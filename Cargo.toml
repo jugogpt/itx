@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "lib",
+    "miner",
+    "node",
+    "wallet",
+]
+
+
+[workspace.dependencies]
+ciborium = "0.2.2"
+chrono = [ version = "0.4.38", features = ["serde"]]
+serde = { version = "1.0.198", features = ["derive"] }
+sha256 = "1.5.0"
+uint = "0.9.5"
+uuid = { version = "1.8.0", features = ["v4", "serde"] }

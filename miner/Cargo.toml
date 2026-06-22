@@ -1,0 +1,11 @@
+[package]
+name = "miner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "miner"
+path = "src/main.rs"
+
+[dependencies]
+itx-lib = { path = "../lib" }

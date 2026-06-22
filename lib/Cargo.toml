@@ -1,0 +1,16 @@
+[package]
+name = "itx-lib"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "itx_lib"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+ciborium = "0.2.2"
+serde = "1.0.228"
+sha256 = "1.6.0"
+uint = "0.10.0"
+uuid = { version = "1.23.3", features = ["v4", "serde"] }
