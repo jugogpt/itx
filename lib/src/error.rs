@@ -6,23 +6,22 @@ pub enum BtcError {
     InvalidTransaction,
     #[error("Invalid block")]
     InvalidBlock,
-   #[error("Invalid block header")]
+    #[error("Invalid block header")]
     InvalidBlockHeader,
-   #[error("Invalid transaction input")]
+    #[error("Invalid transaction input")]
     InvalidTransactionInput,
-   #[error("Invalid transaction output")]
+    #[error("Invalid transaction output")]
     InvalidTransactionOutput,
-   #[error("Invalid Merkle root")]
+    #[error("Invalid Merkle root")]
     InvalidMerkleRoot,
-   #[error("Invalid hash")]
+    #[error("Invalid hash")]
     InvalidHash,
-   #[error("Invalid signature")]
+    #[error("Invalid signature")]
     InvalidSignature,
-   #[error("Invalid public key")]
+    #[error("Invalid public key")]
     InvalidPublicKey,
-   #[error("Invalid private key")]
+    #[error("Invalid private key")]
     InvalidPrivateKey,
 }
 
-pub type Result<T> = std::result::Result<T, Btc Error>;
-
+pub type Result<T> = std::result::Result<T, BtcError>;
