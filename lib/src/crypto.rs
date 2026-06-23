@@ -1,14 +1,12 @@
 
 use serde::{Deserialize, Serialize};
-
-
 use ecdsa::{
     signature::signature,
     Signature as ECDSASignature,
     SigningKey, 
     VerifyingKey,
 };
-
+use ecdsa::signature::Verifier;
 use k256::Secp256k1;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -33,6 +31,32 @@ impl PrivateKey {
         PublicKey(self.0.verifying_key().clone())
     }
 }
+
+
+impl Signature {
+    
+    // sign a crate::types::TransactionOutput from it Sha256 hash
+    pub fn sign_output(
+        output_hash: &Hash,
+        private_key: &PrivateKey,
+    ) -> Self {
+        let signing_key = &private_key.0;
+        let signature = signing_key.sign(&output_hash.as_bytes());
+        Signature(signature)
+    }
+    // verify a signature
+    pub fn verify(
+        &self, 
+        output_hash: &Hash,
+        public_key: &PublicKey,
+    ) -> bool {
+        public_key.0.verify(&output_hash.as_bytes(), &self.0).is_ok()
+    }
+
+
+}
+
+
 
 
 //what is Secp256k1 is an elliptic curve that is commonlu used by Bitcoin and etherium 

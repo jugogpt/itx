@@ -14,16 +14,24 @@ impl fmt::Display for Hash { //implementing the Display trait from the crate fmt
 }
 
 
-#[derive(Clone, Copy, Serialize)] // implements the clone and copy trait on the ahs type, letting us freely copy and handle the tash type as if it were a number (which it is) 
+#[derive(
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Debug,
+    Hash,
+
+)] // implements the clone and copy trait on the ahs type, letting us freely copy and handle the tash type as if it were a number (which it is) 
+
 pub struct Hash(U256);
 
 impl Hash {
     // hash anything that can be serde Serialized via ciborium
     pub fn hash<T: serde::Serialize>(data: &T) -> Self { //here data takes the form of a generic type bc it can be either a string or an int or char etc to fit into an encrypted hash
         //this takes in an input, serializes it, processes it with ecdsa, and then ouputs the serialization wrapped in a hash object
-        
-        
-        
         
         
         
@@ -56,5 +64,10 @@ impl Hash {
     //an easy way to get the 0 hash for a baselline, shorthand
     pub fn zero() -> Self {
         Hash(U256::zero())
+    }
+
+    pub fn as_bytes(&self) -> [u8; 32] {
+        let mut bytes: Vec<u8> = vec![0; 32];
+        self.0.to_little_endian(&mut bytes);
     }
 }

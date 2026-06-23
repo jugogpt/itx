@@ -10,6 +10,8 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use crate::crypto::{PublicKey, Signature};
+use std::collections::HashMap;
+
 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -20,6 +22,7 @@ pub struct Block {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Blockchain {
+    pub utxos: HashMap<Hash, TransactionOutput>,
     pub block: Vec<Block>,
 }
 
@@ -111,7 +114,11 @@ impl Transaction {
 
 impl Blockchain {
     pub fn new() -> Self {
-        Blockchain { blocks: vec![] }
+        
+        Blockchain { 
+            utxos: HashMap::new(),
+            blocks: vec![],
+        }
     }
 
     pub fn add_block(&mut self, block: Block) -> Result<()> {
@@ -125,19 +132,72 @@ impl Blockchain {
                 return Err(BtcError::InvalidBlock); //through an error if the blockchain is empty 
             }
     
-        } else {
+        } else { //if this block is NOT empty 
+
             //if this is not the first block, check if the 
             //block's prev_block_hashs is the hash of the last block 
 
             let last_block = self.blocks.last().unwrap(); //.last() get the latest element of an iterator in rust
+            if block.header.prev_block_hash != last_block { //this means that the hash has been altered or edited mid-way/tampered
+                println!("prev hash is wrong");
+                return Err("You hash is invalid and potentiall tampered")
             
+            }
 
+            //check if the block's hashs is less than the target, i.e. it does not match
+            if !block.header.hash().matches_target(block.header.target) { 
+                println!("does not match target; the blocks hash is less than the target");
+                return Err(BtcError::InvalidBlock);
+            }
+
+            //check if the block's merkle root is correct 
+            let calculated_merkle_root  = MerkleRoot::calculate(&block.transactions);
+
+            if calculated_merkle_root != block.header.merkle_root {
+                println!("invalid merkle root");
+                return Err(BtcError::InvalidMerkleRoot);
+            }
+            // check if the block's timestamp is after the last block's timestamp
+            if block.header.timestamp <= last_block.header.timestamp 
+            {
+                return Err(BtcError::InvalidBlock);
+            } 
+
+
+            //verify all transactions in the block 
+            block.verify_transactions(self.block_height(), &self.utxos,)?;
         }
-
-
-
         self.blocks.push(block);
+        Ok(())
     }
+
+
+    pub fn rebuild_utxos(&mut self) {
+        for block in &self.blocks {
+            for transaction in &block.transactions {
+                for input in &transaction.inputs {
+                    self.utxos.remove(&input.prev_transaction_output_hash); //we want to remove the former inputs of all transactions of each block in the blockchain
+                }
+
+                for output in &transaction.outputs.iter()
+                {
+                    self.utxos.insert(transaction.hash(), output.clone()); // we want to then insert all of the outputs from those transactions
+                }
+
+
+
+
+
+
+            }
+
+            
+        }
+    }
+
+
+
+
 
 }
 
