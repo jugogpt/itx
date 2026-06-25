@@ -135,6 +135,7 @@ impl Blockchain {
 
     pub fn verify_transactions(
         &self,
+        predicted_block_height: u64,
         utxos: &HashMap<Hash, TransactionOuput>,
     ) -> Result<()> {
         let mut inputs: HashMap<Hash, TransactionOutput> = HashMap::new();
@@ -142,14 +143,51 @@ impl Blockchain {
         if self.transactions.is_empty() {
             return Err(BtcError::InvalidTransaction);
         }
-        for transaction in &self.transactions {
+        //verify coinbase transaction
+        self.verify_coinbase_transaction(
+            predicted_block_height, 
+            utxos,
+        )?;
+        //delete the ampersand before &self.transactions 
+        for transaction in &self.transactions.iter().skip(1) {
             let mut input_value = 0;
             let mut output_value = 0;
             
             for input in &transaction.inputs {
-                
+                let prev_output = utxos.get(&input.prev_transaction_output_hash);
+                if prev_output.is_none() {
+                    return Err(BtcError::InvalidTransaction);
+                }
+
+                let prev_output = prev_output.unwrap();
+                // prevent same-block double-spending
+                if input.contain_key(
+                    &input.prev_transaction_output_hash
+                ) {
+                    return Err(BtcError::InvalidTransaction);
+                }
+
+                // check if the signature is valid 
+                if !input.signature.verify(&input.prev_transaction_output_hash, &prev_output.pubkey,) {
+                    return Err(BtcError::InvalidSignature);
+                }
+                input_value += prev_output.value;
+                input.insert(
+                    input.prev_transaction_output_hash,
+                    prev_output.clone(),
+                );
+            }
+
+            for output in &transaction.outputs {
+                output_value += output.value;
+            }
+            // it is fine for output value to be less than input value
+            //as the difference is the fee for the miner
+            if input_value < output_value {
+                return Err(Btc::InvalidTransaction);
             }
         }
+        Ok(())
     }
 
 
@@ -194,4 +232,56 @@ impl Block {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+
+pub fn verify_coinbase_transaction (
+    &self,
+    predicted_block_height: u64,
+    utxos: &HashMap<Hash, TransactionOutput>,
+) -> Result<()> {
+    //coinbase tx is the first transaction in the block
+    let coinbase_transaction = &self.transaction[0];
+
+    if coinbase_transaction.input.len() != 0 {
+        return Err(BtcError::InvalidTransaction);
+    }
+
+    if coinbase_transaction.input.len() == 0 {
+        return Err(BtcError::InvalidTransaction);
+    }
+
+    let miner_fees = self.calculate_miner_fees(utxos)?;
+    let block_reward = crate::INITIAL_REWARD
+        * 10u64.pow(8)
+        / 2u64.pow(
+            (predicted_block_height
+                / crate::HALVING_INTERVAL)
+                as u32,
+        );
+    let total_coinbase_outputs: u64 = 
+        coinbase_transaction.outputs.iter().map(|output| output.value).sum();
+
+    if total_coinbase_outputs != block_reward + miner_fees {
+        return Err(BtcError::InvalidTransaction);
+    }
+    Ok (())
+}
+
+pub fn calculate_miner_fees(
+    &self, 
+    utxos:&HashMap<Hash, TransactionOutput>,
+) -> Result<u64> {
+    let mut inputs: HashMap<Hash, TransactionOutput> = HashMap::new();
+    let mut outputs: HashMap<Hash, TransactionOutput> = HashMap::new();
+
+    //in order to calculate the miner fees, we need to check every transaction after coinbase (the first transaction of a a block on the blockchain)
+    for transaction in self.transaction
+
+
+
+
+
+
+
 }
