@@ -8,6 +8,7 @@ name = "itx_lib"
 path = "src/lib.rs"
 
 [dependencies]
+bigdecimal.workspace = true
 chrono = { version = "0.4.45", features = ["serde"] }
 ciborium = "0.2.2"
 ecdsa = { version = "0.16.9", features = ["signing", "verifying", "serde", "pem"] }

@@ -27,6 +27,7 @@ pub const MIN_TARGET: U256 = U256([
     0x0000_FFFF_FFFF_FFFF,
 ]);
 //difficulty update interval in blocks
-
 pub const DIFFICULTY_UPDATE_INTERVAL: u64 = 50;
+
+//DEF: the difficulty is how unlikely, roughly, it should be to encounter the correct hash while a node is mining
 
