@@ -156,7 +156,6 @@ impl Blockchain{
         let mut known_inputs = HashSet::new();
 
 
-
         //populate the known_inputs hashset 
         for input in &transaction.inputs {
             if !self.utxos.contains_key(&input.prev_transaction_output_hash) { //the exclaimation mark means that we are chekcing if utxos does NOT contain one of the inputs in the passed Transaction transactiono
@@ -171,9 +170,32 @@ impl Blockchain{
         }
 
 
+        let new_fee = self.transaction_fee(&transaction)?;
 
+        // if a UTXO is already reserved in the mempool, keep the higher-fee transaction
+        let mut conflicting_indices = HashSet::new();
+        for input in &transaction.inputs {
+            if let Some((true, _)) = self.utxos.get(&input.prev_transaction_output_hash) {
+                if let Some(idx) =
+                    self.find_mempool_index_spending(input.prev_transaction_output_hash)
+                {
+                    let old_fee = self.transaction_fee(&self.mempool[idx])?;
+                    if new_fee <= old_fee {
+                        return Err(BtcError::InvalidTransaction);
+                    }
+                    conflicting_indices.insert(idx);
+                }
+            }
+        }
 
-        // all inputs must be lower than all outputs
+        let mut to_remove: Vec<usize> = conflicting_indices.into_iter().collect();
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            let removed = self.mempool.remove(idx);
+            self.unmark_transaction_utxos(&removed);
+        }
+
+        // all inputs must be greater than or equal to all outputs        // all inputs must be lower than all outputs
         let all_inputs = transaction
            .inputs
            .iter()
@@ -191,24 +213,64 @@ impl Blockchain{
             }
 
 
-        self.mempool.push(transaction);  //add the parameter transaction to the list that is the mempool of needed transactions
+        self.mark_transaction_utxos(&transaction);
+        self.mempool.push(transaction);
 
-        //sort by miner fee
-        self.mempool.sort_by_key(|transaction| {
-            let all_inputs = transaction.inputs.iter().map(|input| {
-                self.utxos.get(&input.prev_transaction_output_hash).expect("BUG: impossible").1.value
-            }).sum::<u64>();
-
-
-            let all_output: u64 = transaction.outputs.iter().map(|output| output.value).sum();
-
-            let miner_fee = all_inputs - all_outputs;
-            miner_fee 
-
+        let mut order: Vec<usize> = (0..self.mempool.len()).collect();
+        order.sort_by(|&i, &j| {
+            self.transaction_fee(&self.mempool[j])
+                .unwrap_or(0)
+                .cmp(&self.transaction_fee(&self.mempool[i]).unwrap_or(0))
         });
+        let sorted = order.into_iter().map(|i| self.mempool[i].clone()).collect();
+        self.mempool = sorted;
 
         Ok(())
-        
+    }
+
+    fn transaction_fee(&self, transaction: &Transaction) -> Result<u64> {
+        let input_value: u64 = transaction
+            .inputs
+            .iter()
+            .map(|input| {
+                self.utxos
+                    .get(&input.prev_transaction_output_hash)
+                    .expect("BUG: impossible")
+                    .1
+                    .value
+            })
+            .sum();
+        let output_value: u64 = transaction.outputs.iter().map(|output| output.value).sum();
+        if input_value < output_value {
+            return Err(BtcError::InvalidTransaction);
+        }
+        Ok(input_value - output_value)
+    }
+
+    fn find_mempool_index_spending(&self, utxo_hash: Hash) -> Option<usize> {
+        self.mempool.iter().enumerate().find_map(|(idx, transaction)| {
+            transaction
+                .inputs
+                .iter()
+                .any(|input| input.prev_transaction_output_hash == utxo_hash)
+                .then_some(idx)
+        })
+    }
+
+    fn mark_transaction_utxos(&mut self, transaction: &Transaction) {
+        for input in &transaction.inputs {
+            if let Some((marked, _)) = self.utxos.get_mut(&input.prev_transaction_output_hash) {
+                *marked = true;
+            }
+        }
+    }
+
+    fn unmark_transaction_utxos(&mut self, transaction: &Transaction) {
+        for input in &transaction.inputs {
+            if let Some((marked, _)) = self.utxos.get_mut(&input.prev_transaction_output_hash) {
+                *marked = false;
+            }
+        }
     }
 
 
@@ -266,8 +328,13 @@ impl Blockchain{
 
         let block_transactions: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
         self.mempool.retain(|tx| !block_transactions.contains(&tx.hash()));
-    
+
         self.blocks.push(block);
+        self.rebuild_utxos();
+        let pending: Vec<Transaction> = self.mempool.clone();
+        for tx in pending {
+            self.mark_transaction_utxos(&tx);
+        }
         self.try_adjust_target();
         Ok(())
     }
