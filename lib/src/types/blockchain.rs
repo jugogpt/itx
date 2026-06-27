@@ -1,39 +1,46 @@
-use crate::crypto::{PublicKey, Signature};
+use super::{Block, Transaction, TransactionOutput};
 use crate::error::{BtcError, Result};
 use crate::sha256::Hash;
-use crate::util::MerkleRoot;
+use crate::util::{MerkleRoot, Saveable};
 use crate::U256;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use bigdecimal::BigDecimal;
 use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
+use std::io::{
+    Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write,
+};
 
+impl Saveable for Blockchain {
+    fn load<I: Read>(reader: I) -> IoResult<Self> {
+        ciborium::de::from_reader(reader).map_err(|_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to deserialize Blockchain",
+            )
+        })
+    }
 
-
-
-
-
-
+    fn save<O: Write>(&self, writer: O) -> IoResult<()> {
+        ciborium::ser::into_writer(self, writer).map_err(|_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to serialize Blockchain",
+            )
+        })
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Blockchain {
-    utxos: HashMap<Hash, (bool,TransactionOutput)>,
+    utxos: HashMap<Hash, (bool, TransactionOutput)>,
     target: U256,
     blocks: Vec<Block>,
     #[serde(default, skip_serializing)]
     mempool: Vec<(DateTime<Utc>, Transaction)>,
 }
 
-
-
-impl Blockchain{
-    //the natrue of bitconi is that we have e a netowrk of nodes that share information between each other in order to maintain a single ssource truth -- the blochain itself
-    //curntly the methods we ahve created on our Blockchain type are only enough if we ever plan to have just one node, which defeats the purose of a blockchain
-    // We need to adda coupel of methods that will help us share the blockchain
-    // first, we want to imporvoe our desing by making our fields private and create methods that expose them
-
-
+impl Blockchain {
     pub fn new() -> Self {
         Blockchain {
             utxos: HashMap::new(),
@@ -43,8 +50,6 @@ impl Blockchain{
         }
     }
 
-
-    // mempool
     pub fn mempool(&self) -> &[(DateTime<Utc>, Transaction)] {
         &self.mempool
     }
@@ -53,7 +58,7 @@ impl Blockchain{
         let now = Utc::now();
         let mut utxo_hashes_to_unmark: Vec<Hash> = vec![];
         self.mempool.retain(|(timestamp, transaction)| {
-            if now - *timestamp
+            if (now - *timestamp)
                 > chrono::Duration::seconds(crate::MAX_MEMPOOL_TRANSACTION_AGE as i64)
             {
                 utxo_hashes_to_unmark.extend(
@@ -103,7 +108,6 @@ impl Blockchain{
                     }
                     conflicting_indices.insert(idx);
                 } else {
-                    // orphaned mark: no mempool tx references this UTXO
                     self.utxos
                         .entry(input.prev_transaction_output_hash)
                         .and_modify(|(marked, _)| *marked = false);
@@ -194,22 +198,18 @@ impl Blockchain{
         }
     }
 
-
-
-    //block height 
     pub fn block_height(&self) -> u64 {
         self.blocks.len() as u64
     }
 
-   // utxos
     pub fn utxos(&self) -> &HashMap<Hash, (bool, TransactionOutput)> {
         &self.utxos
     }
-    // target
+
     pub fn target(&self) -> U256 {
         self.target
     }
-    // blocks
+
     pub fn blocks(&self) -> impl Iterator<Item = &Block> {
         self.blocks.iter()
     }
@@ -245,8 +245,6 @@ impl Blockchain{
             block.verify_transactions(self.block_height(), self.utxos())?;
         }
 
-        //remvoe transactions from mempool that are now in the block
-
         self.cleanup_mempool();
 
         let block_transactions: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
@@ -262,7 +260,6 @@ impl Blockchain{
         self.try_adjust_target();
         Ok(())
     }
-
 
     pub fn try_adjust_target(&mut self) {
         if self.blocks.is_empty() {
@@ -280,12 +277,10 @@ impl Blockchain{
         let time_diff_seconds = time_diff.num_seconds().max(1) as u64;
         let target_seconds = crate::IDEAL_BLOCK_TIME * crate::DIFFICULTY_UPDATE_INTERVAL;
 
-        // multiply the current target by actual time divided by ideal time
         let new_target = BigDecimal::parse_bytes(self.target.to_string().as_bytes(), 10)
             .expect("BUG: impossible")
             * (BigDecimal::from(time_diff_seconds) / BigDecimal::from(target_seconds));
 
-        // cut off decimal point and everything after it from string representation
         let new_target_str = new_target
             .to_string()
             .split('.')
@@ -296,29 +291,22 @@ impl Blockchain{
         let mut new_target =
             U256::from_str_radix(&new_target_str, 10).expect("BUG: impossible");
 
-        // clamp to at most 4x easier or 4x harder than the current target; this is to prevent runaway loops that make mining impossibly hard or very very easy
         if new_target < self.target / 4 {
             new_target = self.target / 4;
         } else if new_target > self.target * 4 {
             new_target = self.target * 4;
         }
 
-        // cap at the easiest allowed difficulty
         self.target = new_target.min(crate::MIN_TARGET);
     }
 
-
-
-
-
     pub fn rebuild_utxos(&mut self) {
         self.utxos.clear();
-        //probably redo this code to make it more performant, this is an On**3 operation 
         for block in &self.blocks {
             for transaction in &block.transactions {
                 for input in &transaction.inputs {
                     self.utxos
-                        .remove(&input.prev_transaction_output_hash); //removing the past hashes
+                        .remove(&input.prev_transaction_output_hash);
                 }
 
                 for output in &transaction.outputs {

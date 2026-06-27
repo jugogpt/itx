@@ -1,11 +1,14 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use super::{Transaction, TransactionOutput};
 use crate::error::{BtcError, Result};
 use crate::sha256::Hash;
-use crate::util::MerkleRoot;
+use crate::util::{MerkleRoot, Saveable};
 use crate::U256;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{
+    Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write,
+};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BlockHeader {
@@ -37,47 +40,31 @@ impl BlockHeader {
         Hash::hash(self)
     }
 
-    pub fn mine(&mut self, steps:usize) -> bool {
-
-
-        // the reason why we only do a finite number of steps at a time is because we may want to interrupt the mining if we receive an update froom the network that 
-        //that we should work on a neww block (because a new block has been found in the meantime)
-
-
-        //if the block already matches target, return early 
+    pub fn mine(&mut self, steps: usize) -> bool {
         if self.hash().matches_target(self.target) {
-            return true; //this means that we already mined or don't need to mine
+            return true;
         }
 
         for _ in 0..steps {
-            if let Some(new_nonce) = self.nonce.checked_add(1)
-            {
+            if let Some(new_nonce) = self.nonce.checked_add(1) {
                 self.nonce = new_nonce;
             } else {
                 self.nonce = 0;
-                self.timestamp = Utc::now()
+                self.timestamp = Utc::now();
             }
             if self.hash().matches_target(self.target) {
                 return true;
             }
         }
         false
-
     }
-
-
 }
-
-
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
 }
-
-
 
 impl Block {
     pub fn new(header: BlockHeader, transactions: Vec<Transaction>) -> Self {
@@ -211,5 +198,25 @@ impl Block {
         }
 
         Ok(total_fees)
+    }
+}
+
+impl Saveable for Block {
+    fn load<I: Read>(reader: I) -> IoResult<Self> {
+        ciborium::de::from_reader(reader).map_err(|_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to deserialize Block",
+            )
+        })
+    }
+
+    fn save<O: Write>(&self, writer: O) -> IoResult<()> {
+        ciborium::ser::into_writer(self, writer).map_err(|_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to serialize Block",
+            )
+        })
     }
 }
