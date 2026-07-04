@@ -51,3 +51,9 @@ cargo run --bin key_gen ../miner/alice
 4)static_init - one of the many rust libraries for creating global variablesfor types that require allocations.
 
 - the node implementation is incredibly simplistic
+
+- the find_longest_chain method in the node crate has been brutally simplified and could potentially serve as a security problem/risk, as an atck might create a bogus malicious node with a very long blockchain and it would propagate from there (we need a consensus mechanism for this, should implement after).
+
+- the "longest chain" is a simplification: what actually matters is the chain with the most cumulative proof-of-work (usually the same as the longest, but not always, since blocks can have different difficulty)
+
+- for the download_blockchain method in the node.rs crate, we can improve by instead of making many small request, we could add another message type that would return an entire chain of blocks.
