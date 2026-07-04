@@ -1,9 +1,36 @@
+
+use anyhow::{Context, Result};
+use tokio::net::TcpStream;
+use tokio::time;
+use btclib::network::Message;
+use btclib::types::Blockchain;
+use btclib::util::Saveable;
 use crate::sha256::Hash;
 use crate::types::Transaction;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Result as IoResult, Write};
 use std::path::Path;
+
+
+pub async fn load_blockchain (blockchain_file: &str) -> Result<()> { 
+    println!("blockchain file exists, loading...") //bc this util function is only called by node.rs if the path for blochchain_path exists
+    let new_blockchain = Blockchain::load_from_file(blockchain_file)?;
+    println!("blockchain loaded");
+    let mut blockchain = crate::BLOCKCHAIN.write().await;
+    *blockchain = new_blockchain;
+    println!("rebuilding utxos...");
+    blockchain.rebuild_utxos();
+    println!("utxos rebuilt");
+    println!("checking if target needs to be adjusted...");
+    println!("current target: {}", blockchain.target());
+    blockchain.try_adjust_target();
+    println!("new target: {}", blockchain.target());
+    println!("initialization complete");
+    Ok(())
+}
+
+
 
 pub trait Saveable
 where
