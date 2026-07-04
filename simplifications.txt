@@ -22,3 +22,17 @@ d) the node verifies them and adds them to the mempool, sending confirmation on 
 programming all taks can run on one thread in parallel programming, task run simultaneously, whereas dsitrbuted progrmmming uses multiple process, often each running on a separate machine...
 - cocurrent = all processes run on a single thread... can use event driven programming as well (as an alternative to threads)
 - rust has only one built-in method to due cocurrency, i.e. asynchronous programming
+
+- a future is a promise that at some point in the future a value of a given type will be available
+- rust does not come with any built in runtime, the most commonly used are tokio or 
+- the crate bastion is what people usually use for facilitating distributed programming
+
+-mxining async frameworks is generally very bad of an idea and very difficult to do practically
+
+
+- we can use this in the wsl terminal to generate a pair of keys to place in the miner folder for testing
+cargo run --bin key_gen ../miner/alice
+
+- here we are creating a central Miner structure, which manages the entire state of the applicatoin ; in order to be effectieve we will neeed to mnie on a didfference thread, so that we do NOT block the tokio runtime. In order to be able to communicate with te hardware thread effectively, we need to use so-called "channels"
+
+-we do not utilize the built in standard library mpsc (multiple producer Single Consumer) crate for channel in std bc it carries with it 2 caveats: (1) It cannot receive or send messages asynchronously, (2) it is not multiple consumer (mpmc)
