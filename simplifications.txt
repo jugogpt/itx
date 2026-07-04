@@ -1,0 +1,24 @@
+- "our networking situation is signficationly simplied to the current real bitcoin in that we do not have pools. "
+
+
+- "currently the wallet-node communcation goes like this:
+
+a) wallet queires the node for the UTXOs that belong to it 
+b) the node sends over the information 
+c) the wallet assembles transactions and sends them to the node // transactions come directly from the wallet
+d) the node verifies them and adds them to the mempool, sending confirmation on back to the wallet 
+
+"
+
+- we here take the simplest way we could implement networking, i.e. through TCP so that we didn't have to worry baout data integrity
+- we also simplify by using the length-prefixed encoding (this means taht we will serialize each message into a binary fomrat, in our case CBOR since we are alreaedy using)
+
+- our protocal is not necessarily backward and forward compatible --> for later (the improver reading this information) we need to make the protocol smarter in order to do that and introduce some versioning and version-negotiation mechanisms. a good tool for such functionality would be (for example) gRPC with Protocol Buffers, bu tt that is an additional complexity that we will not be initroducing in this book. However, if you want, this is a great improvement you can make to the project. 
+
+- threads are expensive so here we do not use them; could use in the future if we are doing realtime computing
+
+- we want a practical way to avoid spawning many threads --> this is where cocurrent programming comes to play.
+- concurrent programming is a general term for an approach which allwos having more than one task in progress at once... the difference between conceurrent, parallel, and distrubuted programming is that in concurrent 
+programming all taks can run on one thread in parallel programming, task run simultaneously, whereas dsitrbuted progrmmming uses multiple process, often each running on a separate machine...
+- cocurrent = all processes run on a single thread... can use event driven programming as well (as an alternative to threads)
+- rust has only one built-in method to due cocurrency, i.e. asynchronous programming

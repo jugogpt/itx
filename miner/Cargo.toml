@@ -8,4 +8,6 @@ name = "miner"
 path = "src/main.rs"
 
 [dependencies]
-itx-lib = { path = "../lib" }
+btclib = { path = "../lib" }
+tokio = { version = "1.37.0", features = ["full"] }
+

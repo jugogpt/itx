@@ -8,4 +8,4 @@ name = "node"
 path = "src/main.rs"
 
 [dependencies]
-itx-lib = { path = "../lib" }
+btclib = { path = "../lib" }

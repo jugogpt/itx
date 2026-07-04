@@ -3,6 +3,65 @@ use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature as ECDSASignature, SigningKey, VerifyingKey};
 use k256::Secp256k1;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use spki::EncodePublicKey;
+use std::io::{
+Error as IoError, ErrorKind as IoErrorKind, Read,
+Result as IoResult, Write,
+};
+use crate::util::Saveable;
+impl Saveable for PrivateKey {
+    fn load<I: Read>(reader: I) -> IoResult<Self> {
+        ciborium::de::from_reader(reader).map_err(
+            |_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to deserialize PrivateKey",
+            )
+        })
+    }
+    fn save<O: Write>(&self, writer: O) -> IoResult<()> {
+        ciborium::ser::into_writer(self, writer).map_err(
+           |_| {
+                IoError::new(
+                    IoErrorKind::InvalidData,
+                    "Failed to serialize PrivateKey",
+               )
+           },
+       )?;
+        Ok(())
+    }
+}
+// save and load as PEM
+impl Saveable for PublicKey {
+    fn load<I: Read>(mut reader: I) -> IoResult<Self> {
+       // read PEM-encoded public key into string
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        // decode the public key from PEM
+        let public_key = buf.parse().map_err(|_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to parse PublicKey",
+            )
+        })?;
+        Ok(PublicKey(public_key))
+    }
+    fn save<O: Write>(&self,mut writer: O,) -> IoResult<()> {
+        let s = self.0.to_public_key_pem(Default::default()).map_err(|_| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                "Failed to serialize PublicKey",
+            )
+        })?;
+        writer.write_all(s.as_bytes())?;
+        Ok(())
+    }
+}
+   
+
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Signature(ECDSASignature<Secp256k1>);
@@ -10,11 +69,21 @@ pub struct Signature(ECDSASignature<Secp256k1>);
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PublicKey(VerifyingKey<Secp256k1>);
 
+impl fmt::Display for PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // print the compressed SEC1 encoding of the key as hex
+        write!(f, "{}", hex::encode(self.0.to_sec1_bytes()))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PrivateKey(
     #[serde(with = "signkey_serde")]
     SigningKey<Secp256k1>,
 );
+
+
+
 
 impl PrivateKey {
     pub fn new_key() -> Self {
