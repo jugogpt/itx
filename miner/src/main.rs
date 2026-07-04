@@ -79,7 +79,8 @@ impl Miner {
             if mining.load(Ordering::Relaxed) {
                 if let Some(mut block) = template.lock().unwrap().clone() {
                     println!("Mining block with target: {}" block.header.target);
-                    if block.header.mine(2000000) {
+                    if block.header.mine(2000000) { //this is the part that is actually doing the mining 
+
                         println!("Block mined: {}", block.hash());
                         sender.send(block).expect("Failed to send mined block");
                         mining.store(false, Ordering::Relaxed);
@@ -91,9 +92,36 @@ impl Miner {
         
     }
     async fn fetch_and_validate_template(&self) -> Result<()> {
-        
+        //if we are not mining -> fetch a template
+        if !self.mining.load(Ordering::Relaxed) {
+            //when working with atomics, we need too specify the ordering of atomic operations we would ike to use. This ranges from
+            // Order::Relaxed (which roughly translates to "please just be atomic bro") or Ordering::SeqCst (which roughly translates to be "YOU SHALL NOT PASS")
+            // all atomic operations before this one stay before it, all after it stay after it 
+            //atomic operations guarantee the whole read-modify-write happens as one uninterruptible unit
+            self.fetch_template().await?;
+        } else { // if we are mining, we validate the current template
+            self.validate_template().await?;
+        }
+        Ok(())
     }
     async fn fetch_template(&self) -> Result<()> {
+        println!("Fetching new template");
+        let message = Message::FetchTemplate(self.public_key.clone());
+        let mut stream_lock = self.stream.lock().await;
+        message.send_async(&mut *stream_lock).await?;
+        drop(stream_lock);
+        let mut stream_lock = self.stream.lock().await?;
+        match Message::receive_async(&mut *stream_lock).await? {
+            Message::Template(template) => {
+                drop(stream_lock);
+                println!("Received new template with target: {}", template.header.target);
+                *self.current_template.lock().unwrap() = Some(template);
+                self.mining.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+
+            _ => Err(anyhow!("Unexpected message receiveed when fetching template")),
+        }
        
     }
     async fn validate_template(&self) -> Result<()> {
