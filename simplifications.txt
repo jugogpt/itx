@@ -38,3 +38,16 @@ cargo run --bin key_gen ../miner/alice
 -we do not utilize the built in standard library mpsc (multiple producer Single Consumer) crate for channel in std bc it carries with it 2 caveats: (1) It cannot receive or send messages asynchronously, (2) it is not multiple consumer (mpmc)
 
 -arc (and the fact that our sender struct is clonable), we can create copies that are not actually copies, but rather second handles into the samr piece of memory. Rust forces us to use these types through the liberal amoung of compile errors it provides if you try to do multi-threading without them
+
+
+-Potential improvements to be made to the miner: multithreaded mining could be implemented, as we are only mining with a single CPU core at the moment; it would also be a good idea to be able to submit your block to multiple nodes.
+
+-we have a constraint on the node-- the maximum amount of transctions allowed in a block. 
+
+- LIBRARY DEFINITIONS:
+1) anyhow - this library is often used together with thiserror. while thiserror provides  a macro to create a concreate type covering all sorts of errors, anyhow provides ad dynamic type (and a Result<T> alias  that is using this type), whic hcan be converted into
+2) argh is just more lightweight version of clap,  whic is the CLI app framework for Rust, i.e. aides in communication across nodes
+3) dashmap: provides a fast HashMap that is thread-safe and has interior mutability.
+4)static_init - one of the many rust libraries for creating global variablesfor types that require allocations.
+
+- the node implementation is incredibly simplistic
