@@ -1,10 +1,11 @@
 use std::io::{Error as IoError, Read, Write};
-use serde::{Deserialize, Serialize};
+
 use crate::crypto::PublicKey;
 use crate::types::{Block, Transaction, TransactionOutput};
-#[derive(Debug, Clone, Deserialize, Serialize)]
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum Message {
     // we need to fetch all utxos belonging to a public key 
     FetchUTXOs(PublicKey),
@@ -91,7 +92,6 @@ impl Message {
         stream.write_all(&bytes).await?;
         Ok(())
     }
-
 
     pub async fn receive_async(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, ciborium::de::Error<IoError>> {
         let mut len_bytes = [0u8; 8];
