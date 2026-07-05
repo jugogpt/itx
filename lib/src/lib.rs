@@ -35,3 +35,4 @@ pub const MAX_MEMPOOL_TRANSACTION_AGE: u64 = 600;
 
 //DEF: the difficulty is how unlikely, roughly, it should be to encounter the correct hash while a node is mining
 
+pub const BLOCK_TRANSACTION_CAP: usize = 20;

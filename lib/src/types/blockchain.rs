@@ -1,4 +1,6 @@
-use super::{Block, Transaction, TransactionOutput};
+use super::{Block, BlockHeader, Transaction, TransactionOutput};
+use super::block::calculate_miner_fees_for_transactions;
+use crate::crypto::PublicKey;
 use crate::error::{BtcError, Result};
 use crate::sha256::Hash;
 use crate::util::{MerkleRoot, Saveable};
@@ -10,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{
     Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write,
 };
+use uuid::Uuid;
 
 impl Saveable for Blockchain {
     fn load<I: Read>(reader: I) -> IoResult<Self> {
@@ -52,6 +55,55 @@ impl Blockchain {
 
     pub fn mempool(&self) -> &[(DateTime<Utc>, Transaction)] {
         &self.mempool
+    }
+
+
+    pub fn calculate_block_reward(&self) -> u64 {
+        let block_height = self.block_height();
+        let halvings = block_height / crate::HALVING_INTERVAL;
+        (crate::INITIAL_REWARD * 10u64.pow(8)) >> halvings
+    }
+
+    pub fn create_block_template(&self, pubkey: PublicKey) -> Result<Block> {
+        let mut transactions: Vec<Transaction> = self
+            .mempool
+            .iter()
+            .take(crate::BLOCK_TRANSACTION_CAP)
+            .map(|(_, tx)| tx.clone())
+            .collect();
+
+        let miner_fees = calculate_miner_fees_for_transactions(&transactions, &self.utxos)?;
+        let reward = self.calculate_block_reward();
+
+        transactions.insert(
+            0,
+            Transaction {
+                inputs: vec![],
+                outputs: vec![TransactionOutput {
+                    value: reward + miner_fees,
+                    unique_id: Uuid::new_v4(),
+                    pubkey,
+                }],
+            },
+        );
+
+        let merkle_root = MerkleRoot::calculate(&transactions);
+        let prev_block_hash = self
+            .blocks
+            .last()
+            .map(|last_block| last_block.hash())
+            .unwrap_or(Hash::zero());
+
+        Ok(Block::new(
+            BlockHeader {
+                timestamp: Utc::now(),
+                prev_block_hash,
+                nonce: 0,
+                target: self.target,
+                merkle_root,
+            },
+            transactions,
+        ))
     }
 
     pub fn cleanup_mempool(&mut self) {

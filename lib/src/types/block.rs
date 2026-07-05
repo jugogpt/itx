@@ -168,37 +168,44 @@ impl Block {
         &self,
         utxos: &HashMap<Hash, (bool, TransactionOutput)>,
     ) -> Result<u64> {
-        let mut total_fees = 0u64;
+        calculate_miner_fees_for_transactions(&self.transactions[1..], utxos)
+    }
+}
 
-        for transaction in self.transactions.iter().skip(1) {
-            let mut input_value = 0;
-            let mut output_value = 0;
+pub fn calculate_miner_fees_for_transactions(
+    transactions: &[Transaction],
+    utxos: &HashMap<Hash, (bool, TransactionOutput)>,
+) -> Result<u64> {
+    let mut total_fees = 0u64;
 
-            for input in &transaction.inputs {
-                let prev_output = utxos
-                    .get(&input.prev_transaction_output_hash)
-                    .map(|(_, output)| output);
+    for transaction in transactions {
+        let mut input_value = 0;
+        let mut output_value = 0;
 
-                if prev_output.is_none() {
-                    return Err(BtcError::InvalidTransaction);
-                }
+        for input in &transaction.inputs {
+            let prev_output = utxos
+                .get(&input.prev_transaction_output_hash)
+                .map(|(_, output)| output);
 
-                input_value += prev_output.unwrap().value;
-            }
-
-            for output in &transaction.outputs {
-                output_value += output.value;
-            }
-
-            if input_value < output_value {
+            if prev_output.is_none() {
                 return Err(BtcError::InvalidTransaction);
             }
 
-            total_fees += input_value - output_value;
+            input_value += prev_output.unwrap().value;
         }
 
-        Ok(total_fees)
+        for output in &transaction.outputs {
+            output_value += output.value;
+        }
+
+        if input_value < output_value {
+            return Err(BtcError::InvalidTransaction);
+        }
+
+        total_fees += input_value - output_value;
     }
+
+    Ok(total_fees)
 }
 
 impl Saveable for Block {

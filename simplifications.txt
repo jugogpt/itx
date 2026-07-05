@@ -57,3 +57,9 @@ cargo run --bin key_gen ../miner/alice
 - the "longest chain" is a simplification: what actually matters is the chain with the most cumulative proof-of-work (usually the same as the longest, but not always, since blocks can have different difficulty)
 
 - for the download_blockchain method in the node.rs crate, we can improve by instead of making many small request, we could add another message type that would return an entire chain of blocks.
+
+- our wallet here is done more in a similar way to how they are done in production. We will split our wallet into two discrete pairs:
+1) a core that handles functionailty, and knows nothing about the UI of the application
+2) the interface of the application itself
+
+we want the core to run pretty much independetly from the UI with the UI making requests from the core of the application
