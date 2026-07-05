@@ -83,3 +83,9 @@ cloning an Arc
 --> remember that CLI means jsut "command line interface"= a way for the user to interact with the program easily 
 
 --> the fee configuration in the wallet could be more complex than the current implementation 
+
+--> the transaction handling is simplified
+
+
+-->> IMPORTANT: in handle_transactions, we are wiating to receive fully formed transactions (they will be coming frpm the UI). this solution will be a bit odd, as we will be taking a trip in and out of the core with the transactions (as the sender fro this receiver is loaced in the core)
+-->Can we come back later refactor it so this does not happen?? important!!
