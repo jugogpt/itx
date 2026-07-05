@@ -1,3 +1,5 @@
+use tracing::*;
+
 use btclib::crypto::PrivateKey;
 use btclib::sha256::Hash;
 use btclib::types::{Block, BlockHeader, Transaction, TransactionOutput};

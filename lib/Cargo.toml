@@ -22,4 +22,5 @@ uint = "0.10.0"
 uuid = { version = "1.23.3", features = ["v4", "serde"] }
 tokio = { version = "1.37.0", features = ["full"] }
 spki = { version = "0.7", features = ["pem"] }
+tracing = { workspace = true }
 

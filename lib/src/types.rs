@@ -1,3 +1,5 @@
+use tracing::*;
+
 mod block;
 mod blockchain;
 mod transaction;

@@ -1,3 +1,5 @@
+use tracing::*;
+
 use btclib::network::Message;
 use btclib::sha256::Hash;
 use tokio::net::TcpStream;
@@ -145,3 +147,4 @@ pub async fn handle_connection(mut socket: TcpStream) {
         }
     }
 }
+

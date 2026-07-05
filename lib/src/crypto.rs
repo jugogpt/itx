@@ -1,3 +1,5 @@
+use tracing::*;
+
 use crate::sha256::Hash;
 use ecdsa::signature::{Signer, Verifier};
 use ecdsa::{Signature as ECDSASignature, SigningKey, VerifyingKey};
@@ -130,3 +132,4 @@ mod signkey_serde {
         super::SigningKey::from_slice(&bytes).map_err(serde::de::Error::custom)
     }
 }
+

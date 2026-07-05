@@ -199,6 +199,7 @@ dependencies = [
  "spki",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uint",
  "uuid",
 ]
@@ -998,6 +999,7 @@ dependencies = [
  "clap",
  "flume",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1042,6 +1044,7 @@ dependencies = [
  "dashmap",
  "static_init",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

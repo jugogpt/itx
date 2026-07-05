@@ -1,3 +1,5 @@
+use tracing::*;
+
 use btclib::types::Transaction;
 use btclib::util::Saveable;
 use std::env;

@@ -89,3 +89,8 @@ cloning an Arc
 
 -->> IMPORTANT: in handle_transactions, we are wiating to receive fully formed transactions (they will be coming frpm the UI). this solution will be a bit odd, as we will be taking a trip in and out of the core with the transactions (as the sender fro this receiver is loaced in the core)
 -->Can we come back later refactor it so this does not happen?? important!!
+
+
+--> the implementation of core could be significantly improved by not opening connections over and over again, but rather, storeing one connection in Core, and reusing it in both tasks (keep in you will have to lock in in a Mutex properly, to ensure one task doesn't start sending messages while the other is waiting for a reply)
+
+-->a "challenge for us" presented in the editing of the core.rs crate in the TUI implementation was to: make the Key fields public, which we will need in a different part of the program

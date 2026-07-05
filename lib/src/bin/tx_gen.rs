@@ -1,3 +1,5 @@
+use tracing::*;
+
 use btclib::crypto::PrivateKey;
 use btclib::types::{Transaction, TransactionOutput};
 use btclib::util::Saveable;

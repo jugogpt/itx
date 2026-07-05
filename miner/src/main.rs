@@ -1,3 +1,5 @@
+use tracing::*;
+
 use anyhow::{anyhow, Result};
 use btclib::crypto::PublicKey;
 use btclib::network::Message;
@@ -163,3 +165,4 @@ async fn main() -> Result<()> {
     let miner = Miner::new(cli.address, public_key).await?;
     miner.run().await
 }
+

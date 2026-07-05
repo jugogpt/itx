@@ -1,3 +1,5 @@
+use tracing::*;
+
 use super::{Block, BlockHeader, Transaction, TransactionOutput};
 use super::block::calculate_miner_fees_for_transactions;
 use crate::crypto::PublicKey;
@@ -369,3 +371,4 @@ impl Blockchain {
         }
     }
 }
+

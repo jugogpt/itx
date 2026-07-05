@@ -1,3 +1,5 @@
+use tracing::*;
+
 use super::{Transaction, TransactionOutput};
 use crate::error::{BtcError, Result};
 use crate::sha256::Hash;
@@ -227,3 +229,4 @@ impl Saveable for Block {
         })
     }
 }
+

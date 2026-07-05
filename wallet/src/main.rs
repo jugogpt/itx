@@ -1,4 +1,6 @@
 mod core;
+mod tasks;
+mod ui.rs
 
 use core::{Config, Core, FeeConfig, FeeType, Recipient};
 use std::sync::Arc;
@@ -9,6 +11,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use tokio::time::{self, Duration};
 use btclib::types::Transaction;
+use tracing::*;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -85,10 +88,8 @@ async fn run_cli(core: Arc<Core>) -> Result<()> {
                 if let Err(e) = core.fetch_utxos().await {
                     println!("failed to fetch utxos: {e}");
                 };
-                let transaction = core
-                    .create_transaction(&recipient_key, amount)
-                    .await?;
-                core.tx_sender.send(transaction).await?;
+                let transaction = core.create_transaction(&recipient_key, amount)?;
+                core.tx_sender.send(transaction)?;
                 println!("Transaction sent successfully");
                 core.fetch_utxos().await?;
             }
@@ -136,12 +137,12 @@ async fn main() -> Result<()> {
     let config_path = cli
         .config
         .unwrap_or_else(|| PathBuf::from("wallet_config.toml"));
-    let mut core = Core::load(config_path.clone())?;
+    let mut core = Core::load(config_path.clone()).await?;
     if let Some(node) = cli.node {
         core.config.default_node = node;
     }
     let (tx_sender, tx_receiver) = kanal::bounded(10);
-    core.tx_sender = tx_sender.clone_async();
+    core.tx_sender = tx_sender;
     let core = Arc::new(core);
     tokio::spawn(update_utxos(core.clone()));
     tokio::spawn(handle_transactions(

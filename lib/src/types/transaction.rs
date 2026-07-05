@@ -1,3 +1,5 @@
+use tracing::*;
+
 use crate::crypto::{PublicKey, Signature};
 use crate::sha256::Hash;
 use crate::util::Saveable;
@@ -61,3 +63,4 @@ impl Saveable for Transaction {
         })
     }
 }
+

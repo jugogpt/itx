@@ -1,3 +1,5 @@
+use tracing::*;
+
 use btclib::crypto::PrivateKey;
 use btclib::util::Saveable;
 use std::env;
@@ -18,3 +20,4 @@ fn main() {
     private_key.save_to_file(&private_key_file).unwrap();
     public_key.save_to_file(&public_key_file).unwrap();
 }
+

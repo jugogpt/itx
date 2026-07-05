@@ -1,3 +1,5 @@
+use tracing::*;
+
 use crate::U256;
 use serde::{Deserialize, Serialize};
 use sha256::digest;
@@ -49,3 +51,4 @@ impl Hash {
         self.0.to_little_endian()
     }
 }
+

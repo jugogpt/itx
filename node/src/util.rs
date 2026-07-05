@@ -1,3 +1,5 @@
+use tracing::*;
+
 use anyhow::{Context, Result};
 use btclib::network::Message;
 use btclib::types::Blockchain;
@@ -119,3 +121,4 @@ pub async fn save(name: String) {
         blockchain.save_to_file(name.clone()).unwrap();
     }
 }
+

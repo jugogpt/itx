@@ -1,3 +1,5 @@
+use tracing::*;
+
 use anyhow::Result;
 use argh::FromArgs;
 use btclib::types::Blockchain;
@@ -72,3 +74,4 @@ async fn main() -> Result<()> {
         tokio::spawn(handler::handle_connection(socket));
     }
 }
+

@@ -1,3 +1,5 @@
+use tracing::*;
+
 use btclib::types::Block;
 use btclib::util::Saveable;
 use std::env;
@@ -44,3 +46,4 @@ fn main() {
     println!("final: {:#?}", block);
     println!("hash: {}", block.header.hash());
 }
+
