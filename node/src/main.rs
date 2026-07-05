@@ -77,4 +77,27 @@ async fn main() -> Result<()>{
         }
     }
     Ok(())
+
+
+
+    //Start the TCP listener on 0.0.0.0:port 
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TCPListener::bind(&addr).await?;
+    println!("Listening on {}", addr);
+    
+    //start a task to periodically cleanup the mempool
+    // normally, you would want to keep and join the handle 
+    tokio::spawn(util::cleanup());
+    //and a task to periodically save the blockchain'
+    tokio::spawn(util::save(blockchain_file.clone()));
+
+
+    loop {
+        let (socket, _) = listener.accept().await?;
+        tokio::spawn(handler::handle_connection(socket));
+        // the handler::handle_conncection function is the heart of our application, it's where we will handle every possible message type: but b4 we implement it message type by message type, there are some automatic tasks we msut take care of first:
+
+    }
+
+    
 }
