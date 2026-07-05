@@ -63,3 +63,23 @@ cargo run --bin key_gen ../miner/alice
 2) the interface of the application itself
 
 we want the core to run pretty much independetly from the UI with the UI making requests from the core of the application
+
+-a core (wallet) that handles functionality, and knows nothing about the UI of the applicatoin
+-the interfact of the application itself
+
+- the second part is the TUI interface of the application itself that does not iteract with the wallet logic 
+
+want the core to run pretty much independently from the UUI (wit the UI making requrest from the core of the eapplication and fetching info) 
+
+
+core should NOT be a global variable because it is not necessary in rust 
+
+core will be a structure that uses interior mutability so that it can be easily shareable via Arc<Core>
+
+--> recall taht Arc<T> (Atomcic Reference Counting) is a thread-safe smart pointer in Rsust thatllow multiple ownsership of the same data acorss thread so we can avoid having to set things mut and can have multiple pointers "owning" the same actual value, not just a Reference --> the is the standard for cocurrent applications in rust 
+
+cloning an Arc 
+
+--> remember that CLI means jsut "command line interface"= a way for the user to interact with the program easily 
+
+--> the fee configuration in the wallet could be more complex than the current implementation 
