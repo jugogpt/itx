@@ -71,6 +71,18 @@ pub struct Signature(ECDSASignature<Secp256k1>);
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PublicKey(VerifyingKey<Secp256k1>);
 
+impl PartialOrd for PublicKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PublicKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.to_sec1_bytes().cmp(&other.0.to_sec1_bytes())
+    }
+}
+
 impl fmt::Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // print the compressed SEC1 encoding of the key as hex
