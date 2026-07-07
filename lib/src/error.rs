@@ -8,6 +8,8 @@ pub enum BtcError {
     InvalidTransaction,
     #[error("Invalid block")]
     InvalidBlock,
+    #[error("Block buffered as orphan (parent not yet known)")]
+    OrphanBlock,
     #[error("Invalid block header")]
     InvalidBlockHeader,
     #[error("Invalid transaction input")]

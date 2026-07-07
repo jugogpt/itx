@@ -1,0 +1,31 @@
+[package]
+name = "hub"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hub"
+path = "src/main.rs"
+
+[dependencies]
+btclib = { path = "../lib" }
+anyhow = "1.0.86"
+argh = "0.1.12"
+axum = "0.7"
+chrono = { workspace = true }
+ciborium = { workspace = true }
+dashmap = "5.5.3"
+redb = "2"
+serde = { workspace = true }
+serde_json = "1.0"
+static_init = "1.0.3"
+thiserror = { workspace = true }
+tokio = { version = "1.37.0", features = ["full"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+# Only pulled in for the `examples/smoke_agent.rs` end-to-end HTTP smoke
+# test -- never part of the shipped `hub` binary's dependency tree.
+reqwest = { version = "0.12", features = ["json"] }

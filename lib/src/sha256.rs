@@ -33,7 +33,16 @@ impl Hash {
             );
         }
 
-        let hash = digest(&serialized);
+        Self::hash_bytes(&serialized)
+    }
+
+    /// Hashes raw bytes directly, skipping the CBOR-serialization step
+    /// `hash` always does. Used where the exact bytes being hashed need
+    /// to be reproducible by something that isn't Rust and has no CBOR
+    /// library handy -- e.g. an HTTP API where a plain canonical string is
+    /// hashed and signed, rather than one of btclib's own types.
+    pub fn hash_bytes(bytes: &[u8]) -> Self {
+        let hash = digest(bytes);
         let hash_bytes = hex::decode(hash).unwrap();
         let hash_array: [u8; 32] = hash_bytes.as_slice().try_into().unwrap();
         Hash(U256::from_little_endian(&hash_array))
@@ -49,6 +58,10 @@ impl Hash {
 
     pub fn as_bytes(&self) -> [u8; 32] {
         self.0.to_little_endian()
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Hash(U256::from_little_endian(&bytes))
     }
 }
 

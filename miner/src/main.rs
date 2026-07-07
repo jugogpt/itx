@@ -35,7 +35,10 @@ struct Miner {
 
 impl Miner {
     async fn new(address: String, public_key: PublicKey) -> Result<Self> {
-        let stream = TcpStream::connect(&address).await?;
+        let mut stream = TcpStream::connect(&address).await?;
+        btclib::network::perform_handshake_initiator(&mut stream)
+            .await
+            .map_err(|e| anyhow!("handshake with {} failed: {}", address, e))?;
         let (mined_block_sender, mined_block_receiver) = flume::unbounded();
         Ok(Self {
             public_key,

@@ -42,6 +42,11 @@ impl BlockHeader {
         Hash::hash(self)
     }
 
+    /// The amount of expected PoW work represented by this header's target.
+    pub fn work(&self) -> U256 {
+        crate::work_from_target(self.target)
+    }
+
     pub fn mine(&mut self, steps: usize) -> bool {
         if self.hash().matches_target(self.target) {
             return true;

@@ -120,7 +120,10 @@ impl Core {
         info!("Loading core from config: {:?}", config_path);
         let config: Config = toml::from_str(&fs::read_to_string(&config_path)?)?;
         let mut utxos = UtxoStore::new();
-        let stream = TcpStream::connect(&config.default_node).await?;
+        let mut stream = TcpStream::connect(&config.default_node).await?;
+        btclib::network::perform_handshake_initiator(&mut stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("handshake with {} failed: {}", config.default_node, e))?;
 
         // Load keys from config
         for key in &config.my_keys {

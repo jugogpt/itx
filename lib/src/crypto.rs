@@ -90,6 +90,20 @@ impl fmt::Display for PublicKey {
     }
 }
 
+impl PublicKey {
+    /// Parses a key from its compressed SEC1 byte encoding (the same
+    /// format `Display`/`to_sec1_bytes` produce). Used at HTTP API
+    /// boundaries, where a key travels as a plain hex string rather than
+    /// btclib's internal CBOR representation.
+    pub fn from_sec1_bytes(bytes: &[u8]) -> Result<Self, ecdsa::Error> {
+        Ok(PublicKey(VerifyingKey::from_sec1_bytes(bytes)?))
+    }
+
+    pub fn to_sec1_bytes(&self) -> Vec<u8> {
+        self.0.to_sec1_bytes().to_vec()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PrivateKey(
     #[serde(with = "signkey_serde")]
@@ -102,6 +116,13 @@ pub struct PrivateKey(
 impl PrivateKey {
     pub fn new_key() -> Self {
         PrivateKey(SigningKey::random(&mut rand::thread_rng()))
+    }
+
+    /// Deterministically reconstructs a key from a fixed 32-byte scalar,
+    /// rather than generating a random one. Used for the protocol's fixed
+    /// genesis key, where every node must derive the exact same keypair.
+    pub fn from_fixed_bytes(bytes: &[u8]) -> Result<Self, ecdsa::Error> {
+        Ok(PrivateKey(SigningKey::from_slice(bytes)?))
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -120,6 +141,24 @@ impl Signature {
             .0
             .verify(&output_hash.as_bytes(), &self.0)
             .is_ok()
+    }
+
+    /// Signs an arbitrary already-hashed message (as opposed to
+    /// `sign_output`, which specifically signs a UTXO's hash). Used
+    /// outside the blockchain proper -- e.g. an HTTP API authenticating a
+    /// request by having the caller sign a hash of it.
+    pub fn sign_hash(hash: &Hash, private_key: &PrivateKey) -> Self {
+        Self::sign_output(hash, private_key)
+    }
+
+    /// Fixed-size (r || s) byte encoding, for HTTP API boundaries where a
+    /// signature travels as a plain hex string.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes().to_vec()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ecdsa::Error> {
+        Ok(Signature(ECDSASignature::from_slice(bytes)?))
     }
 }
 

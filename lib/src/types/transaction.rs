@@ -42,6 +42,15 @@ impl Transaction {
     pub fn hash(&self) -> Hash {
         Hash::hash(self)
     }
+
+    /// Size in bytes of this transaction once CBOR-serialized, i.e. how
+    /// much block space it would consume. Used to fit transactions into a
+    /// byte budget rather than an arbitrary transaction count.
+    pub fn serialized_size(&self) -> usize {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("BUG: failed to serialize Transaction");
+        buf.len()
+    }
 }
 
 impl Saveable for Transaction {
