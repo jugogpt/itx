@@ -198,13 +198,17 @@ mod tests {
             id: Uuid::new_v4(),
             description: "do a thing".to_string(),
             bounty: 42,
-            expected_output_hash: Hash::hash_bytes(b"answer"),
+            kind: crate::board::TaskKind::HashMatch {
+                expected_output_hash: Hash::hash_bytes(b"answer"),
+            },
             poster,
             status: TaskStatus::Open,
             claimant: None,
             claim_deadline: None,
             failed_attempts: 0,
             created_at: Utc::now(),
+            min_reputation: 0,
+            close_reason: None,
         };
         store.save_task(&task).unwrap();
         let loaded = store.load_all_tasks().unwrap();

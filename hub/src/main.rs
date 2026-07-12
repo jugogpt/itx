@@ -10,7 +10,7 @@ use anyhow::Result;
 use argh::FromArgs;
 use axum::routing::{get, post};
 use axum::Router;
-use board::TaskBoard;
+use board::{Task, TaskBoard};
 use btclib::crypto::{PrivateKey, PublicKey};
 use btclib::util::Saveable;
 use node_client::NodeClient;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use store::HubStore;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
+use uuid::Uuid;
 
 /// Shared state handed to every HTTP handler. `board` is the only piece
 /// that changes after startup, so it's the only field behind a lock --
@@ -63,28 +64,94 @@ fn load_or_create_operator_key(path: &str) -> Result<PrivateKey> {
     }
 }
 
-/// Periodically reopens abandoned claims and sweeps the auth replay guard.
-/// Runs for the lifetime of the process.
+/// Periodically reopens abandoned claims, retries paying out any task
+/// stuck `Verified` by an earlier failed payout attempt, and sweeps the
+/// auth replay guard. Runs for the lifetime of the process.
 async fn sweep_loop(state: Arc<AppState>) {
     let mut ticker = interval(Duration::from_secs(60));
     loop {
         ticker.tick().await;
+        run_sweep_once(&state, chrono::Utc::now()).await;
+    }
+}
 
-        let reopened = {
-            let mut board = state.board.write().await;
-            board.expire_claims(chrono::Utc::now())
-        };
-        for task_id in reopened {
-            let task = state.board.read().await.get_task(task_id).cloned();
-            if let Some(task) = task {
-                if let Err(e) = state.store.save_task(&task) {
-                    println!("failed to persist expired-claim task {task_id}: {e}");
+/// One sweep pass, pulled out of `sweep_loop` so tests can drive it
+/// directly without waiting on a real 60-second timer. `now` is threaded
+/// through (rather than each check calling `chrono::Utc::now()` itself) so
+/// tests can simulate a deadline having passed without an actual sleep --
+/// mirroring the board methods this delegates to, which already take `now`
+/// for the same reason.
+async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc>) {
+    let reopened = {
+        let mut board = state.board.write().await;
+        board.expire_claims(now)
+    };
+    for task_id in reopened {
+        persist_task_by_id(state, task_id, "expired-claim").await;
+    }
+
+    let cancelled = {
+        let mut board = state.board.write().await;
+        board.cancel_understaffed_consensus_tasks(now)
+    };
+    for task_id in cancelled {
+        persist_task_by_id(state, task_id, "understaffed consensus").await;
+        println!("sweep: cancelled understaffed consensus task {task_id} past its join deadline");
+    }
+
+    let resolved = {
+        let mut board = state.board.write().await;
+        board.resolve_expired_consensus_tasks(now)
+    };
+    for task_id in resolved {
+        let task = persist_task_by_id(state, task_id, "resolved consensus").await;
+        // A deadline-triggered resolution can ding reputation for several
+        // assignees at once (every no-show/loser), not just whichever
+        // pubkey happens to be at hand -- persist every one of them, or
+        // the penalty is silently lost on the next restart.
+        if let Some(task) = task {
+            for assignee in task.consensus_assignees() {
+                let reputation = state.board.read().await.reputation(&assignee);
+                if let Err(e) = state.store.save_reputation(&assignee, &reputation) {
+                    println!(
+                        "failed to persist reputation for {assignee} after consensus resolution: {e}"
+                    );
                 }
             }
         }
-
-        auth::cleanup_replay_guard();
+        println!("sweep: resolved consensus task {task_id} past its submission deadline");
     }
+
+    let unpaid: Vec<Uuid> = state
+        .board
+        .read()
+        .await
+        .verified_unpaid_tasks()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    for task_id in unpaid {
+        if handlers::try_settle_verified_task(state, task_id).await {
+            println!("sweep: retried and paid out task {task_id}");
+        }
+    }
+
+    auth::cleanup_replay_guard();
+}
+
+/// Fetches `task_id` and persists it, logging (rather than failing) on
+/// error, and returns the fetched task (if it still exists) so a caller
+/// needing it for further work -- e.g. persisting the reputation of
+/// every assignee a consensus resolution just touched -- doesn't have to
+/// fetch it a second time.
+async fn persist_task_by_id(state: &AppState, task_id: Uuid, context: &str) -> Option<Task> {
+    let task = state.board.read().await.get_task(task_id).cloned();
+    if let Some(task) = &task {
+        if let Err(e) = state.store.save_task(task) {
+            println!("failed to persist {context} task {task_id}: {e}");
+        }
+    }
+    task
 }
 
 #[tokio::main]
@@ -126,8 +193,22 @@ async fn main() -> Result<()> {
 
     tokio::spawn(sweep_loop(state.clone()));
 
-    let app = Router::new()
+    let app = build_router(state);
+
+    let addr = format!("0.0.0.0:{}", args.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("hub listening on {addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Wires up every route against the given state. Pulled out of `main` so
+/// tests can stand up the exact same router against a real (ephemeral
+/// port) HTTP server, without duplicating the route list.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/tasks", get(handlers::list_tasks).post(handlers::create_task))
+        .route("/tasks/consensus", post(handlers::create_consensus_task))
         .route("/tasks/:id", get(handlers::get_task))
         .route("/tasks/:id/claim", post(handlers::claim_task))
         .route("/tasks/:id/submit", post(handlers::submit_task))
@@ -135,11 +216,850 @@ async fn main() -> Result<()> {
         .route("/reputation/:pubkey", get(handlers::get_reputation))
         .route("/leaderboard", get(handlers::leaderboard))
         .route("/llms.txt", get(handlers::llms_txt))
-        .with_state(state);
+        .with_state(state)
+}
 
-    let addr = format!("0.0.0.0:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("hub listening on {addr}");
-    axum::serve(listener, app).await?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::TaskStatus;
+    use btclib::crypto::Signature;
+    use btclib::network::Message;
+    use btclib::sha256::Hash;
+    use btclib::types::{Transaction, TransactionOutput};
+    use chrono::{DateTime, Utc};
+    use serde::Serialize;
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    fn temp_store_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("itx_hub_maintest_{}.redb", Uuid::new_v4()))
+    }
+
+    /// A minimal stand-in for a real node: speaks just enough of the wire
+    /// protocol (handshake, `FetchUTXOs`, `SubmitTransaction`) to drive
+    /// the hub's real `NodeClient` in tests, without a real
+    /// `Blockchain`/`node` process behind it. Reports exactly one
+    /// unmarked UTXO of `balance` for `funded_pubkey` and nothing for
+    /// anyone else, and records everything submitted to it.
+    struct FakeNode {
+        addr: String,
+        submitted: Arc<AsyncMutex<Vec<Transaction>>>,
+    }
+
+    impl FakeNode {
+        async fn spawn(funded_pubkey: PublicKey, balance: u64) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let submitted = Arc::new(AsyncMutex::new(Vec::new()));
+            let submitted_for_accept_loop = submitted.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let funded_pubkey = funded_pubkey.clone();
+                    let submitted = submitted_for_accept_loop.clone();
+                    tokio::spawn(async move {
+                        if btclib::network::perform_handshake_acceptor(&mut socket)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        loop {
+                            let message = match Message::receive_async(&mut socket).await {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                            match message {
+                                Message::FetchUTXOs(pk) => {
+                                    let utxos = if pk == funded_pubkey {
+                                        vec![(
+                                            TransactionOutput {
+                                                value: balance,
+                                                unique_id: Uuid::new_v4(),
+                                                pubkey: pk,
+                                            },
+                                            false,
+                                        )]
+                                    } else {
+                                        vec![]
+                                    };
+                                    if Message::UTXOs(utxos).send_async(&mut socket).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Message::SubmitTransaction(tx) => {
+                                    submitted.lock().await.push(tx);
+                                    // fire-and-forget, matching the real protocol
+                                }
+                                _ => return,
+                            }
+                        }
+                    });
+                }
+            });
+            FakeNode { addr, submitted }
+        }
+
+        async fn submitted_transactions(&self) -> Vec<Transaction> {
+            self.submitted.lock().await.clone()
+        }
+
+        /// `NodeClient::submit_transaction` is fire-and-forget (the real
+        /// wire protocol has no acknowledgement for it -- see its own
+        /// doc comment), so a caller observing success only knows the
+        /// bytes were handed to the OS socket, not that this fake node's
+        /// own async accept/receive loop has gotten around to recording
+        /// them yet. Polls briefly instead of asserting on
+        /// `submitted_transactions` immediately after a settle call.
+        async fn wait_for_submitted_count(&self, expected: usize) -> Vec<Transaction> {
+            for _ in 0..100 {
+                let submitted = self.submitted_transactions().await;
+                if submitted.len() >= expected {
+                    return submitted;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            self.submitted_transactions().await
+        }
+    }
+
+    /// An address guaranteed to have nothing listening on it right now --
+    /// for tests that need a deterministically-unreachable "node" rather
+    /// than racing against a real process's timing.
+    async fn dead_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
+        // `listener` drops here, freeing the port right back up -- nothing
+        // is bound to it again within this test's lifetime.
+    }
+
+    struct TestHub {
+        base_url: String,
+        state: Arc<AppState>,
+        operator_key: PrivateKey,
+        client: reqwest::Client,
+        store_path: std::path::PathBuf,
+    }
+
+    impl Drop for TestHub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.store_path);
+        }
+    }
+
+    async fn spawn_hub(operator_private_key: PrivateKey, node_address: String) -> TestHub {
+        let operator_public_key = operator_private_key.public_key();
+        let store_path = temp_store_path();
+        let store = HubStore::open_or_create(&store_path).unwrap();
+        let state = Arc::new(AppState {
+            board: RwLock::new(TaskBoard::new()),
+            store,
+            node: NodeClient::new(node_address),
+            operator_private_key: operator_private_key.clone(),
+            operator_public_key,
+        });
+
+        let app = build_router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        TestHub {
+            base_url,
+            state,
+            operator_key: operator_private_key,
+            client: reqwest::Client::new(),
+            store_path,
+        }
+    }
+
+    fn envelope_at<T: Serialize>(key: &PrivateKey, payload: T, timestamp: DateTime<Utc>) -> Value {
+        let pubkey_hex = key.public_key().to_string();
+        let timestamp_str = timestamp.to_rfc3339();
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let signing_string = format!("{pubkey_hex}:{timestamp_str}:{payload_json}");
+        let hash = Hash::hash_bytes(signing_string.as_bytes());
+        let signature = Signature::sign_hash(&hash, key);
+        json!({
+            "pubkey": pubkey_hex,
+            "timestamp": timestamp_str,
+            "payload": payload,
+            "signature": hex::encode(signature.to_bytes()),
+        })
+    }
+
+    fn envelope<T: Serialize>(key: &PrivateKey, payload: T) -> Value {
+        envelope_at(key, payload, Utc::now())
+    }
+
+    /// Drives `board` directly (bypassing HTTP entirely) through
+    /// create-claim-submit-correct-answer, landing a task in `Verified`
+    /// status with a known claimant. Used by tests that exercise payout
+    /// settlement specifically and don't want task *creation*'s node-
+    /// dependent balance check in the way.
+    async fn seed_verified_task(state: &AppState, bounty: u64) -> (Uuid, PublicKey) {
+        let claimant = PrivateKey::new_key().public_key();
+        let expected = Hash::hash_bytes(b"seeded answer");
+        let task_id = {
+            let mut board = state.board.write().await;
+            let task = board.create_task(
+                state.operator_public_key.clone(),
+                "seeded".to_string(),
+                bounty,
+                expected,
+            );
+            board
+                .claim_task(task.id, claimant.clone(), Utc::now() + chrono::Duration::minutes(5))
+                .unwrap();
+            assert!(board.submit(task.id, claimant.clone(), expected).unwrap());
+            task.id
+        };
+        (task_id, claimant)
+    }
+
+    #[tokio::test]
+    async fn full_http_task_lifecycle_pays_out_through_a_real_router() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+
+        let resp = hub
+            .client
+            .post(format!("{}/faucet", hub.base_url))
+            .json(&envelope(&agent_key, ()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // a FRESH envelope (new signature) for an already-granted pubkey
+        // -- distinct from the replay case, which reuses the same
+        // signature (see `replayed_envelope_is_rejected`).
+        let resp = hub
+            .client
+            .post(format!("{}/faucet", hub.base_url))
+            .json(&envelope(&agent_key, ()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+
+        let expected_output_hash = hex::encode(Hash::hash_bytes(b"42").as_bytes());
+        let payload = handlers::CreateTaskPayload {
+            description: "test task".to_string(),
+            bounty: 1_000,
+            expected_output_hash,
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let task: Value = resp.json().await.unwrap();
+        let task_id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/claim", hub.base_url))
+            .json(&envelope(&agent_key, handlers::ClaimPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/submit", hub.base_url))
+            .json(&envelope(
+                &agent_key,
+                handlers::SubmitPayload { task_id, output: "wrong answer".to_string() },
+            ))
+            .send()
+            .await
+            .unwrap();
+        let result: Value = resp.json().await.unwrap();
+        assert_eq!(result["verified"], false);
+
+        hub.client
+            .post(format!("{}/tasks/{task_id}/claim", hub.base_url))
+            .json(&envelope(&agent_key, handlers::ClaimPayload { task_id }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/submit", hub.base_url))
+            .json(&envelope(
+                &agent_key,
+                handlers::SubmitPayload { task_id, output: "42".to_string() },
+            ))
+            .send()
+            .await
+            .unwrap();
+        let result: Value = resp.json().await.unwrap();
+        assert_eq!(result["verified"], true);
+        assert_eq!(result["paid"], true);
+
+        let reputation: Value = hub
+            .client
+            .get(format!("{}/reputation/{}", hub.base_url, agent_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reputation["completed"], 1);
+        assert_eq!(reputation["total_earned"], 1_000);
+
+        let leaderboard: Value = hub
+            .client
+            .get(format!("{}/leaderboard", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(leaderboard.as_array().unwrap().len(), 1);
+
+        let submitted = fake_node.wait_for_submitted_count(2).await;
+        assert_eq!(submitted.len(), 2, "faucet grant + bounty payout");
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_non_operator() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let impostor = PrivateKey::new_key();
+
+        let payload = handlers::CreateTaskPayload {
+            description: "should be rejected".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&impostor, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_insufficient_operator_balance() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let payload = handlers::CreateTaskPayload {
+            description: "too rich for the operator".to_string(),
+            bounty: 1_000_000,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn replayed_envelope_is_rejected() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+        let env = envelope(&agent_key, ());
+
+        let first = hub
+            .client
+            .post(format!("{}/faucet", hub.base_url))
+            .json(&env)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+        // the exact same envelope (same signature) a second time
+        let second = hub
+            .client
+            .post(format!("{}/faucet", hub.base_url))
+            .json(&env)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stale_timestamp_envelope_is_rejected() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+
+        let stale = envelope_at(&agent_key, (), Utc::now() - chrono::Duration::minutes(10));
+        let resp = hub
+            .client
+            .post(format!("{}/faucet", hub.base_url))
+            .json(&stale)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn try_settle_verified_task_fails_gracefully_when_node_unreachable() {
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key, dead_address().await).await;
+        let (task_id, _claimant) = seed_verified_task(&hub.state, 1_000).await;
+
+        let paid = handlers::try_settle_verified_task(&hub.state, task_id).await;
+        assert!(!paid);
+
+        let status = hub.state.board.read().await.get_task(task_id).unwrap().status;
+        assert_eq!(status, TaskStatus::Verified, "must remain retryable, not stuck or lost");
+    }
+
+    #[tokio::test]
+    async fn try_settle_verified_task_pays_out_and_marks_paid() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let (task_id, claimant) = seed_verified_task(&hub.state, 1_000).await;
+
+        let paid = handlers::try_settle_verified_task(&hub.state, task_id).await;
+        assert!(paid);
+
+        let status = hub.state.board.read().await.get_task(task_id).unwrap().status;
+        assert_eq!(status, TaskStatus::Paid);
+
+        let submitted = fake_node.wait_for_submitted_count(1).await;
+        assert_eq!(submitted.len(), 1);
+        let recipient_output = submitted[0].outputs.iter().find(|o| o.pubkey == claimant);
+        assert_eq!(recipient_output.unwrap().value, 1_000);
+    }
+
+    #[tokio::test]
+    async fn try_settle_verified_task_never_double_pays_concurrent_callers() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let (task_id, _claimant) = seed_verified_task(&hub.state, 1_000).await;
+
+        let (a, b) = tokio::join!(
+            handlers::try_settle_verified_task(&hub.state, task_id),
+            handlers::try_settle_verified_task(&hub.state, task_id),
+        );
+        assert_eq!(
+            [a, b].iter().filter(|&&x| x).count(),
+            1,
+            "exactly one of the two concurrent attempts should have won and paid it out"
+        );
+
+        let submitted = fake_node.wait_for_submitted_count(1).await;
+        assert_eq!(
+            submitted.len(),
+            1,
+            "must never submit two payout transactions for the same task"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sweep_once_pays_out_all_verified_unpaid_tasks() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let (task_a, _) = seed_verified_task(&hub.state, 500).await;
+        let (task_b, _) = seed_verified_task(&hub.state, 700).await;
+
+        run_sweep_once(&hub.state, Utc::now()).await;
+
+        let board = hub.state.board.read().await;
+        assert_eq!(board.get_task(task_a).unwrap().status, TaskStatus::Paid);
+        assert_eq!(board.get_task(task_b).unwrap().status, TaskStatus::Paid);
+        drop(board);
+        assert_eq!(fake_node.wait_for_submitted_count(2).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_consensus_task_rejects_too_few_assignees() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let payload = handlers::CreateConsensusTaskPayload {
+            description: "needs redundancy".to_string(),
+            bounty: 10,
+            num_assignees: 1,
+            join_window_minutes: 30,
+            submission_window_minutes: 30,
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/consensus", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn full_http_consensus_task_lifecycle_pays_out_the_majority() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_a = PrivateKey::new_key();
+        let agent_b = PrivateKey::new_key();
+        let agent_c = PrivateKey::new_key();
+
+        let payload = handlers::CreateConsensusTaskPayload {
+            description: "open-ended".to_string(),
+            bounty: 900,
+            num_assignees: 3,
+            join_window_minutes: 30,
+            submission_window_minutes: 30,
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/consensus", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let task: Value = resp.json().await.unwrap();
+        assert_eq!(task["kind"], "consensus");
+        assert_eq!(task["num_assignees"], 3);
+        assert_eq!(task["assignees_joined"], 0);
+        let task_id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+
+        // all three join through the same /claim endpoint HashMatch tasks use
+        for agent in [&agent_a, &agent_b, &agent_c] {
+            let resp = hub
+                .client
+                .post(format!("{}/tasks/{task_id}/claim", hub.base_url))
+                .json(&envelope(agent, handlers::ClaimPayload { task_id }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }
+
+        let task: Value = hub
+            .client
+            .get(format!("{}/tasks/{task_id}", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(task["status"], "Claimed");
+        assert_eq!(task["assignees_joined"], 3);
+
+        // two agree, one doesn't -- all through the same /submit endpoint
+        for (agent, answer) in [(&agent_a, "42"), (&agent_b, "42")] {
+            let resp = hub
+                .client
+                .post(format!("{}/tasks/{task_id}/submit", hub.base_url))
+                .json(&envelope(
+                    agent,
+                    handlers::SubmitPayload { task_id, output: answer.to_string() },
+                ))
+                .send()
+                .await
+                .unwrap();
+            let result: Value = resp.json().await.unwrap();
+            assert_eq!(result["resolved"], false, "still waiting on the third assignee");
+        }
+
+        // the third submission completes the set and triggers resolution
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/submit", hub.base_url))
+            .json(&envelope(
+                &agent_c,
+                handlers::SubmitPayload { task_id, output: "disagree".to_string() },
+            ))
+            .send()
+            .await
+            .unwrap();
+        let result: Value = resp.json().await.unwrap();
+        assert_eq!(result["resolved"], true);
+        assert_eq!(result["verified"], false, "agent_c disagreed with the majority");
+
+        let rep_a: Value = hub
+            .client
+            .get(format!("{}/reputation/{}", hub.base_url, agent_a.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rep_a["completed"], 1);
+        assert_eq!(rep_a["total_earned"], 450, "900 bounty split between the 2 winners");
+
+        let rep_c: Value = hub
+            .client
+            .get(format!("{}/reputation/{}", hub.base_url, agent_c.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rep_c["completed"], 0);
+        assert_eq!(rep_c["failed"], 1, "dinged for disagreeing with the majority");
+
+        let submitted = fake_node.wait_for_submitted_count(2).await;
+        assert_eq!(submitted.len(), 2, "both winners paid, the dissenter gets nothing");
+    }
+
+    #[tokio::test]
+    async fn claim_task_rejects_insufficient_reputation_via_http() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let payload = handlers::CreateTaskPayload {
+            description: "veterans only".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+            min_reputation: 3,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let task: Value = resp.json().await.unwrap();
+        assert_eq!(task["min_reputation"], 3);
+        let task_id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+
+        let novice = PrivateKey::new_key();
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/claim", hub.base_url))
+            .json(&envelope(&novice, handlers::ClaimPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let veteran = PrivateKey::new_key();
+        {
+            let mut board = hub.state.board.write().await;
+            board.restore_reputation(
+                veteran.public_key(),
+                board::Reputation { completed: 3, failed: 0, total_earned: 0 },
+            );
+        }
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/claim", hub.base_url))
+            .json(&envelope(&veteran, handlers::ClaimPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "veteran meets the bar and should succeed");
+    }
+
+    #[tokio::test]
+    async fn run_sweep_once_persists_reputation_for_every_consensus_loser() {
+        // Regression test: a deadline-triggered consensus resolution used
+        // to persist the resolved task itself but never the reputation
+        // dings it just applied, silently losing them on restart.
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key, dead_address().await).await;
+
+        let (task_id, no_show) = {
+            let mut board = hub.state.board.write().await;
+            // A real, positive submission window so the two legitimate
+            // submissions below succeed (submission_deadline is anchored
+            // at fill time, not creation time -- see
+            // TaskKind::Consensus::submission_window_minutes). The window
+            // having elapsed is simulated below by handing run_sweep_once
+            // a future `now`, rather than by racing submit against an
+            // already-past deadline.
+            let task = board.create_consensus_task(
+                hub.state.operator_public_key.clone(),
+                "t".to_string(),
+                900,
+                3,
+                Utc::now() + chrono::Duration::minutes(30),
+                30,
+            );
+            let agents: Vec<PublicKey> = (0..3).map(|_| PrivateKey::new_key().public_key()).collect();
+            for agent in &agents {
+                board.join_consensus_task(task.id, agent.clone()).unwrap();
+            }
+            // two agree; the third never submits before its deadline
+            board.submit_consensus_answer(task.id, agents[0].clone(), "42".to_string()).unwrap();
+            board.submit_consensus_answer(task.id, agents[1].clone(), "42".to_string()).unwrap();
+            (task.id, agents[2].clone())
+        };
+
+        run_sweep_once(&hub.state, Utc::now() + chrono::Duration::minutes(31)).await;
+        assert_eq!(hub.state.board.read().await.get_task(task_id).unwrap().status, TaskStatus::Verified);
+        assert_eq!(hub.state.board.read().await.reputation(&no_show).failed, 1);
+
+        // The actual regression check: read it back through the store,
+        // not just the in-memory board, to confirm it was really persisted.
+        let persisted = hub.state.store.load_all_reputation().unwrap();
+        let no_show_record = persisted.iter().find(|(pk, _)| *pk == no_show);
+        assert!(
+            no_show_record.is_some(),
+            "the no-show's reputation ding must be persisted, not just held in memory"
+        );
+        assert_eq!(no_show_record.unwrap().1.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn create_consensus_task_rejects_non_positive_submission_window() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        for window in [0, -5] {
+            let payload = handlers::CreateConsensusTaskPayload {
+                description: "t".to_string(),
+                bounty: 10,
+                num_assignees: 2,
+                join_window_minutes: 30,
+                submission_window_minutes: window,
+                min_reputation: 0,
+            };
+            let resp = hub
+                .client
+                .post(format!("{}/tasks/consensus", hub.base_url))
+                .json(&envelope(&hub.operator_key, payload))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "submission_window_minutes={window} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_consensus_task_rejects_non_positive_join_window() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        for window in [0, -5] {
+            let payload = handlers::CreateConsensusTaskPayload {
+                description: "t".to_string(),
+                bounty: 10,
+                num_assignees: 2,
+                join_window_minutes: window,
+                submission_window_minutes: 30,
+                min_reputation: 0,
+            };
+            let resp = hub
+                .client
+                .post(format!("{}/tasks/consensus", hub.base_url))
+                .json(&envelope(&hub.operator_key, payload))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "join_window_minutes={window} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_frees_escrow_from_a_cancelled_understaffed_consensus_task() {
+        // End-to-end proof that cancelling an understaffed task actually
+        // does something useful: it frees the operator's escrow back up
+        // for a real subsequent task creation, not just a status flip.
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 1_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        {
+            let mut board = hub.state.board.write().await;
+            board.create_consensus_task(
+                hub.state.operator_public_key.clone(),
+                "hogging the whole escrow".to_string(),
+                1_000,
+                3,
+                Utc::now() - chrono::Duration::minutes(1),
+                60,
+            );
+        }
+        assert_eq!(hub.state.board.read().await.allocated_bounty(), 1_000);
+
+        let blocked_payload = handlers::CreateTaskPayload {
+            description: "blocked".to_string(),
+            bounty: 1_000,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, blocked_payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "no escrow left");
+
+        run_sweep_once(&hub.state, Utc::now()).await;
+        assert_eq!(hub.state.board.read().await.allocated_bounty(), 0, "sweep must free the cancelled task's escrow");
+
+        let now_allowed_payload = handlers::CreateTaskPayload {
+            description: "should work now".to_string(),
+            bounty: 1_000,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+            min_reputation: 0,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, now_allowed_payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "escrow freed, this must now succeed");
+    }
 }
