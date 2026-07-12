@@ -129,6 +129,30 @@ impl HubStore {
         Ok(())
     }
 
+    /// Same as `save_reputation`, but for several pubkeys at once in a
+    /// single redb write transaction (one fsync total) rather than one
+    /// per entry. A `Consensus` task's resolution can update every
+    /// assignee's reputation in one go (see `Task::consensus_assignees`),
+    /// so callers persisting that should batch here instead of looping
+    /// over individual `save_reputation` calls.
+    pub fn save_reputation_batch(&self, entries: &[(PublicKey, Reputation)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REPUTATION_TABLE)?;
+            for (pubkey, reputation) in entries {
+                let mut bytes = Vec::new();
+                ciborium::into_writer(reputation, &mut bytes)
+                    .map_err(|e| HubStoreError::Serialization(e.to_string()))?;
+                table.insert(pubkey.to_sec1_bytes().as_slice(), bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn load_all_reputation(&self) -> Result<Vec<(PublicKey, Reputation)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(REPUTATION_TABLE)?;
@@ -232,6 +256,41 @@ mod tests {
         let grants = store.load_all_faucet_grants().unwrap();
         assert_eq!(grants, vec![agent]);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_reputation_batch_writes_every_entry_in_one_transaction() {
+        let path = temp_db_path("batch");
+        let store = HubStore::open_or_create(&path).unwrap();
+
+        let entries: Vec<(PublicKey, Reputation)> = (0..3)
+            .map(|i| {
+                (
+                    PrivateKey::new_key().public_key(),
+                    Reputation { completed: i, failed: 0, total_earned: i * 100 },
+                )
+            })
+            .collect();
+        store.save_reputation_batch(&entries).unwrap();
+
+        let loaded = store.load_all_reputation().unwrap();
+        assert_eq!(loaded.len(), 3);
+        for (pubkey, reputation) in &entries {
+            let found = loaded.iter().find(|(k, _)| k == pubkey).unwrap();
+            assert_eq!(found.1.completed, reputation.completed);
+            assert_eq!(found.1.total_earned, reputation.total_earned);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_reputation_batch_of_zero_entries_is_a_harmless_no_op() {
+        let path = temp_db_path("batch_empty");
+        let store = HubStore::open_or_create(&path).unwrap();
+        store.save_reputation_batch(&[]).unwrap();
+        assert!(store.load_all_reputation().unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
 

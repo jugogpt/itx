@@ -10,27 +10,47 @@ use anyhow::Result;
 use argh::FromArgs;
 use axum::routing::{get, post};
 use axum::Router;
-use board::{Task, TaskBoard};
+use board::{Reputation, Task, TaskBoard};
 use btclib::crypto::{PrivateKey, PublicKey};
 use btclib::util::Saveable;
 use node_client::NodeClient;
 use std::sync::Arc;
 use store::HubStore;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
-/// Shared state handed to every HTTP handler. `board` is the only piece
-/// that changes after startup, so it's the only field behind a lock --
-/// `store`/`node` are internally either lock-free (redb) or open a fresh
-/// connection per call (see `NodeClient`), and the operator keys never
-/// change for the process's lifetime.
+/// Shared state handed to every HTTP handler. `board` changes after
+/// startup so it's behind its own lock; `payout_lock` guards a different
+/// thing -- not board state, but the operator's on-chain UTXO set (see
+/// `handlers::pay_bounty`) -- so it's a separate lock rather than piggy-
+/// backing on `board`'s. `store`/`node` are internally either lock-free
+/// (redb) or open a fresh connection per call (see `NodeClient`), and the
+/// operator keys never change for the process's lifetime.
 pub struct AppState {
     pub board: RwLock<TaskBoard>,
     pub store: HubStore,
     pub node: NodeClient,
     pub operator_private_key: PrivateKey,
     pub operator_public_key: PublicKey,
+    /// Serializes every `pay_bounty` call (faucet grants and task
+    /// payouts alike) so at most one is ever building/submitting a
+    /// transaction against the operator's UTXO set at a time. Without
+    /// this, two concurrent payouts (a faucet claim racing a task
+    /// settlement, or two different tasks settling around the same
+    /// moment -- nothing serializes across *different* recipients today)
+    /// can both fetch the same unspent UTXO before either transaction is
+    /// confirmed and both try to spend it. Since every hub-issued
+    /// transaction uses the same flat `HUB_TRANSACTION_FEE`, the node's
+    /// mempool conflict resolution (replace-by-strictly-higher-fee) never
+    /// lets the second one replace the first -- it just rejects it
+    /// outright. `NodeClient::submit_transaction` is fire-and-forget
+    /// (see its own doc comment) and the node protocol sends no error
+    /// back for a rejected transaction, so the loser's caller would
+    /// otherwise have no idea its payout never actually landed on chain,
+    /// and would go on to call `mark_recipient_paid`/`save_faucet_grant`
+    /// anyway.
+    pub payout_lock: Mutex<()>,
 }
 
 #[derive(FromArgs)]
@@ -108,15 +128,23 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
         // A deadline-triggered resolution can ding reputation for several
         // assignees at once (every no-show/loser), not just whichever
         // pubkey happens to be at hand -- persist every one of them, or
-        // the penalty is silently lost on the next restart.
-        if let Some(task) = task {
-            for assignee in task.consensus_assignees() {
-                let reputation = state.board.read().await.reputation(&assignee);
-                if let Err(e) = state.store.save_reputation(&assignee, &reputation) {
-                    println!(
-                        "failed to persist reputation for {assignee} after consensus resolution: {e}"
-                    );
-                }
+        // the penalty is silently lost on the next restart. Batched into
+        // one redb transaction rather than one write per assignee.
+        if let Some(task) = &task {
+            let entries: Vec<(PublicKey, Reputation)> = {
+                let board = state.board.read().await;
+                task.consensus_assignees()
+                    .into_iter()
+                    .map(|assignee| {
+                        let reputation = board.reputation(&assignee);
+                        (assignee, reputation)
+                    })
+                    .collect()
+            };
+            if let Err(e) = state.store.save_reputation_batch(&entries) {
+                println!(
+                    "failed to persist reputation for consensus assignees of task {task_id} after resolution: {e}"
+                );
             }
         }
         println!("sweep: resolved consensus task {task_id} past its submission deadline");
@@ -189,6 +217,7 @@ async fn main() -> Result<()> {
         node: NodeClient::new(args.node_address),
         operator_private_key,
         operator_public_key,
+        payout_lock: Mutex::new(()),
     });
 
     tokio::spawn(sweep_loop(state.clone()));
@@ -212,6 +241,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/tasks/:id", get(handlers::get_task))
         .route("/tasks/:id/claim", post(handlers::claim_task))
         .route("/tasks/:id/submit", post(handlers::submit_task))
+        .route("/tasks/:id/cancel", post(handlers::cancel_task))
         .route("/faucet", post(handlers::faucet_claim))
         .route("/reputation/:pubkey", get(handlers::get_reputation))
         .route("/leaderboard", get(handlers::leaderboard))
@@ -362,6 +392,7 @@ mod tests {
             node: NodeClient::new(node_address),
             operator_private_key: operator_private_key.clone(),
             operator_public_key,
+            payout_lock: Mutex::new(()),
         });
 
         let app = build_router(state.clone());
@@ -1061,5 +1092,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK, "escrow freed, this must now succeed");
+    }
+
+    #[tokio::test]
+    async fn cancel_task_rejects_non_operator() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let impostor = PrivateKey::new_key();
+
+        let task_id = {
+            let mut board = hub.state.board.write().await;
+            board
+                .create_task(
+                    hub.state.operator_public_key.clone(),
+                    "t".to_string(),
+                    10,
+                    Hash::hash_bytes(b"x"),
+                )
+                .id
+        };
+
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/cancel", hub.base_url))
+            .json(&envelope(&impostor, handlers::CancelPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(hub.state.board.read().await.get_task(task_id).unwrap().status, TaskStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_frees_escrow_via_http() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let payload = handlers::CreateTaskPayload {
+            description: "mis-posted".to_string(),
+            bounty: 1_000,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+            min_reputation: 0,
+        };
+        let task: Value = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let task_id: Uuid = task["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(hub.state.board.read().await.allocated_bounty(), 1_000);
+
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/cancel", hub.base_url))
+            .json(&envelope(&hub.operator_key, handlers::CancelPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let cancelled: Value = resp.json().await.unwrap();
+        assert_eq!(cancelled["status"], "Closed");
+        assert_eq!(cancelled["close_reason"], "cancelled_by_operator");
+        assert_eq!(hub.state.board.read().await.allocated_bounty(), 0, "escrow freed immediately, no sweep needed");
+
+        // cancelling an already-closed task is a conflict, not a silent no-op
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/cancel", hub.base_url))
+            .json(&envelope(&hub.operator_key, handlers::CancelPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_paginates_oldest_first() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let base_time = Utc::now();
+
+        // Inserted with explicit, staggered created_at timestamps rather
+        // than relying on a tight loop's real wall-clock gaps, which
+        // could tie at this resolution and make the expected order
+        // flaky.
+        let mut ids = Vec::new();
+        for i in 0..5u32 {
+            let mut board = hub.state.board.write().await;
+            let mut task = board.create_task(
+                hub.state.operator_public_key.clone(),
+                format!("task {i}"),
+                10,
+                Hash::hash_bytes(format!("answer{i}").as_bytes()),
+            );
+            task.created_at = base_time + chrono::Duration::seconds(i as i64);
+            ids.push(task.id);
+            board.restore_task(task);
+        }
+
+        let page: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks?limit=2&offset=1", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), ids[1], "oldest-first, so offset=1 starts at the 2nd-oldest");
+        assert_eq!(page[1]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), ids[2]);
+
+        let capped: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks?limit=999", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 5, "only 5 exist, so a request for more just returns all of them");
+
+        let default_page: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(default_page.len(), 5, "well under the default page size");
     }
 }

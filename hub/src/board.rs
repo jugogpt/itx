@@ -34,6 +34,8 @@ pub enum BoardError {
     AlreadySubmitted,
     #[error("this task requires at least {required} completed tasks, you have {have}")]
     InsufficientReputation { required: u64, have: u64 },
+    #[error("task is already in a terminal state and cannot be cancelled")]
+    AlreadyTerminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,24 +45,32 @@ pub enum TaskStatus {
     /// A winner (or, for a `Consensus` task, at least one) has been determined; payout to them is in flight but not yet confirmed submitted to the chain.
     Verified,
     Paid,
-    /// `Consensus`-only terminal status covering two distinct causes --
-    /// no one is owed a payout and no reputation was docked either way.
-    /// See `Task::close_reason` for which cause it was.
+    /// A terminal status covering three distinct causes, none of which
+    /// owe a payout or dock anyone's reputation -- see `Task::close_reason`
+    /// for which cause it was. The first two only ever apply to a
+    /// `Consensus` task; the third (an operator cancellation) applies to
+    /// either kind.
     Closed,
 }
 
-/// Why a `Consensus` task ended in `TaskStatus::Closed`. Exposed on the
-/// wire (see `handlers::TaskDto`) so a client can tell "an honest vote
-/// split" apart from "never found enough participants" without having to
-/// infer it themselves by comparing `assignees_joined` to `num_assignees`.
+/// Why a task ended in `TaskStatus::Closed`. Exposed on the wire (see
+/// `handlers::TaskDto`) so a client can tell these causes apart without
+/// having to infer one from the other task fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseReason {
-    /// Every answer was tied for the majority (or every assignee
-    /// disagreed with every other) -- an honest split, nobody dinged.
+    /// `Consensus`-only: every answer was tied for the majority (or every
+    /// assignee disagreed with every other) -- an honest split, nobody
+    /// dinged.
     NoMajority,
-    /// Never reached `num_assignees` joiners before its join deadline.
+    /// `Consensus`-only: never reached `num_assignees` joiners before its
+    /// join deadline.
     Understaffed,
+    /// Either kind: the operator cancelled it directly via
+    /// `TaskBoard::cancel_task` -- e.g. a mis-posted task, or an
+    /// abandoned claim/assignment the operator didn't want to wait out.
+    /// Not anyone's fault, same as the other two causes.
+    CancelledByOperator,
 }
 
 /// One assignee's participation in a `Consensus` task: their answer (once
@@ -141,8 +151,7 @@ pub struct Task {
     /// `set_min_reputation` right after creation to require a track
     /// record before agents may attempt higher-value or higher-trust work.
     pub min_reputation: u64,
-    /// `Consensus`-only: why the task ended `Closed`, if it did. See
-    /// `CloseReason`.
+    /// Why the task ended `Closed`, if it did. See `CloseReason`.
     pub close_reason: Option<CloseReason>,
 }
 
@@ -335,6 +344,28 @@ impl TaskBoard {
     pub fn set_min_reputation(&mut self, id: Uuid, min_reputation: u64) -> Result<(), BoardError> {
         let task = self.tasks.get_mut(&id).ok_or(BoardError::NotFound)?;
         task.min_reputation = min_reputation;
+        Ok(())
+    }
+
+    /// Cancels `id` directly -- an operator escape hatch for a task that
+    /// doesn't need to wait out its usual expiry path (a mis-posted task
+    /// still `Open`, or a `Claimed`/in-progress one the operator doesn't
+    /// want to wait on `claim_deadline`/`submission_deadline` for).
+    /// Works on either `TaskKind`, and leaves `claimant`/consensus
+    /// `assignees` untouched as a historical record of who was involved
+    /// when it was cancelled. No payout, no reputation impact either way
+    /// -- same as `Understaffed`/`NoMajority`, an operator cancellation
+    /// isn't the worker's fault. Rejects a task already in a terminal
+    /// state (`Verified`/`Paid`/`Closed`) rather than silently no-op'ing,
+    /// since `Verified`/`Paid` in particular already has (or is about to
+    /// have) money moving for it.
+    pub fn cancel_task(&mut self, id: Uuid) -> Result<(), BoardError> {
+        let task = self.tasks.get_mut(&id).ok_or(BoardError::NotFound)?;
+        if matches!(task.status, TaskStatus::Verified | TaskStatus::Paid | TaskStatus::Closed) {
+            return Err(BoardError::AlreadyTerminal);
+        }
+        task.status = TaskStatus::Closed;
+        task.close_reason = Some(CloseReason::CancelledByOperator);
         Ok(())
     }
 
@@ -1303,6 +1334,112 @@ mod tests {
         assert!(matches!(
             board.join_consensus_task(task.id, pubkey()),
             Err(BoardError::JoinWindowExpired)
+        ));
+    }
+
+    #[test]
+    fn submit_consensus_answer_rejects_a_submission_past_its_deadline() {
+        // Mirrors join_consensus_task_rejects_a_join_past_its_deadline for
+        // the twin defensive check in submit_consensus_answer. A negative
+        // submission_window_minutes forces submission_deadline into the
+        // past the instant the task fills, the same trick
+        // create_and_fill_consensus_task's own doc comment describes
+        // (used directly here, not through that helper, since it clamps
+        // the window to a minimum of 1 minute).
+        let mut board = TaskBoard::new();
+        let task = board.create_consensus_task(
+            pubkey(),
+            "already expired by the time it fills".to_string(),
+            10,
+            2,
+            Utc::now() + chrono::Duration::hours(1),
+            -1,
+        );
+        let a = pubkey();
+        let b = pubkey();
+        board.join_consensus_task(task.id, a.clone()).unwrap();
+        board.join_consensus_task(task.id, b).unwrap();
+        assert_eq!(board.get_task(task.id).unwrap().status, TaskStatus::Claimed);
+
+        assert!(matches!(
+            board.submit_consensus_answer(task.id, a, "42".to_string()),
+            Err(BoardError::SubmissionWindowExpired)
+        ));
+    }
+
+    #[test]
+    fn cancel_task_closes_an_open_task_and_frees_its_escrow() {
+        let mut board = TaskBoard::new();
+        let task = board.create_task(pubkey(), "oops, typo".to_string(), 100, Hash::hash_bytes(b"x"));
+        assert_eq!(board.allocated_bounty(), 100);
+
+        board.cancel_task(task.id).unwrap();
+
+        let task = board.get_task(task.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Closed);
+        assert_eq!(task.close_reason, Some(CloseReason::CancelledByOperator));
+        assert_eq!(board.allocated_bounty(), 0);
+    }
+
+    #[test]
+    fn cancel_task_closes_a_claimed_task_without_dinging_the_claimant() {
+        let mut board = TaskBoard::new();
+        let task = board.create_task(pubkey(), "abandoned".to_string(), 100, Hash::hash_bytes(b"x"));
+        let claimant = pubkey();
+        board
+            .claim_task(task.id, claimant.clone(), Utc::now() + chrono::Duration::minutes(30))
+            .unwrap();
+
+        board.cancel_task(task.id).unwrap();
+
+        assert_eq!(board.get_task(task.id).unwrap().status, TaskStatus::Closed);
+        assert_eq!(board.reputation(&claimant).failed, 0, "an operator cancellation isn't the claimant's fault");
+    }
+
+    #[test]
+    fn cancel_task_works_on_a_claimed_consensus_task_too() {
+        let mut board = TaskBoard::new();
+        let deadline = Utc::now() + chrono::Duration::minutes(30);
+        let (task_id, assignees) = create_and_fill_consensus_task(&mut board, 2, deadline);
+        assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::Claimed);
+        assert_eq!(board.allocated_bounty(), 900);
+
+        board.cancel_task(task_id).unwrap();
+
+        let task = board.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Closed);
+        assert_eq!(task.close_reason, Some(CloseReason::CancelledByOperator));
+        assert_eq!(board.allocated_bounty(), 0);
+        for assignee in &assignees {
+            assert_eq!(board.reputation(assignee).failed, 0);
+        }
+    }
+
+    #[test]
+    fn cancel_task_rejects_an_already_terminal_task() {
+        let mut board = TaskBoard::new();
+        let expected = Hash::hash_bytes(b"x");
+        let task = board.create_task(pubkey(), "t".to_string(), 10, expected);
+        let worker = pubkey();
+        board
+            .claim_task(task.id, worker.clone(), Utc::now() + chrono::Duration::minutes(5))
+            .unwrap();
+        board.submit(task.id, worker.clone(), expected).unwrap();
+        board.mark_recipient_paid(task.id, &worker, 10).unwrap();
+        assert_eq!(board.get_task(task.id).unwrap().status, TaskStatus::Paid);
+
+        assert!(matches!(
+            board.cancel_task(task.id),
+            Err(BoardError::AlreadyTerminal)
+        ));
+    }
+
+    #[test]
+    fn cancel_task_on_a_missing_task_fails() {
+        let mut board = TaskBoard::new();
+        assert!(matches!(
+            board.cancel_task(Uuid::new_v4()),
+            Err(BoardError::NotFound)
         ));
     }
 }

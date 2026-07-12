@@ -3,7 +3,7 @@ use tracing::*;
 use crate::auth::{AuthError, SignedEnvelope};
 use crate::board::{BoardError, CloseReason, Reputation, Task, TaskBoard, TaskKind, TaskStatus};
 use crate::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -37,6 +37,12 @@ const MAX_CONSENSUS_WINDOW_MINUTES: i64 = 60 * 24 * 365;
 /// and the sweep's equivalent), so this also caps how much synchronous
 /// disk I/O one task's resolution can trigger.
 const MAX_CONSENSUS_ASSIGNEES: u32 = 100;
+/// `GET /tasks`'s page size when the caller doesn't specify `limit`.
+const DEFAULT_TASKS_PAGE_SIZE: usize = 50;
+/// Upper bound on `GET /tasks`'s `limit`, regardless of what the caller
+/// asks for -- keeps one request's response (and the read-lock hold time
+/// building it) bounded no matter how many open tasks exist.
+const MAX_TASKS_PAGE_SIZE: usize = 200;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -90,7 +96,8 @@ impl From<BoardError> for ApiError {
             | BoardError::AlreadySubmitted
             | BoardError::JoinWindowExpired
             | BoardError::SubmissionWindowExpired
-            | BoardError::WrongTaskKind => ApiError::Conflict(e.to_string()),
+            | BoardError::WrongTaskKind
+            | BoardError::AlreadyTerminal => ApiError::Conflict(e.to_string()),
             BoardError::NotClaimant | BoardError::InsufficientReputation { .. } => {
                 ApiError::Forbidden(e.to_string())
             }
@@ -274,13 +281,47 @@ pub struct SubmitPayload {
     pub output: String,
 }
 
+/// Query params for `GET /tasks`. Both optional -- see
+/// `DEFAULT_TASKS_PAGE_SIZE`/`MAX_TASKS_PAGE_SIZE` for what an absent
+/// `limit` defaults to and what any `limit` is capped at.
+#[derive(Deserialize)]
+pub struct ListTasksQuery {
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct CancelPayload {
+    pub task_id: Uuid,
+}
+
 // ---------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------
 
-pub async fn list_tasks(State(state): State<Arc<AppState>>) -> Json<Vec<TaskDto>> {
+/// Lists open tasks oldest-first (by `created_at`), paginated via
+/// `?offset=&limit=` -- see `ListTasksQuery`. Ordering by creation time
+/// (rather than `TaskBoard`'s internal by-id order) is what makes
+/// pagination actually meaningful: a stable "page 2" means the same thing
+/// across calls, and older tasks can't be pushed off the end by newer
+/// ones arriving.
+pub async fn list_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListTasksQuery>,
+) -> Json<Vec<TaskDto>> {
+    let limit = query.limit.unwrap_or(DEFAULT_TASKS_PAGE_SIZE).min(MAX_TASKS_PAGE_SIZE);
     let board = state.board.read().await;
-    Json(board.list_open_tasks().into_iter().map(TaskDto::from).collect())
+    let mut tasks = board.list_open_tasks();
+    tasks.sort_by_key(|t| t.created_at);
+    Json(
+        tasks
+            .into_iter()
+            .skip(query.offset)
+            .take(limit)
+            .map(TaskDto::from)
+            .collect(),
+    )
 }
 
 pub async fn get_task(
@@ -390,6 +431,32 @@ pub async fn claim_task(
             let deadline = Utc::now() + Duration::minutes(CLAIM_TTL_MINUTES);
             board.claim_task(task_id, pubkey, deadline)?;
         }
+        board.get_task(task_id).expect("just touched it").clone()
+    };
+    state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(TaskDto::from(&task)))
+}
+
+/// Operator-only: cancels `task_id` directly rather than waiting out its
+/// usual expiry path. See `TaskBoard::cancel_task` for the exact rules
+/// (works on either task kind, no payout/reputation impact, rejects an
+/// already-terminal task).
+pub async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<CancelPayload>>,
+) -> Result<Json<TaskDto>, ApiError> {
+    if envelope.payload.task_id != task_id {
+        return Err(ApiError::BadRequest(
+            "task id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+    require_operator(&pubkey, &state)?;
+
+    let task = {
+        let mut board = state.board.write().await;
+        board.cancel_task(task_id)?;
         board.get_task(task_id).expect("just touched it").clone()
     };
     state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -783,6 +850,8 @@ GET /tasks lists open tasks of both kinds below, each tagged `"kind":
 `description`; a `hash_match` task's verification target is never shown,
 and a `consensus` task's other assignees' answers are never shown either
 -- only `num_assignees` and how many have joined so far (`assignees_joined`).
+Results are ordered oldest-first and paginated: `?limit=` (default
+{default_page_size}, max {max_page_size}) and `?offset=` control the page.
 
 POST /tasks/<id>/claim and POST /tasks/<id>/submit are the same two
 endpoints for both kinds -- what they do depends on the task's `kind`.
@@ -836,6 +905,8 @@ before POST .../claim will accept you; below the bar gets you a 403.
         fee = HUB_TRANSACTION_FEE,
         faucet_amount = FAUCET_GRANT_AMOUNT,
         claim_ttl = CLAIM_TTL_MINUTES,
+        default_page_size = DEFAULT_TASKS_PAGE_SIZE,
+        max_page_size = MAX_TASKS_PAGE_SIZE,
     )
 }
 
@@ -917,7 +988,22 @@ async fn ensure_operator_can_fund(state: &AppState, board: &TaskBoard, bounty: u
     Ok(())
 }
 
+/// Fetches the operator's UTXOs, builds a payment to `recipient`, and
+/// submits it -- the whole sequence held under `AppState::payout_lock` so
+/// at most one payout is ever in flight against the operator's UTXO set.
+/// Without this, two payouts running concurrently (a faucet claim and a
+/// task settlement, or two different tasks settling close together --
+/// nothing else here serializes across different recipients) could both
+/// fetch the same unspent UTXO and both build a transaction spending it.
+/// Since every hub-issued transaction shares the same flat
+/// `HUB_TRANSACTION_FEE`, the node's mempool never lets the second one
+/// replace the first (replace-by-fee requires a strictly higher fee) --
+/// it just silently rejects it, and `submit_transaction` is fire-and-
+/// forget (see its own doc comment), so the caller of the losing payout
+/// would otherwise have no way of knowing it never landed on chain before
+/// going on to record it as paid anyway.
 async fn pay_bounty(state: &AppState, recipient: &PublicKey, amount: u64) -> anyhow::Result<()> {
+    let _guard = state.payout_lock.lock().await;
     let utxos = state.node.fetch_utxos(&state.operator_public_key).await?;
     let tx = btclib::payment::build_payment(
         &utxos,
@@ -950,16 +1036,22 @@ async fn persist_task_and_reputation(
 /// reputation in one go -- without this, only whichever single pubkey a
 /// caller happened to already have in hand would ever get its reputation
 /// change written to disk, silently losing everyone else's penalty across
-/// a restart. Best-effort: logs and continues past an individual save
-/// failure rather than aborting the rest.
+/// a restart. Written as a single batched transaction (see
+/// `HubStore::save_reputation_batch`) rather than one redb write per
+/// assignee, capped at `MAX_CONSENSUS_ASSIGNEES` fsyncs either way.
 async fn persist_other_assignees_reputation(state: &AppState, task: &Task, already_saved: &PublicKey) {
-    for assignee in task.consensus_assignees() {
-        if assignee == *already_saved {
-            continue;
-        }
-        let reputation = state.board.read().await.reputation(&assignee);
-        if let Err(e) = state.store.save_reputation(&assignee, &reputation) {
-            println!("failed to persist reputation for {assignee} after consensus resolution: {e}");
-        }
+    let entries: Vec<(PublicKey, Reputation)> = {
+        let board = state.board.read().await;
+        task.consensus_assignees()
+            .into_iter()
+            .filter(|assignee| assignee != already_saved)
+            .map(|assignee| {
+                let reputation = board.reputation(&assignee);
+                (assignee, reputation)
+            })
+            .collect()
+    };
+    if let Err(e) = state.store.save_reputation_batch(&entries) {
+        println!("failed to persist reputation for consensus assignees of task {} after resolution: {e}", task.id);
     }
 }
