@@ -85,6 +85,12 @@ impl Block {
         Hash::hash(self)
     }
 
+    pub fn serialized_size(&self) -> usize {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("BUG: failed to serialize Block");
+        buf.len()
+    }
+
     pub fn verify_transactions(
         &self,
         predicted_block_height: u64,

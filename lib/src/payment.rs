@@ -11,11 +11,8 @@ pub enum PaymentError {
     InsufficientFunds { available: u64, needed: u64 },
 }
 
-/// Greedily selects from `available_utxos` (skipping any marked as
-/// already spoken for) until `amount + fee` is covered, signs each
-/// selected input with `signing_key`, and returns a transaction paying
-/// `amount` to `recipient` with any leftover sent back to
-/// `change_pubkey`.
+/// Single-recipient special case of `build_multi_payment` -- see its doc
+/// comment for the actual logic.
 ///
 /// All of `available_utxos` must be spendable by the same
 /// `signing_key` -- a wallet mixing UTXOs across multiple keys in one
@@ -30,7 +27,32 @@ pub fn build_payment(
     fee: u64,
     change_pubkey: PublicKey,
 ) -> Result<Transaction, PaymentError> {
-    let total_needed = amount + fee;
+    build_multi_payment(available_utxos, signing_key, &[(recipient, amount)], fee, change_pubkey)
+}
+
+/// Greedily selects from `available_utxos` (skipping any marked as
+/// already spoken for) until the sum of every `recipients` amount plus
+/// `fee` is covered, signs each selected input with `signing_key`, and
+/// returns a transaction paying each recipient their specified amount
+/// (in one output apiece) with any leftover sent back to `change_pubkey`.
+///
+/// This exists rather than always looping `build_payment` per recipient
+/// because a source address funded by a single, exact deposit (see the
+/// hub's escrow mechanism) holds *exactly* that deposit, unlike an
+/// ongoing wallet's float: settling several recipients from the same
+/// pot via independent single-payment transactions would send whatever
+/// "change" remained after the first one back to the source, stranding
+/// every recipient after it. One combined transaction has no such
+/// ordering hazard, and costs one fee total instead of one per recipient.
+pub fn build_multi_payment(
+    available_utxos: &[(bool, TransactionOutput)],
+    signing_key: &PrivateKey,
+    recipients: &[(PublicKey, u64)],
+    fee: u64,
+    change_pubkey: PublicKey,
+) -> Result<Transaction, PaymentError> {
+    let recipients_total: u64 = recipients.iter().map(|(_, amount)| amount).sum();
+    let total_needed = recipients_total + fee;
     let mut inputs = Vec::new();
     let mut input_sum = 0u64;
 
@@ -56,11 +78,14 @@ pub fn build_payment(
         });
     }
 
-    let mut outputs = vec![TransactionOutput {
-        value: amount,
-        unique_id: Uuid::new_v4(),
-        pubkey: recipient,
-    }];
+    let mut outputs: Vec<TransactionOutput> = recipients
+        .iter()
+        .map(|(recipient, amount)| TransactionOutput {
+            value: *amount,
+            unique_id: Uuid::new_v4(),
+            pubkey: recipient.clone(),
+        })
+        .collect();
     if input_sum > total_needed {
         outputs.push(TransactionOutput {
             value: input_sum - total_needed,
@@ -150,5 +175,57 @@ mod tests {
             result,
             Err(PaymentError::InsufficientFunds { available: 5, needed: 100 })
         ));
+    }
+
+    #[test]
+    fn build_multi_payment_pays_every_recipient_in_one_transaction() {
+        let owner = PrivateKey::new_key();
+        let recipient1 = PrivateKey::new_key().public_key();
+        let recipient2 = PrivateKey::new_key().public_key();
+        let available = vec![(false, utxo(1_000, owner.public_key()))];
+
+        let tx = build_multi_payment(
+            &available,
+            &owner,
+            &[(recipient1.clone(), 300), (recipient2.clone(), 300)],
+            10,
+            owner.public_key(),
+        )
+        .unwrap();
+
+        assert_eq!(tx.inputs.len(), 1, "one combined transaction, not one per recipient");
+        assert_eq!(tx.outputs.iter().find(|o| o.pubkey == recipient1).unwrap().value, 300);
+        assert_eq!(tx.outputs.iter().find(|o| o.pubkey == recipient2).unwrap().value, 300);
+        let change = tx.outputs.iter().find(|o| o.pubkey == owner.public_key()).unwrap();
+        assert_eq!(change.value, 1_000 - 300 - 300 - 10);
+    }
+
+    #[test]
+    fn build_multi_payment_rejects_insufficient_funds_across_all_recipients() {
+        let owner = PrivateKey::new_key();
+        let r1 = PrivateKey::new_key().public_key();
+        let r2 = PrivateKey::new_key().public_key();
+        let available = vec![(false, utxo(50, owner.public_key()))];
+
+        let result = build_multi_payment(&available, &owner, &[(r1, 30), (r2, 30)], 0, owner.public_key());
+        assert!(matches!(
+            result,
+            Err(PaymentError::InsufficientFunds { available: 50, needed: 60 })
+        ));
+    }
+
+    #[test]
+    fn build_payment_is_the_single_recipient_case_of_build_multi_payment() {
+        let owner = PrivateKey::new_key();
+        let recipient = PrivateKey::new_key().public_key();
+        let available = vec![(false, utxo(100, owner.public_key()))];
+
+        let single = build_payment(&available, &owner, recipient.clone(), 40, 5, owner.public_key()).unwrap();
+        let multi = build_multi_payment(&available, &owner, &[(recipient, 40)], 5, owner.public_key()).unwrap();
+
+        assert_eq!(single.outputs.len(), multi.outputs.len());
+        let total_single: u64 = single.outputs.iter().map(|o| o.value).sum();
+        let total_multi: u64 = multi.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(total_single, total_multi);
     }
 }

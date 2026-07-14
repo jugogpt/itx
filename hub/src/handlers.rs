@@ -1,13 +1,17 @@
 use tracing::*;
 
 use crate::auth::{AuthError, SignedEnvelope};
-use crate::board::{BoardError, CloseReason, Reputation, Task, TaskBoard, TaskKind, TaskStatus};
+use crate::board::{
+    BoardError, CloseReason, ConsensusTaskIntent, Dispute, DisputableTaskIntent, DisputeResolution,
+    EscrowConfirmation, EscrowPurpose, EscrowStatus, PendingDeposit, Reputation, Task, TaskBoard, TaskIntent,
+    TaskKind, TaskStatus,
+};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use btclib::crypto::PublicKey;
+use btclib::crypto::{PrivateKey, PublicKey};
 use btclib::sha256::Hash;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
@@ -43,6 +47,11 @@ const DEFAULT_TASKS_PAGE_SIZE: usize = 50;
 /// asks for -- keeps one request's response (and the read-lock hold time
 /// building it) bounded no matter how many open tasks exist.
 const MAX_TASKS_PAGE_SIZE: usize = 200;
+/// How long a reserved escrow deposit stays open for funding before the
+/// sweep treats it as abandoned (and refunds whatever, if anything,
+/// showed up late). An hour is generous slack for an on-chain payment to
+/// actually confirm on this testnet.
+const ESCROW_RESERVATION_TTL_MINUTES: i64 = 60;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -87,7 +96,7 @@ impl From<AuthError> for ApiError {
 impl From<BoardError> for ApiError {
     fn from(e: BoardError) -> Self {
         match e {
-            BoardError::NotFound => ApiError::NotFound(e.to_string()),
+            BoardError::NotFound | BoardError::EscrowNotFound => ApiError::NotFound(e.to_string()),
             BoardError::NotOpen
             | BoardError::NotClaimed
             | BoardError::NotVerified
@@ -97,10 +106,19 @@ impl From<BoardError> for ApiError {
             | BoardError::JoinWindowExpired
             | BoardError::SubmissionWindowExpired
             | BoardError::WrongTaskKind
-            | BoardError::AlreadyTerminal => ApiError::Conflict(e.to_string()),
-            BoardError::NotClaimant | BoardError::InsufficientReputation { .. } => {
-                ApiError::Forbidden(e.to_string())
-            }
+            | BoardError::AlreadyTerminal
+            | BoardError::EscrowNotReserved
+            | BoardError::EscrowExpired
+            | BoardError::EscrowUnderfunded { .. }
+            | BoardError::WrongEscrowPurpose
+            | BoardError::DisputeWindowClosed
+            | BoardError::AlreadyDisputed
+            | BoardError::NotDisputed
+            | BoardError::CannotCancelWhileDisputed => ApiError::Conflict(e.to_string()),
+            BoardError::NotClaimant
+            | BoardError::InsufficientReputation { .. }
+            | BoardError::PosterCannotClaimOwnTask
+            | BoardError::AssigneeCannotDisputeOwnSubmission => ApiError::Forbidden(e.to_string()),
         }
     }
 }
@@ -142,6 +160,40 @@ pub enum TaskKindDto {
         /// down before then.
         submission_deadline: Option<DateTime<Utc>>,
     },
+    Disputable {
+        /// `None` until `submit_disputable_answer` sets it.
+        answer: Option<String>,
+        /// `None` until the answer's submitted -- the dispute window
+        /// doesn't start counting down before then.
+        dispute_deadline: Option<DateTime<Utc>>,
+        dispute: Option<DisputeDto>,
+    },
+}
+
+/// A `Disputable` task's filed dispute, if any -- unlike `Consensus`'s
+/// hidden-until-resolved individual answers, there's no anti-collusion
+/// reason to hide this (there's only ever one challenger, not several
+/// simultaneous voters who could copy each other), so it's visible as
+/// soon as it's filed.
+#[derive(Serialize)]
+pub struct DisputeDto {
+    pub challenger: String,
+    pub reason: String,
+    pub bond_amount: u64,
+    pub filed_at: DateTime<Utc>,
+    pub resolution: Option<DisputeResolution>,
+}
+
+impl From<&Dispute> for DisputeDto {
+    fn from(d: &Dispute) -> Self {
+        DisputeDto {
+            challenger: d.challenger.to_string(),
+            reason: d.reason.clone(),
+            bond_amount: d.bond_amount,
+            filed_at: d.filed_at,
+            resolution: d.resolution,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -171,6 +223,11 @@ impl From<&Task> for TaskDto {
                 assignees_joined: assignees.len() as u32,
                 join_deadline: *join_deadline,
                 submission_deadline: *submission_deadline,
+            },
+            TaskKind::Disputable { answer, dispute_deadline, dispute, .. } => TaskKindDto::Disputable {
+                answer: answer.clone(),
+                dispute_deadline: *dispute_deadline,
+                dispute: dispute.as_ref().map(DisputeDto::from),
             },
         };
         TaskDto {
@@ -296,6 +353,91 @@ pub struct CancelPayload {
     pub task_id: Uuid,
 }
 
+/// Same shape as `CreateTaskPayload`, minus the operator restriction --
+/// this funds itself via an escrow deposit (see `create_task_escrow`)
+/// instead of the operator's wallet.
+#[derive(Deserialize, Serialize)]
+pub struct EscrowTaskPayload {
+    pub description: String,
+    pub bounty: u64,
+    pub expected_output_hash: String,
+    #[serde(default)]
+    pub min_reputation: u64,
+}
+
+/// Same shape as `CreateConsensusTaskPayload`, minus the operator
+/// restriction.
+#[derive(Deserialize, Serialize)]
+pub struct EscrowConsensusTaskPayload {
+    pub description: String,
+    pub bounty: u64,
+    pub num_assignees: u32,
+    pub join_window_minutes: i64,
+    pub submission_window_minutes: i64,
+    #[serde(default)]
+    pub min_reputation: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ConfirmEscrowPayload {
+    pub escrow_id: Uuid,
+}
+
+/// Same shape as `CreateTaskPayload`/`EscrowTaskPayload`, but for a
+/// `Disputable` task -- funds itself via escrow, same as
+/// `EscrowTaskPayload`; there's no operator-funded equivalent (an
+/// open-ended, dispute-resolved task is squarely the agent-to-agent case
+/// this whole escrow mechanism exists for).
+#[derive(Deserialize, Serialize)]
+pub struct EscrowDisputableTaskPayload {
+    pub description: String,
+    pub bounty: u64,
+    pub dispute_window_minutes: i64,
+    #[serde(default)]
+    pub min_reputation: u64,
+}
+
+/// Reserves a bond escrow for disputing `task_id`'s submitted answer.
+#[derive(Deserialize, Serialize)]
+pub struct DisputeEscrowPayload {
+    pub task_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ConfirmDisputeEscrowPayload {
+    pub task_id: Uuid,
+    pub escrow_id: Uuid,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ResolveDisputePayload {
+    pub task_id: Uuid,
+    pub outcome: DisputeResolution,
+}
+
+/// What reserving an escrow returns: the address to pay, how much, and
+/// how long the reservation stays open. Deliberately never includes the
+/// private key -- only the hub itself ever needs it.
+#[derive(Serialize)]
+pub struct EscrowReservationDto {
+    pub escrow_id: Uuid,
+    pub deposit_address: String,
+    pub required_amount: u64,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl From<&PendingDeposit> for EscrowReservationDto {
+    fn from(deposit: &PendingDeposit) -> Self {
+        EscrowReservationDto {
+            escrow_id: deposit.id,
+            deposit_address: deposit.deposit_pubkey.to_string(),
+            required_amount: deposit.required_amount,
+            expires_at: deposit.expires_at,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------
@@ -404,6 +546,298 @@ pub async fn create_consensus_task(
     Ok(Json(TaskDto::from(&task)))
 }
 
+/// Reserves a fresh escrow deposit for a `HashMatch` task funded by the
+/// caller's own wallet rather than the operator's -- any signed pubkey
+/// may call this, unlike `create_task`. See `TaskBoard::reserve_escrow`'s
+/// doc comment for the durability requirement this handler must honor:
+/// the deposit is persisted *before* its address is ever returned here.
+pub async fn create_task_escrow(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedEnvelope<EscrowTaskPayload>>,
+) -> Result<Json<EscrowReservationDto>, ApiError> {
+    let pubkey = envelope.verify()?;
+    let expected_output_hash = parse_hex_hash(&envelope.payload.expected_output_hash)?;
+    let bounty = envelope.payload.bounty;
+    let required_amount = bounty + HUB_TRANSACTION_FEE;
+
+    let intent = TaskIntent {
+        description: envelope.payload.description.clone(),
+        bounty,
+        expected_output_hash,
+        min_reputation: envelope.payload.min_reputation,
+    };
+    let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
+    let deposit = state.board.write().await.reserve_escrow(
+        pubkey,
+        required_amount,
+        EscrowPurpose::FundHashMatchTask(intent),
+        expires_at,
+    );
+    state.store.save_pending_deposit(&deposit).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(EscrowReservationDto::from(&deposit)))
+}
+
+/// Same as `create_task_escrow`, for a `Consensus` task instead.
+pub async fn create_consensus_task_escrow(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedEnvelope<EscrowConsensusTaskPayload>>,
+) -> Result<Json<EscrowReservationDto>, ApiError> {
+    let pubkey = envelope.verify()?;
+    if envelope.payload.num_assignees < 2 {
+        return Err(ApiError::BadRequest(
+            "a consensus task needs at least 2 assignees for majority agreement to mean anything".into(),
+        ));
+    }
+    if envelope.payload.num_assignees > MAX_CONSENSUS_ASSIGNEES {
+        return Err(ApiError::BadRequest(format!(
+            "num_assignees must be at most {MAX_CONSENSUS_ASSIGNEES}"
+        )));
+    }
+    validate_positive_minutes(envelope.payload.join_window_minutes, "join_window_minutes")?;
+    validate_positive_minutes(envelope.payload.submission_window_minutes, "submission_window_minutes")?;
+    let bounty = envelope.payload.bounty;
+    let required_amount = bounty + HUB_TRANSACTION_FEE;
+
+    let intent = ConsensusTaskIntent {
+        description: envelope.payload.description.clone(),
+        bounty,
+        num_assignees: envelope.payload.num_assignees,
+        join_window_minutes: envelope.payload.join_window_minutes,
+        submission_window_minutes: envelope.payload.submission_window_minutes,
+        min_reputation: envelope.payload.min_reputation,
+    };
+    let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
+    let deposit = state.board.write().await.reserve_escrow(
+        pubkey,
+        required_amount,
+        EscrowPurpose::FundConsensusTask(intent),
+        expires_at,
+    );
+    state.store.save_pending_deposit(&deposit).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(EscrowReservationDto::from(&deposit)))
+}
+
+/// Same as `create_task_escrow`, for a `Disputable` task instead -- see
+/// `TaskKind::Disputable`. No operator-funded equivalent exists (unlike
+/// `HashMatch`/`Consensus`): open-ended, dispute-resolved work is
+/// squarely the agent-to-agent case escrow exists for.
+pub async fn create_disputable_task_escrow(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedEnvelope<EscrowDisputableTaskPayload>>,
+) -> Result<Json<EscrowReservationDto>, ApiError> {
+    let pubkey = envelope.verify()?;
+    validate_positive_minutes(envelope.payload.dispute_window_minutes, "dispute_window_minutes")?;
+    let bounty = envelope.payload.bounty;
+    let required_amount = bounty + HUB_TRANSACTION_FEE;
+
+    let intent = DisputableTaskIntent {
+        description: envelope.payload.description.clone(),
+        bounty,
+        dispute_window_minutes: envelope.payload.dispute_window_minutes,
+        min_reputation: envelope.payload.min_reputation,
+    };
+    let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
+    let deposit = state.board.write().await.reserve_escrow(
+        pubkey,
+        required_amount,
+        EscrowPurpose::FundDisputableTask(intent),
+        expires_at,
+    );
+    state.store.save_pending_deposit(&deposit).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(EscrowReservationDto::from(&deposit)))
+}
+
+/// Checks whether `escrow_id`'s deposit address now holds at least its
+/// required amount and, if so, materializes the real task it was
+/// reserved for. Only the original depositor may confirm their own
+/// escrow. `observed_amount` comes from a live `FetchUTXOs` balance
+/// check -- confirmed, mined state only (see `NodeClient::balance`), so
+/// a payment that's merely in the mempool won't be seen as funded yet.
+pub async fn confirm_task_escrow(
+    State(state): State<Arc<AppState>>,
+    Path(escrow_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<ConfirmEscrowPayload>>,
+) -> Result<Json<TaskDto>, ApiError> {
+    if envelope.payload.escrow_id != escrow_id {
+        return Err(ApiError::BadRequest(
+            "escrow id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+
+    let deposit_pubkey = {
+        let board = state.board.read().await;
+        let deposit = board.get_pending_deposit(escrow_id).ok_or(BoardError::EscrowNotFound)?;
+        if deposit.depositor != pubkey {
+            return Err(ApiError::Forbidden("you are not the depositor of this escrow".into()));
+        }
+        deposit.deposit_pubkey.clone()
+    };
+    let observed_amount = state
+        .node
+        .balance(&deposit_pubkey)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let task = {
+        let mut board = state.board.write().await;
+        let EscrowConfirmation::TaskCreated(task) =
+            board.confirm_escrow(escrow_id, observed_amount, Utc::now())?;
+        task
+    };
+    state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
+    // The now-Consumed deposit's status also needs persisting, or a
+    // restart before the next sweep tick would see it as still Reserved.
+    if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id) {
+        if let Err(e) = state.store.save_pending_deposit(deposit) {
+            println!("failed to persist consumed escrow {escrow_id}: {e}");
+        }
+    }
+    Ok(Json(TaskDto::from(&task)))
+}
+
+/// Reserves a bond escrow for challenging `task_id`'s submitted answer.
+/// Any signed pubkey may call this except the task's own assignee (the
+/// one being disputed) -- checked here, at the point of intent, mirroring
+/// how `claim_task`/`join_consensus_task` check `PosterCannotClaimOwnTask`
+/// at theirs. This is a fast-fail UX nicety, not the real safety
+/// boundary -- `TaskBoard::confirm_dispute_bond` re-checks task state at
+/// confirm time regardless, since this check and that confirmation are
+/// separated by however long the on-chain payment takes.
+pub async fn create_dispute_escrow(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<DisputeEscrowPayload>>,
+) -> Result<Json<EscrowReservationDto>, ApiError> {
+    if envelope.payload.task_id != task_id {
+        return Err(ApiError::BadRequest(
+            "task id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+
+    let bounty = {
+        let board = state.board.read().await;
+        let task = board
+            .get_task(task_id)
+            .ok_or_else(|| ApiError::NotFound("task not found".into()))?;
+        if !matches!(task.kind, TaskKind::Disputable { .. }) {
+            return Err(BoardError::WrongTaskKind.into());
+        }
+        if task.status != TaskStatus::AwaitingDispute {
+            return Err(BoardError::DisputeWindowClosed.into());
+        }
+        if task.claimant.as_ref() == Some(&pubkey) {
+            return Err(BoardError::AssigneeCannotDisputeOwnSubmission.into());
+        }
+        task.bounty
+    };
+    let required_amount = bounty + HUB_TRANSACTION_FEE;
+    let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
+    let deposit = state.board.write().await.reserve_escrow(
+        pubkey,
+        required_amount,
+        EscrowPurpose::DisputeBond { task_id, reason: envelope.payload.reason.clone() },
+        expires_at,
+    );
+    state.store.save_pending_deposit(&deposit).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(EscrowReservationDto::from(&deposit)))
+}
+
+/// Checks whether a dispute bond is now funded and, if the target task is
+/// still actually awaiting a dispute, attaches it (`AwaitingDispute` ->
+/// `Disputed`). If the window closed while the payment was in flight, the
+/// deposit is refunded on the spot rather than left to a later sweep --
+/// `TaskBoard::confirm_dispute_bond` deliberately didn't consume it in
+/// that case for exactly this reason.
+pub async fn confirm_dispute_escrow(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<ConfirmDisputeEscrowPayload>>,
+) -> Result<Json<TaskDto>, ApiError> {
+    if envelope.payload.task_id != task_id {
+        return Err(ApiError::BadRequest(
+            "task id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+    let escrow_id = envelope.payload.escrow_id;
+
+    let deposit_pubkey = {
+        let board = state.board.read().await;
+        let deposit = board.get_pending_deposit(escrow_id).ok_or(BoardError::EscrowNotFound)?;
+        if deposit.depositor != pubkey {
+            return Err(ApiError::Forbidden("you are not the depositor of this escrow".into()));
+        }
+        deposit.deposit_pubkey.clone()
+    };
+    let observed_amount = state
+        .node
+        .balance(&deposit_pubkey)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let confirm_result = {
+        let mut board = state.board.write().await;
+        board.confirm_dispute_bond(escrow_id, observed_amount, Utc::now())
+    };
+    let task = match confirm_result {
+        Ok(task) => task,
+        Err(BoardError::DisputeWindowClosed) => {
+            if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id).cloned() {
+                refund_escrow(&state, &deposit).await;
+            }
+            return Err(BoardError::DisputeWindowClosed.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
+    // The now-Consumed deposit's status also needs persisting, or a
+    // restart before the next sweep tick would see it as still Reserved.
+    if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id) {
+        if let Err(e) = state.store.save_pending_deposit(deposit) {
+            println!("failed to persist consumed dispute-bond escrow {escrow_id}: {e}");
+        }
+    }
+    Ok(Json(TaskDto::from(&task)))
+}
+
+/// Operator-only: resolves a filed dispute and settles both legs right
+/// away (bounty via the ordinary machinery, bond via its own dedicated
+/// path -- see `settle_dispute_bond`) rather than waiting for the sweep.
+pub async fn resolve_dispute(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<ResolveDisputePayload>>,
+) -> Result<Json<TaskDto>, ApiError> {
+    if envelope.payload.task_id != task_id {
+        return Err(ApiError::BadRequest(
+            "task id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+    require_operator(&pubkey, &state)?;
+
+    let (_winner, loser) = {
+        let mut board = state.board.write().await;
+        board.resolve_dispute(task_id, envelope.payload.outcome)?
+    };
+    let task = state.board.read().await.get_task(task_id).expect("just resolved, must still exist").clone();
+    state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
+    // resolve_dispute dinged the loser's reputation immediately, mirroring
+    // resolve_consensus's "dinged at resolution" convention -- persist it.
+    let loser_reputation = state.board.read().await.reputation(&loser);
+    if let Err(e) = state.store.save_reputation(&loser, &loser_reputation) {
+        println!("failed to persist dispute-loser reputation for {loser}: {e}");
+    }
+
+    try_settle_verified_task(&state, task_id).await;
+    settle_dispute_bond(&state, task_id).await;
+
+    let task = state.board.read().await.get_task(task_id).expect("still exists").clone();
+    Ok(Json(TaskDto::from(&task)))
+}
+
 pub async fn claim_task(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<Uuid>,
@@ -460,6 +894,7 @@ pub async fn cancel_task(
         board.get_task(task_id).expect("just touched it").clone()
     };
     state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
+    refund_closed_task_escrow(&state, task_id).await;
     Ok(Json(TaskDto::from(&task)))
 }
 
@@ -475,19 +910,54 @@ pub async fn submit_task(
     }
     let pubkey = envelope.verify()?;
 
-    let is_consensus = {
+    enum Dispatch {
+        HashMatch,
+        Consensus,
+        Disputable,
+    }
+    let dispatch = {
         let board = state.board.read().await;
         let task = board
             .get_task(task_id)
             .ok_or_else(|| ApiError::NotFound("task not found".into()))?;
-        matches!(task.kind, TaskKind::Consensus { .. })
+        match task.kind {
+            TaskKind::Consensus { .. } => Dispatch::Consensus,
+            TaskKind::Disputable { .. } => Dispatch::Disputable,
+            TaskKind::HashMatch { .. } => Dispatch::HashMatch,
+        }
     };
 
-    if is_consensus {
-        submit_consensus_task(&state, task_id, pubkey, envelope.payload.output.clone()).await
-    } else {
-        submit_hash_match_task(&state, task_id, pubkey, &envelope.payload.output).await
+    match dispatch {
+        Dispatch::Consensus => submit_consensus_task(&state, task_id, pubkey, envelope.payload.output.clone()).await,
+        Dispatch::Disputable => submit_disputable_task(&state, task_id, pubkey, envelope.payload.output.clone()).await,
+        Dispatch::HashMatch => submit_hash_match_task(&state, task_id, pubkey, &envelope.payload.output).await,
     }
+}
+
+/// `Disputable` only. Unlike `HashMatch`/`Consensus`, submitting never
+/// pays out (or even finally resolves) anything synchronously -- it just
+/// opens the dispute window (see `TaskBoard::submit_disputable_answer`).
+/// Settlement happens later, either via the sweep (unchallenged) or an
+/// operator's `resolve_dispute` call (challenged).
+async fn submit_disputable_task(
+    state: &AppState,
+    task_id: Uuid,
+    pubkey: PublicKey,
+    answer: String,
+) -> Result<Json<SubmitResultDto>, ApiError> {
+    let task_after_submit = {
+        let mut board = state.board.write().await;
+        board.submit_disputable_answer(task_id, pubkey.clone(), answer, Utc::now())?;
+        board.get_task(task_id).expect("just touched it").clone()
+    };
+    persist_task_and_reputation(state, &task_after_submit, &pubkey).await?;
+
+    Ok(Json(SubmitResultDto {
+        verified: true,
+        paid: false,
+        bounty: Some(task_after_submit.bounty),
+        resolved: Some(false),
+    }))
 }
 
 async fn submit_hash_match_task(
@@ -631,11 +1101,17 @@ static PAYOUT_IN_FLIGHT: DashMap<(Uuid, String), ()> = DashMap::new();
 /// fully-manual retry this replaces; automating the retry doesn't remove
 /// it. Acceptable for a testnet economy, but worth keeping in mind before
 /// reusing this pattern anywhere real money is on the line.
+///
+/// An escrow-funded task (see `Task::escrow_id`) is settled entirely
+/// differently from an operator-funded one -- see `settle_escrow_funded_task`.
 pub async fn try_settle_verified_task(state: &AppState, task_id: Uuid) -> bool {
-    let payouts = {
+    let (payouts, escrow) = {
         let board = state.board.read().await;
         match board.get_task(task_id) {
-            Some(t) if t.status == TaskStatus::Verified => t.pending_payouts(),
+            Some(t) if t.status == TaskStatus::Verified => {
+                let escrow = t.escrow_id.and_then(|id| board.get_pending_deposit(id).cloned());
+                (t.pending_payouts(), escrow)
+            }
             _ => return false,
         }
     };
@@ -643,13 +1119,18 @@ pub async fn try_settle_verified_task(state: &AppState, task_id: Uuid) -> bool {
         return false;
     }
 
-    let mut all_paid = true;
-    for (recipient, amount) in payouts {
-        if !settle_one_payout(state, task_id, &recipient, amount).await {
-            all_paid = false;
+    match escrow {
+        Some(deposit) => settle_escrow_funded_task(state, task_id, &deposit, payouts).await,
+        None => {
+            let mut all_paid = true;
+            for (recipient, amount) in payouts {
+                if !settle_one_payout(state, task_id, &recipient, amount).await {
+                    all_paid = false;
+                }
+            }
+            all_paid
         }
     }
-    all_paid
 }
 
 /// RAII handle on one `PAYOUT_IN_FLIGHT` entry: releases it on `Drop`
@@ -678,6 +1159,249 @@ impl Drop for PayoutGuard {
             PAYOUT_IN_FLIGHT.remove(&key);
         }
     }
+}
+
+/// Parallel to `PAYOUT_IN_FLIGHT`, but at the right granularity for an
+/// escrow: paying out (or refunding) everything at one `PendingDeposit`'s
+/// address is a single all-or-nothing operation against that escrow's own
+/// one-time address, not "N independent recipients from a shared,
+/// ever-refilled pool" the way the operator's wallet is treated -- so
+/// this is keyed by `escrow_id` alone.
+#[dynamic]
+static ESCROW_SETTLEMENT_IN_FLIGHT: DashMap<Uuid, ()> = DashMap::new();
+
+/// Same RAII shape as `PayoutGuard` -- releases unconditionally on drop,
+/// including on cancellation, so a cancelled attempt can never leak the
+/// entry and permanently stall that escrow.
+struct EscrowSettlementGuard(Option<Uuid>);
+
+impl EscrowSettlementGuard {
+    fn try_acquire(escrow_id: Uuid) -> Option<Self> {
+        if ESCROW_SETTLEMENT_IN_FLIGHT.insert(escrow_id, ()).is_some() {
+            return None;
+        }
+        Some(EscrowSettlementGuard(Some(escrow_id)))
+    }
+}
+
+impl Drop for EscrowSettlementGuard {
+    fn drop(&mut self) {
+        if let Some(escrow_id) = self.0.take() {
+            ESCROW_SETTLEMENT_IN_FLIGHT.remove(&escrow_id);
+        }
+    }
+}
+
+/// Settles every still-owed recipient of an escrow-funded task in ONE
+/// combined transaction (see `btclib::payment::build_multi_payment`'s own
+/// doc comment for why: `deposit`'s address holds exactly its one
+/// deposit, not an ongoing float like the operator's wallet, so paying
+/// winners independently would send "change" back to the depositor after
+/// the first payout, stranding every recipient after it).
+async fn settle_escrow_funded_task(
+    state: &AppState,
+    task_id: Uuid,
+    deposit: &PendingDeposit,
+    payouts: Vec<(PublicKey, u64)>,
+) -> bool {
+    let Some(_guard) = EscrowSettlementGuard::try_acquire(deposit.id) else {
+        return false;
+    };
+    // Re-check live state immediately before spending, same principle as
+    // settle_one_payout_inner's own re-check below: `payouts` may be a
+    // stale snapshot if another attempt already settled some of these.
+    let still_owed: Vec<(PublicKey, u64)> = {
+        let board = state.board.read().await;
+        let Some(task) = board.get_task(task_id) else {
+            return false;
+        };
+        payouts.into_iter().filter(|(recipient, _)| !task.is_recipient_paid(recipient)).collect()
+    };
+    if still_owed.is_empty() {
+        return true;
+    }
+
+    if let Err(e) = pay_from(
+        state,
+        &deposit.deposit_private_key,
+        &deposit.deposit_pubkey,
+        &still_owed,
+        &deposit.depositor,
+    )
+    .await
+    {
+        println!(
+            "escrow settlement for task {task_id} (escrow {}) failed, will retry: {e}",
+            deposit.id
+        );
+        return false;
+    }
+
+    let mut all_recorded = true;
+    for (recipient, amount) in &still_owed {
+        if let Err(e) = state.board.write().await.mark_recipient_paid(task_id, recipient, *amount) {
+            println!(
+                "escrow settlement for task {task_id} succeeded on-chain but mark_recipient_paid failed for {recipient}: {e}"
+            );
+            all_recorded = false;
+        }
+    }
+
+    let (final_task, reputations) = {
+        let board = state.board.read().await;
+        let final_task = board.get_task(task_id).cloned();
+        let reputations: Vec<(PublicKey, Reputation)> =
+            still_owed.iter().map(|(pk, _)| (pk.clone(), board.reputation(pk))).collect();
+        (final_task, reputations)
+    };
+    if let Some(final_task) = final_task {
+        if let Err(e) = state.store.save_task(&final_task) {
+            println!("failed to persist task {task_id}: {e}");
+        }
+    }
+    if let Err(e) = state.store.save_reputation_batch(&reputations) {
+        println!("failed to persist reputation after escrow settlement for task {task_id}: {e}");
+    }
+    all_recorded
+}
+
+/// Refunds whatever balance remains at `deposit`'s address back to its
+/// `depositor`, then marks it `Refunded` -- shared by the sweep's
+/// overdue-unconfirmed-reservation path (nothing may have ever arrived)
+/// and by `refund_closed_task_escrow` (a materialized task that turned
+/// out to end without a winner: a Consensus tie, an understaffed
+/// cancellation, or an operator `cancel_task`), since both are "this
+/// escrow's money has nowhere left to go but back to whoever deposited
+/// it."
+/// Sends `deposit`'s current on-chain balance to `recipient` -- who need
+/// not be `deposit.depositor`: a resolved dispute can send a bond forward
+/// to the winning party instead of back to whoever posted it (see
+/// `settle_dispute_bond`) -- then marks the deposit settled. Returns the
+/// *net* amount actually sent (after the network fee, `None` if nothing
+/// was sent or the attempt failed) -- callers crediting reputation off
+/// this must use that, not `deposit.required_amount`, which overstates
+/// it by the fee. Deliberately does *not* touch reputation itself -- a
+/// plain refund never should (getting your own money back isn't
+/// "earning"), and a forfeited-bond credit is a distinct, explicit step
+/// the caller applies separately (see `TaskBoard::credit_forfeited_bond`)
+/// only in the one case where it's warranted.
+async fn disburse_escrow(state: &AppState, deposit: &PendingDeposit, recipient: &PublicKey) -> Option<u64> {
+    let Some(_guard) = EscrowSettlementGuard::try_acquire(deposit.id) else {
+        return None;
+    };
+    let balance = match state.node.balance(&deposit.deposit_pubkey).await {
+        Ok(balance) => balance,
+        Err(e) => {
+            println!("failed to check balance for escrow {} before disbursing: {e}", deposit.id);
+            return None;
+        }
+    };
+    // Below the network fee, there's nothing meaningfully disbursable --
+    // treat it the same as an empty balance rather than fail forever
+    // trying to build a transaction that can never cover its own fee.
+    let net_amount = balance.saturating_sub(HUB_TRANSACTION_FEE);
+    if balance > HUB_TRANSACTION_FEE {
+        if let Err(e) = pay_from(
+            state,
+            &deposit.deposit_private_key,
+            &deposit.deposit_pubkey,
+            &[(recipient.clone(), net_amount)],
+            recipient,
+        )
+        .await
+        {
+            println!("failed to disburse escrow {} to {}: {e}", deposit.id, recipient);
+            return None;
+        }
+    }
+    if let Err(e) = state.board.write().await.mark_escrow_refunded(deposit.id) {
+        println!("failed to mark escrow {} refunded: {e}", deposit.id);
+        return None;
+    }
+    Some(net_amount)
+}
+
+/// Refunds whatever balance remains at `deposit`'s address back to its
+/// own `depositor` -- shared by the sweep's overdue-unconfirmed-
+/// reservation path (nothing may have ever arrived) and by
+/// `refund_closed_task_escrow` (a materialized task that turned out to
+/// end without a winner: a Consensus tie, an understaffed cancellation,
+/// or an operator `cancel_task`), since both are "this escrow's money has
+/// nowhere left to go but back to whoever deposited it."
+pub async fn refund_escrow(state: &AppState, deposit: &PendingDeposit) {
+    disburse_escrow(state, deposit, &deposit.depositor).await;
+}
+
+/// If `task_id` was escrow-funded, refunds whatever remains at its
+/// escrow's address back to its poster. A no-op for an operator-funded
+/// task (nothing was ever escrowed per-task to refund). Called from every
+/// path that can close a task without a winner.
+pub async fn refund_closed_task_escrow(state: &AppState, task_id: Uuid) {
+    let deposit = {
+        let board = state.board.read().await;
+        board.escrow_for_task(task_id).cloned()
+    };
+    if let Some(deposit) = deposit {
+        refund_escrow(state, &deposit).await;
+    }
+}
+
+/// Settles the *bond* leg of a resolved `Disputable` task's dispute --
+/// the *bounty* leg is already handled by the ordinary
+/// `try_settle_verified_task` (since `Task::pending_payouts` for a
+/// resolved dispute already names the winner and draws on the task's own
+/// escrow), but the bond lives in a *different* escrow than the task's
+/// own, so it needs its own dedicated settlement (the same reason
+/// escrow-funded multi-winner Consensus tasks needed `build_multi_payment`
+/// instead of reusing single-recipient plumbing -- two distinct funding
+/// sources can't be expressed through a mechanism that assumes one).
+/// Safe to call repeatedly/on tasks that don't apply: a no-op (returns
+/// `true`, "nothing to do") unless there's a resolved dispute whose bond
+/// hasn't been disbursed yet.
+pub async fn settle_dispute_bond(state: &AppState, task_id: Uuid) -> bool {
+    let settlement = {
+        let board = state.board.read().await;
+        let Some(task) = board.get_task(task_id) else {
+            return true;
+        };
+        let TaskKind::Disputable { dispute: Some(d), .. } = &task.kind else {
+            return true;
+        };
+        let Some(resolution) = d.resolution else {
+            return true; // Disputed but not yet resolved -- nothing to settle
+        };
+        let Some(bond) = board.get_pending_deposit(d.bond_escrow_id) else {
+            return true;
+        };
+        if bond.status != EscrowStatus::Consumed {
+            return true; // already disbursed (or, in principle, never reached Disputed)
+        }
+        let winner = match resolution {
+            DisputeResolution::ChallengerWins => d.challenger.clone(),
+            DisputeResolution::AssigneeWins => match task.claimant.clone() {
+                Some(c) => c,
+                None => return false, // shouldn't happen -- a Disputed task always has a claimant
+            },
+        };
+        let is_forfeiture = matches!(resolution, DisputeResolution::AssigneeWins);
+        (bond.clone(), winner, is_forfeiture)
+    };
+    let (bond_deposit, winner, is_forfeiture) = settlement;
+
+    let Some(net_amount) = disburse_escrow(state, &bond_deposit, &winner).await else {
+        return false;
+    };
+    if is_forfeiture {
+        // net_amount, not bond_deposit.required_amount -- the latter is
+        // the gross funded amount including the network fee, which never
+        // reaches the recipient and so must not count as earned.
+        state.board.write().await.credit_forfeited_bond(&winner, net_amount);
+        let reputation = state.board.read().await.reputation(&winner);
+        if let Err(e) = state.store.save_reputation(&winner, &reputation) {
+            println!("failed to persist forfeited-bond reputation credit for {winner}: {e}");
+        }
+    }
+    true
 }
 
 /// Pays `recipient` their `amount`-sized share of `task_id`'s bounty and
@@ -1002,18 +1726,46 @@ async fn ensure_operator_can_fund(state: &AppState, board: &TaskBoard, bounty: u
 /// forget (see its own doc comment), so the caller of the losing payout
 /// would otherwise have no way of knowing it never landed on chain before
 /// going on to record it as paid anyway.
-async fn pay_bounty(state: &AppState, recipient: &PublicKey, amount: u64) -> anyhow::Result<()> {
-    let _guard = state.payout_lock.lock().await;
-    let utxos = state.node.fetch_utxos(&state.operator_public_key).await?;
-    let tx = btclib::payment::build_payment(
+/// Fetches `source_pubkey`'s UTXOs, builds a transaction paying every one
+/// of `recipients` (change, if any, to `change_pubkey`) signed by
+/// `signing_key`, and submits it. Does no locking itself -- callers are
+/// responsible for ensuring only one such call is ever in flight against
+/// a given `source_pubkey` at a time: `pay_bounty` (below) uses
+/// `state.payout_lock` for the operator's own address; escrow-sourced
+/// callers use `EscrowSettlementGuard`, keyed per `PendingDeposit` since
+/// each has its own independent, never-reused address.
+async fn pay_from(
+    state: &AppState,
+    signing_key: &PrivateKey,
+    source_pubkey: &PublicKey,
+    recipients: &[(PublicKey, u64)],
+    change_pubkey: &PublicKey,
+) -> anyhow::Result<()> {
+    let utxos = state.node.fetch_utxos(source_pubkey).await?;
+    let tx = btclib::payment::build_multi_payment(
         &utxos,
-        &state.operator_private_key,
-        recipient.clone(),
-        amount,
+        signing_key,
+        recipients,
         HUB_TRANSACTION_FEE,
-        state.operator_public_key.clone(),
+        change_pubkey.clone(),
     )?;
     state.node.submit_transaction(tx).await
+}
+
+/// Pays a single `recipient` out of the operator's own wallet -- the
+/// hub's original, and still most common, funding source. A thin wrapper
+/// over `pay_from` for the single-recipient, operator-sourced,
+/// change-to-self case.
+async fn pay_bounty(state: &AppState, recipient: &PublicKey, amount: u64) -> anyhow::Result<()> {
+    let _guard = state.payout_lock.lock().await;
+    pay_from(
+        state,
+        &state.operator_private_key,
+        &state.operator_public_key,
+        &[(recipient.clone(), amount)],
+        &state.operator_public_key,
+    )
+    .await
 }
 
 async fn persist_task_and_reputation(

@@ -50,13 +50,29 @@ pub const PROTOCOL_MAGIC: u32 = 0x49_54_58_00;
 // bump this whenever the wire protocol changes in an incompatible way.
 // v2: Hello/HelloAck gained a timestamp field for network time-offset
 // sampling.
-pub const PROTOCOL_VERSION: u32 = 2;
+// v3: FetchBlock/NewBlock (one block per round trip) replaced by
+// FetchBlocks/Blocks (a batch per round trip) for chain sync.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // upper bound on a single length-prefixed wire message. Well above
 // BLOCK_BYTE_CAP to leave headroom for e.g. large UTXO-set responses,
 // while still rejecting a peer that sends a bogus multi-gigabyte length
 // prefix before we ever allocate a buffer for it.
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
+// upper bound on how many blocks a single FetchBlocks reply may contain,
+// regardless of how many were requested -- the responder enforces this
+// itself rather than trusting the requester's count, and the requester
+// must ask for no more than this per round trip too, so that "fewer
+// blocks came back than requested" can only mean this cap, never an
+// ambiguous mix of two independently-chosen numbers.
+pub const BLOCKS_PER_FETCH_BATCH: usize = 8;
+// safety margin under MAX_MESSAGE_SIZE for one FetchBlocks reply's total
+// serialized size. Coinbase transaction size isn't consensus-bounded
+// (only non-coinbase transactions are, via BLOCK_BYTE_CAP), so this is a
+// belt-and-suspenders running-total check during batch assembly, not just
+// a count cap.
+pub const MAX_FETCH_BATCH_BYTES: usize = 9 * 1024 * 1024;
 
 // how far ahead of our own clock a block's timestamp is allowed to be
 // before we consider it invalid. Mirrors Bitcoin's 2-hour rule; without

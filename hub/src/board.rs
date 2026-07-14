@@ -1,6 +1,6 @@
 use tracing::*;
 
-use btclib::crypto::PublicKey;
+use btclib::crypto::{PrivateKey, PublicKey};
 use btclib::sha256::Hash;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -36,12 +36,43 @@ pub enum BoardError {
     InsufficientReputation { required: u64, have: u64 },
     #[error("task is already in a terminal state and cannot be cancelled")]
     AlreadyTerminal,
+    #[error("no such escrow deposit")]
+    EscrowNotFound,
+    #[error("this escrow deposit has already been consumed or refunded")]
+    EscrowNotReserved,
+    #[error("this escrow deposit's reservation window has expired")]
+    EscrowExpired,
+    #[error("escrow deposit requires at least {required}, only {have} has been received so far")]
+    EscrowUnderfunded { required: u64, have: u64 },
+    #[error("a task's own poster may not claim or join it themselves")]
+    PosterCannotClaimOwnTask,
+    #[error("this escrow deposit's purpose doesn't match the confirmation endpoint used")]
+    WrongEscrowPurpose,
+    #[error("the window to dispute this task's submission has passed")]
+    DisputeWindowClosed,
+    #[error("the assignee may not dispute their own submission")]
+    AssigneeCannotDisputeOwnSubmission,
+    #[error("this task already has a dispute filed against it")]
+    AlreadyDisputed,
+    #[error("this task has no dispute awaiting resolution")]
+    NotDisputed,
+    #[error("cannot cancel a task with an active dispute in progress")]
+    CannotCancelWhileDisputed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Open,
     Claimed,
+    /// `Disputable`-only: an answer was submitted and its dispute window
+    /// is open, but no dispute has been filed (yet). Deliberately
+    /// distinct from `Verified` -- reusing `Verified` here would make the
+    /// existing sweep loop try to pay out immediately, before the
+    /// challenge window has had a chance to close.
+    AwaitingDispute,
+    /// `Disputable`-only: a challenger's bond is posted and confirmed,
+    /// awaiting the operator's resolution. See `Dispute`.
+    Disputed,
     /// A winner (or, for a `Consensus` task, at least one) has been determined; payout to them is in flight but not yet confirmed submitted to the chain.
     Verified,
     Paid,
@@ -128,6 +159,67 @@ pub enum TaskKind {
         submission_deadline: Option<DateTime<Utc>>,
         assignees: BTreeMap<PublicKey, ConsensusAssignment>,
     },
+    /// For open-ended work with no mechanical check (not hash-checkable
+    /// like `HashMatch`, and not amenable to independent-majority voting
+    /// like `Consensus` -- a single claimant does the work, and its
+    /// correctness is judged by whoever's willing to back a challenge
+    /// with money). Single-claimant, like `HashMatch` -- reuses
+    /// `Task::claimant`/`claim_deadline` rather than duplicating them
+    /// here. Operator-arbitrated: there's no mechanical oracle for "is
+    /// this open-ended answer correct," and the operator is the only
+    /// party with standing to be one, consistent with its existing
+    /// total-trust role (it already gates all task creation and
+    /// custodies every escrow).
+    Disputable {
+        /// Set once, by `submit_disputable_answer`.
+        answer: Option<String>,
+        /// Minutes from submission that the dispute window stays open.
+        /// Stored as a window, not a fixed deadline, for the same reason
+        /// `Consensus::submission_window_minutes` is: the anchor moment
+        /// (submission) isn't known at task-creation time.
+        dispute_window_minutes: i64,
+        /// `None` until `submit_disputable_answer` sets it, atomically
+        /// with the `Claimed` -> `AwaitingDispute` transition.
+        dispute_deadline: Option<DateTime<Utc>>,
+        /// `Some` once a challenger's bond is confirmed funded (see
+        /// `TaskBoard::confirm_dispute_bond`), atomically with the
+        /// `AwaitingDispute` -> `Disputed` transition.
+        dispute: Option<Dispute>,
+    },
+}
+
+/// How an operator resolved a filed `Dispute`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisputeResolution {
+    /// The challenger was right: the assignee's submission was wrong.
+    /// Assignee gets nothing (reputation dinged); challenger gets the
+    /// task's bounty plus their own bond back.
+    ChallengerWins,
+    /// The assignee was right: the challenge was unfounded. Challenger
+    /// gets nothing (reputation dinged) and forfeits their bond; assignee
+    /// gets the task's bounty plus the forfeited bond.
+    AssigneeWins,
+}
+
+/// A challenge filed against a `Disputable` task's submitted answer,
+/// backed by a bond the challenger must fund before it counts (see
+/// `EscrowPurpose::DisputeBond`) -- filing costs nothing, but an
+/// unfounded challenge does, which is what keeps disputes from being a
+/// free way to stall a payout indefinitely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dispute {
+    pub challenger: PublicKey,
+    pub reason: String,
+    /// The `PendingDeposit` holding the challenger's bond -- a
+    /// *different* escrow than the task's own (`Task::escrow_id`), which
+    /// is why settling a resolved dispute needs two separate payouts
+    /// rather than one (see `handlers::settle_dispute_bond`).
+    pub bond_escrow_id: Uuid,
+    pub bond_amount: u64,
+    pub filed_at: DateTime<Utc>,
+    /// `None` until the operator calls `TaskBoard::resolve_dispute`.
+    pub resolution: Option<DisputeResolution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +245,13 @@ pub struct Task {
     pub min_reputation: u64,
     /// Why the task ended `Closed`, if it did. See `CloseReason`.
     pub close_reason: Option<CloseReason>,
+    /// `Some` if this task was funded by an agent's own escrow deposit
+    /// (see `PendingDeposit`) rather than the operator's wallet -- points
+    /// at the `PendingDeposit` holding its funds, which settlement code
+    /// must pay out of (or refund from) instead of the operator's
+    /// address, and which `allocated_bounty()` must not double-count
+    /// against the operator's balance.
+    pub escrow_id: Option<Uuid>,
 }
 
 impl Task {
@@ -177,6 +276,21 @@ impl Task {
                 .filter(|(_, a)| !a.paid)
                 .filter_map(|(pk, a)| a.share.map(|share| (pk.clone(), share)))
                 .collect(),
+            // Only the *bounty* leg -- drawn from the task's own escrow,
+            // same as HashMatch. A resolved dispute's *bond* leg lives in
+            // a different escrow entirely and is settled separately (see
+            // `handlers::settle_dispute_bond`), never through this path.
+            TaskKind::Disputable { dispute, .. } => {
+                let winner = match dispute {
+                    None => self.claimant.clone(),
+                    Some(d) => match d.resolution {
+                        None => None, // still Disputed, awaiting resolution -- nothing owed yet
+                        Some(DisputeResolution::ChallengerWins) => Some(d.challenger.clone()),
+                        Some(DisputeResolution::AssigneeWins) => self.claimant.clone(),
+                    },
+                };
+                winner.map(|w| vec![(w, self.bounty)]).unwrap_or_default()
+            }
         }
     }
 
@@ -196,18 +310,40 @@ impl Task {
             TaskKind::Consensus { assignees, .. } => {
                 assignees.get(recipient).is_some_and(|a| a.paid)
             }
+            // Bounty leg only, same scope as pending_payouts() above --
+            // the bond leg is tracked by the bond's own PendingDeposit
+            // status, not here.
+            TaskKind::Disputable { .. } => {
+                self.status == TaskStatus::Paid && self.pending_payouts_recipient_hint() == Some(recipient.clone())
+            }
         }
     }
 
-    /// Every assignee of a `Consensus` task (empty for `HashMatch`).
-    /// `resolve_consensus` can change several assignees' reputation at
-    /// once (every loser, not just whoever's request happened to trigger
-    /// resolution) -- callers persisting reputation after a resolution
-    /// should save every pubkey this returns, not just the one they
-    /// already had in hand.
+    /// `Disputable`-only helper for `is_recipient_paid`: who *would* be
+    /// owed the bounty leg, independent of whether it's actually been
+    /// paid yet (unlike `pending_payouts`, which only answers while still
+    /// `Verified`) -- `is_recipient_paid` needs this to still resolve to
+    /// the right identity once the task has moved on to `Paid`.
+    fn pending_payouts_recipient_hint(&self) -> Option<PublicKey> {
+        let TaskKind::Disputable { dispute, .. } = &self.kind else { return None };
+        match dispute {
+            None => self.claimant.clone(),
+            Some(d) => match d.resolution {
+                Some(DisputeResolution::ChallengerWins) => Some(d.challenger.clone()),
+                Some(DisputeResolution::AssigneeWins) | None => self.claimant.clone(),
+            },
+        }
+    }
+
+    /// Every assignee of a `Consensus` task (empty for `HashMatch`/
+    /// `Disputable`). `resolve_consensus` can change several assignees'
+    /// reputation at once (every loser, not just whoever's request
+    /// happened to trigger resolution) -- callers persisting reputation
+    /// after a resolution should save every pubkey this returns, not just
+    /// the one they already had in hand.
     pub fn consensus_assignees(&self) -> Vec<PublicKey> {
         match &self.kind {
-            TaskKind::HashMatch { .. } => vec![],
+            TaskKind::HashMatch { .. } | TaskKind::Disputable { .. } => vec![],
             TaskKind::Consensus { assignees, .. } => assignees.keys().cloned().collect(),
         }
     }
@@ -239,6 +375,94 @@ pub struct Reputation {
     pub total_earned: u64,
 }
 
+/// A `PendingDeposit`'s lifecycle: `Reserved` (address handed out,
+/// nothing confirmed yet) -> `Consumed` (successfully confirmed and
+/// materialized into whatever `purpose` describes) or `Refunded`
+/// (expired, or confirmed too late to still apply -- see
+/// `EscrowPurpose::DisputeBond`'s own callers -- and whatever balance was
+/// actually there has been sent back to `depositor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EscrowStatus {
+    Reserved,
+    Consumed,
+    Refunded,
+}
+
+/// Board-native snapshot of a task-creation intent, captured at
+/// reservation time and materialized into a real `Task` only once its
+/// escrow is confirmed funded (see `TaskBoard::confirm_escrow`).
+/// Deliberately not `handlers::CreateTaskPayload` itself, to keep this
+/// module free of HTTP-layer knowledge, matching how the rest of
+/// `board.rs` already relates to `handlers.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskIntent {
+    pub description: String,
+    pub bounty: u64,
+    pub expected_output_hash: Hash,
+    pub min_reputation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusTaskIntent {
+    pub description: String,
+    pub bounty: u64,
+    pub num_assignees: u32,
+    pub join_window_minutes: i64,
+    pub submission_window_minutes: i64,
+    pub min_reputation: u64,
+}
+
+/// What a `PendingDeposit`'s funds are earmarked for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EscrowPurpose {
+    FundHashMatchTask(TaskIntent),
+    FundConsensusTask(ConsensusTaskIntent),
+    FundDisputableTask(DisputableTaskIntent),
+    /// A challenger's bond against `task_id`'s submitted answer --
+    /// confirming this attaches a `Dispute` to an *existing* task rather
+    /// than materializing a new one, unlike the other two purposes (see
+    /// `TaskBoard::confirm_dispute_bond`).
+    DisputeBond { task_id: Uuid, reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisputableTaskIntent {
+    pub description: String,
+    pub bounty: u64,
+    pub dispute_window_minutes: i64,
+    pub min_reputation: u64,
+}
+
+/// A one-time, hub-generated keypair handed out as a deposit address for
+/// a single funding intent. Any UTXO ever seen at `deposit_pubkey` is
+/// unambiguously this deposit's funds by construction -- nobody else was
+/// ever told this address exists -- which is what lets the hub attribute
+/// an arbitrary agent's on-chain payment to a specific intent at all
+/// (a plain `TransactionOutput` carries no sender field, and there is no
+/// message in the wire protocol to look up an arbitrary past transaction
+/// by id). The hub generates and durably persists this keypair *before*
+/// ever handing the address out -- see `reserve_escrow`'s own doc comment
+/// for why that ordering is non-negotiable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDeposit {
+    pub id: Uuid,
+    pub depositor: PublicKey,
+    pub deposit_pubkey: PublicKey,
+    pub deposit_private_key: PrivateKey,
+    pub required_amount: u64,
+    pub purpose: EscrowPurpose,
+    pub status: EscrowStatus,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// What successfully confirming a `PendingDeposit` produced -- what the
+/// caller (an HTTP handler) does next differs by what the deposit was
+/// for.
+pub enum EscrowConfirmation {
+    TaskCreated(Task),
+}
+
 /// Pure in-memory task-marketplace state: no I/O, no knowledge of the
 /// blockchain or HTTP -- mirrors how `Blockchain` itself is a pure data
 /// structure the node crate drives. `HubStore` is this module's
@@ -251,6 +475,7 @@ pub struct TaskBoard {
     tasks: BTreeMap<Uuid, Task>,
     reputation: BTreeMap<PublicKey, Reputation>,
     faucet_grants: BTreeSet<PublicKey>,
+    pending_deposits: BTreeMap<Uuid, PendingDeposit>,
 }
 
 impl TaskBoard {
@@ -259,12 +484,18 @@ impl TaskBoard {
     }
 
     /// Total bounty already promised to tasks that haven't been paid out
-    /// yet. Callers use this against the operator's actual on-chain
-    /// balance to decide whether a new task can be safely funded.
+    /// yet, funded from the *operator's own* balance. Callers use this
+    /// against the operator's actual on-chain balance to decide whether a
+    /// new operator-funded task can be safely created. Excludes
+    /// escrow-funded tasks (`escrow_id.is_some()`) -- their bounty was
+    /// never drawn from the operator in the first place, so counting it
+    /// here would falsely block legitimate new operator-funded tasks
+    /// against capacity the operator was never actually committing.
     pub fn allocated_bounty(&self) -> u64 {
         self.tasks
             .values()
             .filter(|t| !matches!(t.status, TaskStatus::Paid | TaskStatus::Closed))
+            .filter(|t| t.escrow_id.is_none())
             .map(|t| t.bounty)
             .sum()
     }
@@ -289,6 +520,7 @@ impl TaskBoard {
             created_at: Utc::now(),
             min_reputation: 0,
             close_reason: None,
+            escrow_id: None,
         };
         self.tasks.insert(task.id, task.clone());
         task
@@ -330,6 +562,40 @@ impl TaskBoard {
             created_at: Utc::now(),
             min_reputation: 0,
             close_reason: None,
+            escrow_id: None,
+        };
+        self.tasks.insert(task.id, task.clone());
+        task
+    }
+
+    /// Creates an open-ended task judged by operator-arbitrated dispute
+    /// rather than a mechanical check -- see `TaskKind::Disputable`.
+    pub fn create_disputable_task(
+        &mut self,
+        poster: PublicKey,
+        description: String,
+        bounty: u64,
+        dispute_window_minutes: i64,
+    ) -> Task {
+        let task = Task {
+            id: Uuid::new_v4(),
+            description,
+            bounty,
+            kind: TaskKind::Disputable {
+                answer: None,
+                dispute_window_minutes,
+                dispute_deadline: None,
+                dispute: None,
+            },
+            poster,
+            status: TaskStatus::Open,
+            claimant: None,
+            claim_deadline: None,
+            failed_attempts: 0,
+            created_at: Utc::now(),
+            min_reputation: 0,
+            close_reason: None,
+            escrow_id: None,
         };
         self.tasks.insert(task.id, task.clone());
         task
@@ -364,9 +630,272 @@ impl TaskBoard {
         if matches!(task.status, TaskStatus::Verified | TaskStatus::Paid | TaskStatus::Closed) {
             return Err(BoardError::AlreadyTerminal);
         }
+        // A Disputed task has a bond actively contested between two named
+        // agents -- cancellation's "no payout, no reputation impact"
+        // semantics are wrong once money is contested this way (unlike
+        // AwaitingDispute, which has no bond yet and is fine to cancel
+        // the same as any other Open/Claimed task).
+        if task.status == TaskStatus::Disputed {
+            return Err(BoardError::CannotCancelWhileDisputed);
+        }
         task.status = TaskStatus::Closed;
         task.close_reason = Some(CloseReason::CancelledByOperator);
         Ok(())
+    }
+
+    /// Reserves a fresh single-use escrow deposit for `depositor`,
+    /// generating a new keypair to hand out as the deposit address (see
+    /// `PendingDeposit`'s own doc comment for why a one-time address is
+    /// the only workable design here). Inserted into the board's
+    /// in-memory state immediately, same as `create_task` -- but callers
+    /// carry a stricter obligation than `create_task`'s own equivalent
+    /// (`state.store.save_task`): the returned deposit (which holds the
+    /// only copy of `deposit_private_key` outside this process's memory)
+    /// **must** be durably persisted via `HubStore::save_pending_deposit`
+    /// before its address is ever returned in an HTTP response. If the
+    /// process crashes after generating this keypair but before that
+    /// write commits, and the response still somehow reached the caller,
+    /// any funds later sent there become permanently unrecoverable --
+    /// strictly worse than any existing failure mode in this codebase
+    /// (today's worst persistence failure loses a task record, never
+    /// money).
+    pub fn reserve_escrow(
+        &mut self,
+        depositor: PublicKey,
+        required_amount: u64,
+        purpose: EscrowPurpose,
+        expires_at: DateTime<Utc>,
+    ) -> PendingDeposit {
+        let deposit_private_key = PrivateKey::new_key();
+        let deposit_pubkey = deposit_private_key.public_key();
+        let deposit = PendingDeposit {
+            id: Uuid::new_v4(),
+            depositor,
+            deposit_pubkey,
+            deposit_private_key,
+            required_amount,
+            purpose,
+            status: EscrowStatus::Reserved,
+            created_at: Utc::now(),
+            expires_at,
+        };
+        self.pending_deposits.insert(deposit.id, deposit.clone());
+        deposit
+    }
+
+    pub fn get_pending_deposit(&self, id: Uuid) -> Option<&PendingDeposit> {
+        self.pending_deposits.get(&id)
+    }
+
+    /// Confirms `id`'s deposit is now sufficiently funded --
+    /// `observed_amount` is whatever the caller's own on-chain balance
+    /// check reported (this method itself does no I/O) -- and
+    /// materializes whatever `purpose` describes. Rejects a deposit
+    /// that's missing, already consumed/refunded, past its `expires_at`,
+    /// or still underfunded.
+    pub fn confirm_escrow(
+        &mut self,
+        id: Uuid,
+        observed_amount: u64,
+        now: DateTime<Utc>,
+    ) -> Result<EscrowConfirmation, BoardError> {
+        let deposit = self.pending_deposits.get(&id).ok_or(BoardError::EscrowNotFound)?;
+        // A DisputeBond attaches to an *existing* task rather than
+        // materializing a new one, and needs an extra check this generic
+        // path doesn't perform (the target task must still actually be
+        // awaiting a dispute) -- see `confirm_dispute_bond` instead.
+        // Checked before any mutation below, not after.
+        if matches!(deposit.purpose, EscrowPurpose::DisputeBond { .. }) {
+            return Err(BoardError::WrongEscrowPurpose);
+        }
+        if deposit.status != EscrowStatus::Reserved {
+            return Err(BoardError::EscrowNotReserved);
+        }
+        if now > deposit.expires_at {
+            return Err(BoardError::EscrowExpired);
+        }
+        if observed_amount < deposit.required_amount {
+            return Err(BoardError::EscrowUnderfunded {
+                required: deposit.required_amount,
+                have: observed_amount,
+            });
+        }
+
+        let depositor = deposit.depositor.clone();
+        let purpose = deposit.purpose.clone();
+        self.pending_deposits
+            .get_mut(&id)
+            .expect("existence checked above")
+            .status = EscrowStatus::Consumed;
+
+        let task_id = match purpose {
+            EscrowPurpose::FundHashMatchTask(intent) => {
+                let task = self.create_task(depositor, intent.description, intent.bounty, intent.expected_output_hash);
+                if intent.min_reputation > 0 {
+                    self.set_min_reputation(task.id, intent.min_reputation)
+                        .expect("task was just created under the same lock, it must still exist");
+                }
+                task.id
+            }
+            EscrowPurpose::FundConsensusTask(intent) => {
+                // Anchored at confirm time, not reservation time -- the
+                // same reason `submission_deadline`/`join_deadline`
+                // elsewhere are anchored at the moment they start
+                // mattering rather than at creation: a reservation can
+                // sit unconfirmed for a while, and anchoring the join
+                // window any earlier would silently shrink it.
+                let join_deadline = now + chrono::Duration::minutes(intent.join_window_minutes);
+                let task = self.create_consensus_task(
+                    depositor,
+                    intent.description,
+                    intent.bounty,
+                    intent.num_assignees,
+                    join_deadline,
+                    intent.submission_window_minutes,
+                );
+                if intent.min_reputation > 0 {
+                    self.set_min_reputation(task.id, intent.min_reputation)
+                        .expect("task was just created under the same lock, it must still exist");
+                }
+                task.id
+            }
+            EscrowPurpose::FundDisputableTask(intent) => {
+                let task = self.create_disputable_task(
+                    depositor,
+                    intent.description,
+                    intent.bounty,
+                    intent.dispute_window_minutes,
+                );
+                if intent.min_reputation > 0 {
+                    self.set_min_reputation(task.id, intent.min_reputation)
+                        .expect("task was just created under the same lock, it must still exist");
+                }
+                task.id
+            }
+            EscrowPurpose::DisputeBond { .. } => unreachable!("rejected before any mutation, above"),
+        };
+        let task = self.tasks.get_mut(&task_id).expect("just created above, must still exist");
+        task.escrow_id = Some(id);
+        Ok(EscrowConfirmation::TaskCreated(task.clone()))
+    }
+
+    /// Confirms a dispute-bond deposit is now sufficiently funded and, if
+    /// its target task is still actually awaiting a dispute, attaches a
+    /// `Dispute` to it and transitions `AwaitingDispute` -> `Disputed`.
+    /// Unlike `confirm_escrow`, a failed *timing* check here (the window
+    /// closed while the payment was in flight) does **not** consume the
+    /// deposit -- the caller must refund it instead of losing it, since
+    /// nothing was materialized to show for it. Other failures (not
+    /// found, wrong purpose, not yet Reserved, expired, underfunded)
+    /// behave the same as `confirm_escrow`'s.
+    pub fn confirm_dispute_bond(
+        &mut self,
+        escrow_id: Uuid,
+        observed_amount: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Task, BoardError> {
+        let deposit = self.pending_deposits.get(&escrow_id).ok_or(BoardError::EscrowNotFound)?;
+        let EscrowPurpose::DisputeBond { task_id, reason } = deposit.purpose.clone() else {
+            return Err(BoardError::WrongEscrowPurpose);
+        };
+        if deposit.status != EscrowStatus::Reserved {
+            return Err(BoardError::EscrowNotReserved);
+        }
+        if now > deposit.expires_at {
+            return Err(BoardError::EscrowExpired);
+        }
+        if observed_amount < deposit.required_amount {
+            return Err(BoardError::EscrowUnderfunded {
+                required: deposit.required_amount,
+                have: observed_amount,
+            });
+        }
+        let challenger = deposit.depositor.clone();
+        let bond_amount = deposit.required_amount;
+
+        let task = self.tasks.get_mut(&task_id).ok_or(BoardError::NotFound)?;
+        let TaskKind::Disputable { dispute_deadline, dispute, .. } = &mut task.kind else {
+            return Err(BoardError::WrongTaskKind);
+        };
+        // The race the plan explicitly calls out: the bond's funding
+        // transaction can confirm after the dispute window already
+        // closed (and the sweep already finalized the task as
+        // unchallenged). Reject without consuming -- the caller must
+        // refund this deposit, not reopen an already-finalizing task.
+        if task.status != TaskStatus::AwaitingDispute {
+            return Err(BoardError::DisputeWindowClosed);
+        }
+        let deadline = dispute_deadline
+            .expect("AwaitingDispute always has a dispute_deadline, set atomically when it got there");
+        if now > deadline {
+            return Err(BoardError::DisputeWindowClosed);
+        }
+        if dispute.is_some() {
+            return Err(BoardError::AlreadyDisputed);
+        }
+        // Defense in depth: `create_dispute_escrow` (the HTTP handler)
+        // already rejects the assignee at reservation time, but this is
+        // the real enforcement boundary, same reasoning as the
+        // dispute-window check just above -- an invariant a caller can
+        // bypass shouldn't rely solely on handler-layer discipline.
+        if task.claimant.as_ref() == Some(&challenger) {
+            return Err(BoardError::AssigneeCannotDisputeOwnSubmission);
+        }
+
+        *dispute = Some(Dispute {
+            challenger,
+            reason,
+            bond_escrow_id: escrow_id,
+            bond_amount,
+            filed_at: now,
+            resolution: None,
+        });
+        task.status = TaskStatus::Disputed;
+        self.pending_deposits
+            .get_mut(&escrow_id)
+            .expect("existence checked above")
+            .status = EscrowStatus::Consumed;
+        Ok(self.tasks.get(&task_id).expect("just updated above").clone())
+    }
+
+    /// Every still-`Reserved` deposit past its `expires_at` -- polled by
+    /// the sweep loop, mirroring `verified_unpaid_tasks`'s role for
+    /// payouts. Whether there's actually a balance to refund at each one
+    /// is something only a caller with access to the node can determine,
+    /// so this is a read-only listing, not an action.
+    pub fn overdue_reserved_escrows(&self, now: DateTime<Utc>) -> Vec<&PendingDeposit> {
+        self.pending_deposits
+            .values()
+            .filter(|d| d.status == EscrowStatus::Reserved && now > d.expires_at)
+            .collect()
+    }
+
+    /// The `PendingDeposit` funding `task_id`, if it was escrow-funded.
+    /// Used by settlement/refund code to determine which key/address to
+    /// pay out of (or refund) instead of the operator's own.
+    pub fn escrow_for_task(&self, task_id: Uuid) -> Option<&PendingDeposit> {
+        let task = self.tasks.get(&task_id)?;
+        let escrow_id = task.escrow_id?;
+        self.pending_deposits.get(&escrow_id)
+    }
+
+    /// Records that `id`'s deposit has been fully dealt with -- either
+    /// nothing was ever sent to it, or whatever was there has already
+    /// been refunded on-chain to `depositor`. Callers must perform (or
+    /// confirm the unnecessity of) that refund before calling this.
+    pub fn mark_escrow_refunded(&mut self, id: Uuid) -> Result<(), BoardError> {
+        let deposit = self.pending_deposits.get_mut(&id).ok_or(BoardError::EscrowNotFound)?;
+        deposit.status = EscrowStatus::Refunded;
+        Ok(())
+    }
+
+    /// Restores a pending deposit previously persisted by `HubStore`.
+    pub fn restore_pending_deposit(&mut self, deposit: PendingDeposit) {
+        self.pending_deposits.insert(deposit.id, deposit);
+    }
+
+    pub fn all_pending_deposits(&self) -> impl Iterator<Item = &PendingDeposit> {
+        self.pending_deposits.values()
     }
 
     /// Checks `agent`'s `completed` count against `task`'s
@@ -420,8 +949,31 @@ impl TaskBoard {
             .collect()
     }
 
-    /// `HashMatch` only -- a `Consensus` task takes on multiple
-    /// simultaneous assignees, so it uses `join_consensus_task` instead.
+    /// Every `Disputable` task with a resolved dispute whose *bond* leg
+    /// hasn't been disbursed yet (see `handlers::settle_dispute_bond`).
+    /// Deliberately independent of the task's own status (`Verified` or
+    /// already `Paid`, doesn't matter) -- unlike the bounty leg, which
+    /// `verified_unpaid_tasks` already covers and which drops a task out
+    /// of that list the moment it's settled, the bond leg is a *separate*
+    /// escrow that can still need a retry even after the task itself has
+    /// reached `Paid`.
+    pub fn tasks_with_unsettled_dispute_bonds(&self) -> Vec<Uuid> {
+        self.tasks
+            .values()
+            .filter_map(|task| {
+                let TaskKind::Disputable { dispute: Some(d), .. } = &task.kind else {
+                    return None;
+                };
+                d.resolution?;
+                let bond = self.pending_deposits.get(&d.bond_escrow_id)?;
+                (bond.status == EscrowStatus::Consumed).then_some(task.id)
+            })
+            .collect()
+    }
+
+    /// `HashMatch`/`Disputable` only -- both are single-claimant, unlike
+    /// `Consensus`, which takes on multiple simultaneous assignees via
+    /// `join_consensus_task` instead.
     pub fn claim_task(
         &mut self,
         id: Uuid,
@@ -429,11 +981,19 @@ impl TaskBoard {
         deadline: DateTime<Utc>,
     ) -> Result<(), BoardError> {
         let task = self.tasks.get(&id).ok_or(BoardError::NotFound)?;
-        if !matches!(task.kind, TaskKind::HashMatch { .. }) {
+        if !matches!(task.kind, TaskKind::HashMatch { .. } | TaskKind::Disputable { .. }) {
             return Err(BoardError::WrongTaskKind);
         }
         if task.status != TaskStatus::Open {
             return Err(BoardError::NotOpen);
+        }
+        // Applies regardless of who posted it or how it was funded: even
+        // for an operator-posted task this closes a latent (if harmless
+        // today) hole, and it's what keeps an agent-funded task (see
+        // `confirm_escrow`) from letting its own poster farm reputation
+        // by claiming and solving something they posted themselves.
+        if task.poster == claimant {
+            return Err(BoardError::PosterCannotClaimOwnTask);
         }
         self.check_min_reputation(task, &claimant)?;
 
@@ -467,6 +1027,10 @@ impl TaskBoard {
         // a task that should already be dead back to `Claimed`.
         if Utc::now() > *join_deadline {
             return Err(BoardError::JoinWindowExpired);
+        }
+        // See the identical check (and its doc comment) in `claim_task`.
+        if task.poster == agent {
+            return Err(BoardError::PosterCannotClaimOwnTask);
         }
         self.check_min_reputation(task, &agent)?;
 
@@ -529,6 +1093,108 @@ impl TaskBoard {
             self.reputation.entry(submitter).or_default().failed += 1;
             Ok(false)
         }
+    }
+
+    /// `Disputable` only. Records `submitter`'s answer and opens the
+    /// dispute window (`Claimed` -> `AwaitingDispute`), anchored *now*
+    /// rather than at task-creation time -- the same anchoring reasoning
+    /// as `Consensus::submission_window_minutes`.
+    pub fn submit_disputable_answer(
+        &mut self,
+        id: Uuid,
+        submitter: PublicKey,
+        answer: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), BoardError> {
+        let task = self.tasks.get_mut(&id).ok_or(BoardError::NotFound)?;
+        let TaskKind::Disputable { answer: stored_answer, dispute_window_minutes, dispute_deadline, .. } =
+            &mut task.kind
+        else {
+            return Err(BoardError::WrongTaskKind);
+        };
+        if task.status != TaskStatus::Claimed {
+            return Err(BoardError::NotClaimed);
+        }
+        if task.claimant.as_ref() != Some(&submitter) {
+            return Err(BoardError::NotClaimant);
+        }
+        *stored_answer = Some(answer);
+        *dispute_deadline = Some(now + chrono::Duration::minutes(*dispute_window_minutes));
+        task.status = TaskStatus::AwaitingDispute;
+        Ok(())
+    }
+
+    /// Transitions any `AwaitingDispute` task whose dispute window has
+    /// passed with no dispute filed straight to `Verified`, so the
+    /// ordinary settlement machinery (`pending_payouts`/
+    /// `try_settle_verified_task`) pays the claimant -- mirrors
+    /// `resolve_expired_consensus_tasks`'s role for `Consensus`. Returns
+    /// the ids finalized this way. Call periodically from a background
+    /// sweep.
+    pub fn finalize_unchallenged_disputable_tasks(&mut self, now: DateTime<Utc>) -> Vec<Uuid> {
+        let mut finalized = Vec::new();
+        for task in self.tasks.values_mut() {
+            if task.status != TaskStatus::AwaitingDispute {
+                continue;
+            }
+            let TaskKind::Disputable { dispute_deadline, dispute, .. } = &task.kind else {
+                continue;
+            };
+            if dispute.is_some() {
+                continue; // a dispute beat the sweep to it -- Disputed already, not this path
+            }
+            if dispute_deadline.is_some_and(|d| now > d) {
+                task.status = TaskStatus::Verified;
+                finalized.push(task.id);
+            }
+        }
+        finalized
+    }
+
+    /// Resolves a filed dispute: dings the losing party's reputation
+    /// immediately (matching `resolve_consensus`'s "dinged at resolution,
+    /// credited only once actually paid" convention) and transitions
+    /// `Disputed` -> `Verified` so the bounty leg settles through the
+    /// ordinary machinery, naming whichever party won as the recipient
+    /// (see `Task::pending_payouts`). Returns `(winner, loser)`. The bond
+    /// leg is a *separate* escrow and is not this method's concern -- see
+    /// `handlers::settle_dispute_bond`.
+    pub fn resolve_dispute(
+        &mut self,
+        task_id: Uuid,
+        outcome: DisputeResolution,
+    ) -> Result<(PublicKey, PublicKey), BoardError> {
+        let task = self.tasks.get_mut(&task_id).ok_or(BoardError::NotFound)?;
+        if task.status != TaskStatus::Disputed {
+            return Err(BoardError::NotDisputed);
+        }
+        let claimant = task.claimant.clone().expect("Disputed task always has a claimant");
+        let TaskKind::Disputable { dispute, .. } = &mut task.kind else {
+            return Err(BoardError::WrongTaskKind);
+        };
+        let d = dispute.as_mut().expect("Disputed status implies dispute is Some");
+        // No separate "already resolved" check needed: resolving always
+        // moves status off Disputed in this same call (below), and the
+        // status guard above already rejects anything not Disputed --
+        // so reaching here means d.resolution is still None.
+        d.resolution = Some(outcome);
+        let (winner, loser) = match outcome {
+            DisputeResolution::ChallengerWins => (d.challenger.clone(), claimant),
+            DisputeResolution::AssigneeWins => (claimant, d.challenger.clone()),
+        };
+        self.reputation.entry(loser.clone()).or_default().failed += 1;
+        task.status = TaskStatus::Verified;
+        Ok((winner, loser))
+    }
+
+    /// Credits `recipient`'s `total_earned` for a forfeited dispute bond
+    /// -- deliberately *not* `completed` (that was already credited by
+    /// `mark_recipient_paid` for the bounty leg) and deliberately
+    /// separate from a plain refund (`refund_escrow` never touches
+    /// reputation, since getting your own money back isn't "earning" --
+    /// only receiving someone else's forfeited stake is).
+    pub fn credit_forfeited_bond(&mut self, recipient: &PublicKey, bond_amount: u64) {
+        self.reputation.entry(recipient.clone()).or_default().total_earned += bond_amount;
     }
 
     /// `Consensus` only. Records `agent`'s answer. Once every assignee
@@ -724,6 +1390,24 @@ impl TaskBoard {
                 // "fully paid" just means every one of them is now marked
                 // paid too -- no need to recompute the majority again.
                 assignees.values().all(|a| a.share.is_none() || a.paid)
+            }
+            // Bounty leg only -- same scope as pending_payouts()/
+            // is_recipient_paid() above. `recipient` must be whichever
+            // party pending_payouts() actually named (the claimant if
+            // unchallenged or AssigneeWins, the challenger if
+            // ChallengerWins), not just "the claimant" unconditionally.
+            TaskKind::Disputable { dispute, .. } => {
+                let expected_recipient = match dispute {
+                    None => task.claimant.clone(),
+                    Some(d) => match d.resolution {
+                        Some(DisputeResolution::ChallengerWins) => Some(d.challenger.clone()),
+                        Some(DisputeResolution::AssigneeWins) | None => task.claimant.clone(),
+                    },
+                };
+                if expected_recipient.as_ref() != Some(recipient) {
+                    return Err(BoardError::NotClaimant);
+                }
+                true
             }
         };
 
@@ -1441,5 +2125,470 @@ mod tests {
             board.cancel_task(Uuid::new_v4()),
             Err(BoardError::NotFound)
         ));
+    }
+
+    #[test]
+    fn reserve_escrow_creates_a_reserved_deposit_with_a_fresh_address() {
+        let mut board = TaskBoard::new();
+        let depositor = pubkey();
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 100,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(
+            depositor.clone(),
+            100,
+            EscrowPurpose::FundHashMatchTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        assert_eq!(deposit.status, EscrowStatus::Reserved);
+        assert_eq!(deposit.depositor, depositor);
+        assert_ne!(deposit.deposit_pubkey, depositor, "must be a fresh address, not the depositor's own");
+        assert!(board.get_pending_deposit(deposit.id).is_some());
+    }
+
+    #[test]
+    fn confirm_escrow_creates_a_hash_match_task_once_sufficiently_funded() {
+        let mut board = TaskBoard::new();
+        let depositor = pubkey();
+        let expected = Hash::hash_bytes(b"answer");
+        let intent = TaskIntent {
+            description: "escrowed".to_string(),
+            bounty: 500,
+            expected_output_hash: expected,
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(
+            depositor.clone(),
+            500,
+            EscrowPurpose::FundHashMatchTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        let EscrowConfirmation::TaskCreated(task) =
+            board.confirm_escrow(deposit.id, 500, Utc::now()).unwrap();
+
+        assert_eq!(task.poster, depositor, "the depositor, not the operator, is the poster");
+        assert_eq!(task.escrow_id, Some(deposit.id));
+        assert_eq!(task.bounty, 500);
+        assert_eq!(board.get_task(task.id).unwrap().id, task.id, "must actually be a real, retrievable task");
+        assert_eq!(
+            board.get_pending_deposit(deposit.id).unwrap().status,
+            EscrowStatus::Consumed
+        );
+    }
+
+    #[test]
+    fn confirm_escrow_creates_a_consensus_task_once_sufficiently_funded() {
+        let mut board = TaskBoard::new();
+        let depositor = pubkey();
+        let intent = ConsensusTaskIntent {
+            description: "open-ended, escrowed".to_string(),
+            bounty: 900,
+            num_assignees: 3,
+            join_window_minutes: 60,
+            submission_window_minutes: 30,
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(
+            depositor.clone(),
+            900,
+            EscrowPurpose::FundConsensusTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        let EscrowConfirmation::TaskCreated(task) =
+            board.confirm_escrow(deposit.id, 900, Utc::now()).unwrap();
+
+        assert_eq!(task.poster, depositor);
+        assert_eq!(task.escrow_id, Some(deposit.id));
+        assert!(matches!(task.kind, TaskKind::Consensus { num_assignees: 3, .. }));
+    }
+
+    #[test]
+    fn confirm_escrow_rejects_an_underfunded_deposit() {
+        let mut board = TaskBoard::new();
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 500,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            500,
+            EscrowPurpose::FundHashMatchTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        assert!(matches!(
+            board.confirm_escrow(deposit.id, 499, Utc::now()),
+            Err(BoardError::EscrowUnderfunded { required: 500, have: 499 })
+        ));
+        // must not have consumed the reservation or created anything
+        assert_eq!(board.get_pending_deposit(deposit.id).unwrap().status, EscrowStatus::Reserved);
+    }
+
+    #[test]
+    fn confirm_escrow_rejects_an_expired_deposit() {
+        let mut board = TaskBoard::new();
+        let now = Utc::now();
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 100,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            100,
+            EscrowPurpose::FundHashMatchTask(intent),
+            now + chrono::Duration::minutes(5),
+        );
+
+        assert!(matches!(
+            board.confirm_escrow(deposit.id, 100, now + chrono::Duration::minutes(6)),
+            Err(BoardError::EscrowExpired)
+        ));
+    }
+
+    #[test]
+    fn confirm_escrow_rejects_an_already_consumed_deposit() {
+        let mut board = TaskBoard::new();
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 100,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            100,
+            EscrowPurpose::FundHashMatchTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        board.confirm_escrow(deposit.id, 100, Utc::now()).unwrap();
+
+        assert!(matches!(
+            board.confirm_escrow(deposit.id, 100, Utc::now()),
+            Err(BoardError::EscrowNotReserved)
+        ));
+    }
+
+    #[test]
+    fn confirm_escrow_on_a_missing_deposit_fails() {
+        let mut board = TaskBoard::new();
+        assert!(matches!(
+            board.confirm_escrow(Uuid::new_v4(), 100, Utc::now()),
+            Err(BoardError::EscrowNotFound)
+        ));
+    }
+
+    #[test]
+    fn overdue_reserved_escrows_lists_only_expired_still_reserved_deposits() {
+        let mut board = TaskBoard::new();
+        let now = Utc::now();
+        let intent = |bounty| TaskIntent {
+            description: "t".to_string(),
+            bounty,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let expired = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent(100)), now - chrono::Duration::seconds(1));
+        let still_fresh = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent(100)), now + chrono::Duration::minutes(30));
+        let expired_but_confirmed = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent(100)), now - chrono::Duration::seconds(1));
+        board.confirm_escrow(expired_but_confirmed.id, 100, now - chrono::Duration::seconds(2)).unwrap();
+
+        let overdue: Vec<Uuid> = board.overdue_reserved_escrows(now).iter().map(|d| d.id).collect();
+        assert_eq!(overdue, vec![expired.id]);
+        assert!(!overdue.contains(&still_fresh.id));
+        assert!(!overdue.contains(&expired_but_confirmed.id), "already-consumed deposits aren't 'overdue', just done");
+    }
+
+    #[test]
+    fn mark_escrow_refunded_transitions_status() {
+        let mut board = TaskBoard::new();
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 100,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent), Utc::now() - chrono::Duration::seconds(1));
+
+        board.mark_escrow_refunded(deposit.id).unwrap();
+        assert_eq!(board.get_pending_deposit(deposit.id).unwrap().status, EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn allocated_bounty_excludes_escrow_funded_tasks() {
+        let mut board = TaskBoard::new();
+        board.create_task(pubkey(), "operator-funded".to_string(), 100, Hash::hash_bytes(b"x"));
+        assert_eq!(board.allocated_bounty(), 100);
+
+        let intent = TaskIntent {
+            description: "escrow-funded".to_string(),
+            bounty: 900,
+            expected_output_hash: Hash::hash_bytes(b"y"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(pubkey(), 900, EscrowPurpose::FundHashMatchTask(intent), Utc::now() + chrono::Duration::minutes(30));
+        board.confirm_escrow(deposit.id, 900, Utc::now()).unwrap();
+
+        assert_eq!(board.allocated_bounty(), 100, "the escrow-funded task's bounty must not count against the operator");
+    }
+
+    #[test]
+    fn poster_cannot_claim_their_own_hash_match_task() {
+        let mut board = TaskBoard::new();
+        let poster = pubkey();
+        let task = board.create_task(poster.clone(), "t".to_string(), 10, Hash::hash_bytes(b"x"));
+
+        assert!(matches!(
+            board.claim_task(task.id, poster, Utc::now() + chrono::Duration::minutes(5)),
+            Err(BoardError::PosterCannotClaimOwnTask)
+        ));
+        assert_eq!(board.get_task(task.id).unwrap().status, TaskStatus::Open, "a rejected claim must not consume the task");
+    }
+
+    #[test]
+    fn poster_cannot_join_their_own_consensus_task() {
+        let mut board = TaskBoard::new();
+        let poster = pubkey();
+        let deadline = Utc::now() + chrono::Duration::minutes(30);
+        let task = board.create_consensus_task(poster.clone(), "t".to_string(), 10, 2, deadline, 30);
+
+        assert!(matches!(
+            board.join_consensus_task(task.id, poster),
+            Err(BoardError::PosterCannotClaimOwnTask)
+        ));
+    }
+
+    #[test]
+    fn escrow_for_task_finds_the_funding_deposit_and_none_for_operator_funded() {
+        let mut board = TaskBoard::new();
+        let operator_task = board.create_task(pubkey(), "t".to_string(), 10, Hash::hash_bytes(b"x"));
+        assert!(board.escrow_for_task(operator_task.id).is_none());
+
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 10,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+        };
+        let deposit = board.reserve_escrow(pubkey(), 10, EscrowPurpose::FundHashMatchTask(intent), Utc::now() + chrono::Duration::minutes(30));
+        let EscrowConfirmation::TaskCreated(task) = board.confirm_escrow(deposit.id, 10, Utc::now()).unwrap();
+
+        assert_eq!(board.escrow_for_task(task.id).unwrap().id, deposit.id);
+    }
+
+    /// Creates a `Disputable` task, claims it, and submits an answer,
+    /// landing it in `AwaitingDispute` -- the common starting point for
+    /// most dispute tests below.
+    fn create_and_submit_disputable_task(
+        board: &mut TaskBoard,
+        poster: PublicKey,
+        claimant: PublicKey,
+        bounty: u64,
+        dispute_window_minutes: i64,
+    ) -> Uuid {
+        let task = board.create_disputable_task(poster, "open-ended work".to_string(), bounty, dispute_window_minutes);
+        board.claim_task(task.id, claimant.clone(), Utc::now() + chrono::Duration::minutes(30)).unwrap();
+        board.submit_disputable_answer(task.id, claimant, "my answer".to_string(), Utc::now()).unwrap();
+        assert_eq!(board.get_task(task.id).unwrap().status, TaskStatus::AwaitingDispute);
+        task.id
+    }
+
+    /// Files (reserves + confirms) a dispute bond against `task_id` from
+    /// `challenger`, landing the task in `Disputed`. Returns the bond's
+    /// own escrow id (a *different* escrow than the task's own).
+    fn file_dispute(board: &mut TaskBoard, task_id: Uuid, challenger: PublicKey, reason: &str) -> Uuid {
+        let bounty = board.get_task(task_id).unwrap().bounty;
+        let deposit = board.reserve_escrow(
+            challenger,
+            bounty,
+            EscrowPurpose::DisputeBond { task_id, reason: reason.to_string() },
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        board.confirm_dispute_bond(deposit.id, bounty, Utc::now()).unwrap();
+        assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::Disputed);
+        deposit.id
+    }
+
+    #[test]
+    fn disputable_task_finalizes_unchallenged_via_sweep_and_pays_the_claimant() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant.clone(), 900, 30);
+
+        // not yet due
+        assert!(board.finalize_unchallenged_disputable_tasks(Utc::now()).is_empty());
+        assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::AwaitingDispute);
+
+        // now it is
+        let later = Utc::now() + chrono::Duration::minutes(31);
+        let finalized = board.finalize_unchallenged_disputable_tasks(later);
+        assert_eq!(finalized, vec![task_id]);
+        let task = board.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Verified);
+        assert_eq!(task.pending_payouts(), vec![(claimant, 900)]);
+    }
+
+    #[test]
+    fn submit_disputable_answer_rejects_non_claimant() {
+        let mut board = TaskBoard::new();
+        let task = board.create_disputable_task(pubkey(), "t".to_string(), 10, 30);
+        let claimant = pubkey();
+        let impostor = pubkey();
+        board.claim_task(task.id, claimant, Utc::now() + chrono::Duration::minutes(30)).unwrap();
+
+        assert!(matches!(
+            board.submit_disputable_answer(task.id, impostor, "answer".to_string(), Utc::now()),
+            Err(BoardError::NotClaimant)
+        ));
+    }
+
+    #[test]
+    fn confirm_dispute_bond_rejects_the_assignee() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant.clone(), 900, 30);
+
+        let deposit = board.reserve_escrow(
+            claimant, // the assignee itself, trying to dispute its own submission
+            900,
+            EscrowPurpose::DisputeBond { task_id, reason: "self-dispute attempt".to_string() },
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        assert!(matches!(
+            board.confirm_dispute_bond(deposit.id, 900, Utc::now()),
+            Err(BoardError::AssigneeCannotDisputeOwnSubmission)
+        ));
+        assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::AwaitingDispute, "must not have attached");
+    }
+
+    #[test]
+    fn confirm_dispute_bond_rejects_after_window_closed_without_consuming_deposit() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let challenger = pubkey();
+        // A negative dispute_window_minutes forces the deadline into the
+        // past the instant submission happens -- same trick used
+        // elsewhere in this file for the analogous Consensus-side race.
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant, 900, -1);
+
+        let deposit = board.reserve_escrow(
+            challenger,
+            900,
+            EscrowPurpose::DisputeBond { task_id, reason: "too late".to_string() },
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        assert!(matches!(
+            board.confirm_dispute_bond(deposit.id, 900, Utc::now()),
+            Err(BoardError::DisputeWindowClosed)
+        ));
+        // Must NOT have consumed the deposit -- the caller (handler) is
+        // responsible for refunding it instead of losing it.
+        assert_eq!(board.get_pending_deposit(deposit.id).unwrap().status, EscrowStatus::Reserved);
+    }
+
+    #[test]
+    fn cannot_file_a_second_dispute_on_an_already_disputed_task() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant, 900, 30);
+        file_dispute(&mut board, task_id, pubkey(), "first challenge");
+
+        let second_challenger = pubkey();
+        let deposit = board.reserve_escrow(
+            second_challenger,
+            900,
+            EscrowPurpose::DisputeBond { task_id, reason: "second challenge".to_string() },
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        // Status is already Disputed, not AwaitingDispute -- the same
+        // guard that rejects a too-late confirmation also rejects this.
+        assert!(matches!(
+            board.confirm_dispute_bond(deposit.id, 900, Utc::now()),
+            Err(BoardError::DisputeWindowClosed)
+        ));
+    }
+
+    #[test]
+    fn resolve_dispute_challenger_wins_dings_assignee_and_pays_challenger() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let challenger = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant.clone(), 900, 30);
+        file_dispute(&mut board, task_id, challenger.clone(), "wrong answer");
+
+        let (winner, loser) = board.resolve_dispute(task_id, DisputeResolution::ChallengerWins).unwrap();
+        assert_eq!(winner, challenger);
+        assert_eq!(loser, claimant.clone());
+        assert_eq!(board.reputation(&claimant).failed, 1);
+        assert_eq!(board.reputation(&challenger).failed, 0, "not credited (completed) until actually paid");
+
+        let task = board.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Verified);
+        assert_eq!(task.pending_payouts(), vec![(challenger, 900)], "bounty leg goes to the challenger");
+    }
+
+    #[test]
+    fn resolve_dispute_assignee_wins_dings_challenger_and_pays_assignee() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let challenger = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant.clone(), 900, 30);
+        file_dispute(&mut board, task_id, challenger.clone(), "actually correct");
+
+        let (winner, loser) = board.resolve_dispute(task_id, DisputeResolution::AssigneeWins).unwrap();
+        assert_eq!(winner, claimant.clone());
+        assert_eq!(loser, challenger);
+        assert_eq!(board.reputation(&challenger).failed, 1);
+
+        let task = board.get_task(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Verified);
+        assert_eq!(task.pending_payouts(), vec![(claimant, 900)], "bounty leg goes to the assignee -- the bond leg is separate, see settle_dispute_bond");
+    }
+
+    #[test]
+    fn resolve_dispute_rejects_a_task_that_isnt_currently_disputed() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant, 900, 30);
+
+        // still just AwaitingDispute, no dispute filed yet
+        assert!(matches!(
+            board.resolve_dispute(task_id, DisputeResolution::ChallengerWins),
+            Err(BoardError::NotDisputed)
+        ));
+    }
+
+    #[test]
+    fn cancel_task_rejects_a_disputed_task() {
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant, 900, 30);
+        file_dispute(&mut board, task_id, pubkey(), "contested");
+
+        assert!(matches!(board.cancel_task(task_id), Err(BoardError::CannotCancelWhileDisputed)));
+        // A Disputed task must stay Disputed, not silently become Closed
+        // while a bond is actively contested.
+        assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::Disputed);
+    }
+
+    #[test]
+    fn cancel_task_still_accepts_an_awaiting_dispute_task() {
+        // No bond posted yet, so there's nothing contested -- cancelling
+        // here is the same as cancelling any other Open/Claimed task.
+        let mut board = TaskBoard::new();
+        let claimant = pubkey();
+        let task_id = create_and_submit_disputable_task(&mut board, pubkey(), claimant, 900, 30);
+
+        board.cancel_task(task_id).unwrap();
+        assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::Closed);
     }
 }

@@ -1,6 +1,6 @@
 use tracing::*;
 
-use crate::board::{Reputation, Task};
+use crate::board::{PendingDeposit, Reputation, Task};
 use btclib::crypto::PublicKey;
 use redb::{ReadableTable, TableDefinition};
 use std::path::Path;
@@ -11,6 +11,14 @@ const REPUTATION_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("re
 // pubkey sec1 bytes -> grant time (Unix seconds). Mirrors the node's own
 // bans table: same "durable set of pubkeys/IPs with a timestamp" shape.
 const FAUCET_GRANTS_TABLE: TableDefinition<&[u8], i64> = TableDefinition::new("faucet_grants");
+// uuid bytes -> serialized PendingDeposit (private key included -- see
+// its own doc comment for why this must be durable before its address is
+// ever handed out). Additive relative to the schema this hub shipped
+// with: an old store simply gains this table empty the first time it's
+// opened by build that knows about it, same as any other missing table
+// `open_or_create` creates on demand -- no version bump needed for a
+// purely-additive table.
+const PENDING_DEPOSITS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pending_deposits");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -61,6 +69,7 @@ impl HubStore {
             write_txn.open_table(TASKS_TABLE)?;
             write_txn.open_table(REPUTATION_TABLE)?;
             write_txn.open_table(FAUCET_GRANTS_TABLE)?;
+            write_txn.open_table(PENDING_DEPOSITS_TABLE)?;
             let mut meta = write_txn.open_table(META_TABLE)?;
 
             let stored_version = match meta.get(SCHEMA_VERSION_KEY)? {
@@ -106,6 +115,38 @@ impl HubStore {
     pub fn load_all_tasks(&self) -> Result<Vec<Task>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(TASKS_TABLE)?;
+        table
+            .iter()?
+            .map(|entry| {
+                let (_, value) = entry?;
+                ciborium::from_reader(value.value())
+                    .map_err(|e: ciborium::de::Error<_>| HubStoreError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
+
+    /// Persists `deposit`, including its private key. Callers must
+    /// complete this **before** ever handing the deposit's address out in
+    /// an HTTP response -- see `PendingDeposit`'s own doc comment for why
+    /// that ordering is non-negotiable (a crash between generating the
+    /// keypair and this write committing would make any funds later sent
+    /// there permanently unrecoverable).
+    pub fn save_pending_deposit(&self, deposit: &PendingDeposit) -> Result<()> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(deposit, &mut bytes)
+            .map_err(|e| HubStoreError::Serialization(e.to_string()))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PENDING_DEPOSITS_TABLE)?;
+            table.insert(deposit.id.as_bytes().as_slice(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_pending_deposits(&self) -> Result<Vec<PendingDeposit>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(PENDING_DEPOSITS_TABLE)?;
         table
             .iter()?
             .map(|entry| {
@@ -233,6 +274,7 @@ mod tests {
             created_at: Utc::now(),
             min_reputation: 0,
             close_reason: None,
+            escrow_id: None,
         };
         store.save_task(&task).unwrap();
         let loaded = store.load_all_tasks().unwrap();
@@ -255,6 +297,48 @@ mod tests {
         store.save_faucet_grant(&agent, Utc::now().timestamp()).unwrap();
         let grants = store.load_all_faucet_grants().unwrap();
         assert_eq!(grants, vec![agent]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_a_pending_deposit_including_its_private_key() {
+        let path = temp_db_path("pending_deposit_roundtrip");
+        let store = HubStore::open_or_create(&path).unwrap();
+
+        let depositor = PrivateKey::new_key().public_key();
+        let deposit_private_key = PrivateKey::new_key();
+        let deposit_pubkey = deposit_private_key.public_key();
+        let deposit = crate::board::PendingDeposit {
+            id: Uuid::new_v4(),
+            depositor,
+            deposit_pubkey: deposit_pubkey.clone(),
+            deposit_private_key,
+            required_amount: 500,
+            purpose: crate::board::EscrowPurpose::FundHashMatchTask(crate::board::TaskIntent {
+                description: "t".to_string(),
+                bounty: 500,
+                expected_output_hash: Hash::hash_bytes(b"x"),
+                min_reputation: 0,
+            }),
+            status: crate::board::EscrowStatus::Reserved,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(30),
+        };
+        store.save_pending_deposit(&deposit).unwrap();
+
+        let loaded = store.load_all_pending_deposits().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, deposit.id);
+        assert_eq!(loaded[0].deposit_pubkey, deposit_pubkey);
+        assert_eq!(loaded[0].required_amount, 500);
+        // the private key itself must round-trip too -- it's the whole
+        // point of persisting this before the address is ever handed out
+        assert_eq!(
+            loaded[0].deposit_private_key.public_key(),
+            deposit_pubkey,
+            "the persisted private key must still correspond to the same address"
+        );
 
         std::fs::remove_file(&path).ok();
     }

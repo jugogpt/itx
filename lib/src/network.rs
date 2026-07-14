@@ -66,8 +66,19 @@ pub enum Message {
     AskChainTip,
     /// This is the response to AskChainTip: (block height, cumulative work)
     ChainTip(u32, crate::U256),
-    /// Ask a node to send a block with the specified height
-    FetchBlock(usize),
+    /// Ask a node to send up to `count` blocks from its own active chain,
+    /// starting at height `start`. Always answered with a `Blocks` reply,
+    /// even if empty (e.g. `start` is at or past the peer's tip) -- an
+    /// out-of-range request must never just drop the connection.
+    FetchBlocks { start: usize, count: u32 },
+    /// Reply to `FetchBlocks`. May hold fewer blocks than requested -- the
+    /// responder caps how much it packs into one reply (see
+    /// `crate::BLOCKS_PER_FETCH_BATCH`/`crate::MAX_FETCH_BATCH_BYTES`)
+    /// independent of how many blocks it actually has past `start`. A
+    /// short-but-non-empty reply does not by itself mean "the peer's tip
+    /// is reached" -- only a genuinely empty one (or separately knowing
+    /// the peer's height, e.g. via `AskChainTip`) means that.
+    Blocks(Vec<Block>),
     /// Broadcast a new block to other nodes
     NewBlock(Block),
 }
