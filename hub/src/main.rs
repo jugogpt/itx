@@ -8,6 +8,7 @@ mod store;
 
 use anyhow::Result;
 use argh::FromArgs;
+use axum::http::Method;
 use axum::routing::{get, post};
 use axum::Router;
 use board::{PendingDeposit, Reputation, Task, TaskBoard, TaskStatus};
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use store::HubStore;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 /// Shared state handed to every HTTP handler. `board` changes after
@@ -281,6 +283,20 @@ async fn main() -> Result<()> {
 /// tests can stand up the exact same router against a real (ephemeral
 /// port) HTTP server, without duplicating the route list.
 fn build_router(state: Arc<AppState>) -> Router {
+    // GET-only and any-origin: every route this actually unlocks
+    // cross-origin (`/tasks`, `/tasks/:id`, `/leaderboard`,
+    // `/reputation/:pubkey`, `/llms.txt`) is already read-only and
+    // unauthenticated with no cookies/credentials involved, which is what
+    // makes a permissive origin safe here. The POST routes stay
+    // effectively closed to a cross-origin browser caller regardless --
+    // not because CORS blocks them (the browser wouldn't even attempt a
+    // disallowed method's actual request past its own preflight check),
+    // but because they separately require a valid signed envelope no
+    // page-borrowed browser session could forge anyway. Added for the
+    // dashboard (`dashboard/`), which talks to the hub from a different
+    // origin (its own dev server / static host) via plain `fetch()`.
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]);
+
     Router::new()
         .route("/tasks", get(handlers::list_tasks).post(handlers::create_task))
         .route("/tasks/consensus", post(handlers::create_consensus_task))
@@ -299,6 +315,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/reputation/:pubkey", get(handlers::get_reputation))
         .route("/leaderboard", get(handlers::leaderboard))
         .route("/llms.txt", get(handlers::llms_txt))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -313,6 +330,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use serde::Serialize;
     use serde_json::{json, Value};
+    use std::collections::BTreeSet;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -567,6 +585,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash,
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -663,6 +682,7 @@ mod tests {
             bounty: 10,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -685,6 +705,7 @@ mod tests {
             bounty: 1_000_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -829,6 +850,7 @@ mod tests {
             join_window_minutes: 30,
             submission_window_minutes: 30,
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -856,6 +878,7 @@ mod tests {
             join_window_minutes: 30,
             submission_window_minutes: 30,
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -965,6 +988,7 @@ mod tests {
             bounty: 10,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 3,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -1070,6 +1094,7 @@ mod tests {
                 join_window_minutes: 30,
                 submission_window_minutes: window,
                 min_reputation: 0,
+                capabilities: Default::default(),
             };
             let resp = hub
                 .client
@@ -1100,6 +1125,7 @@ mod tests {
                 join_window_minutes: window,
                 submission_window_minutes: 30,
                 min_reputation: 0,
+                capabilities: Default::default(),
             };
             let resp = hub
                 .client
@@ -1143,6 +1169,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -1161,6 +1188,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -1213,6 +1241,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let task: Value = hub
             .client
@@ -1312,6 +1341,234 @@ mod tests {
         assert_eq!(default_page.len(), 5, "well under the default page size");
     }
 
+    #[tokio::test]
+    async fn create_task_with_capabilities_is_filtered_correctly() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let python_payload = handlers::CreateTaskPayload {
+            description: "python task".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"a").as_bytes()),
+            min_reputation: 0,
+            capabilities: BTreeSet::from(["python".to_string()]),
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, python_payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let python_task: Value = resp.json().await.unwrap();
+        let python_id: Uuid = python_task["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(python_task["capabilities"], json!(["python"]));
+
+        let rust_payload = handlers::CreateTaskPayload {
+            description: "rust task".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"b").as_bytes()),
+            min_reputation: 0,
+            capabilities: BTreeSet::from(["rust".to_string()]),
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, rust_payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let filtered: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks?capability=python", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1, "only the python-tagged task should match");
+        assert_eq!(filtered[0]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), python_id);
+    }
+
+    #[tokio::test]
+    async fn unfiltered_task_list_always_includes_tasks_with_no_capabilities() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let tagged_payload = handlers::CreateTaskPayload {
+            description: "tagged".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"a").as_bytes()),
+            min_reputation: 0,
+            capabilities: BTreeSet::from(["python".to_string()]),
+        };
+        hub.client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, tagged_payload))
+            .send()
+            .await
+            .unwrap();
+
+        let untagged_payload = handlers::CreateTaskPayload {
+            description: "untagged".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"b").as_bytes()),
+            min_reputation: 0,
+            capabilities: Default::default(),
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, untagged_payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let untagged_task: Value = resp.json().await.unwrap();
+        assert_eq!(untagged_task["capabilities"], json!([]), "no capabilities were given, so none are stored");
+
+        let unfiltered: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(unfiltered.len(), 2, "an unfiltered query returns both the tagged and untagged task");
+
+        let filtered_by_tag: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks?capability=python", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(filtered_by_tag.len(), 1, "the untagged task never matches a specific capability filter");
+    }
+
+    #[tokio::test]
+    async fn capability_filter_normalizes_case() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let payload = handlers::CreateTaskPayload {
+            description: "mixed case tag".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"a").as_bytes()),
+            min_reputation: 0,
+            capabilities: BTreeSet::from(["  Python  ".to_string()]),
+        };
+        let task: Value = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(task["capabilities"], json!(["python"]), "stored tags are trimmed and lowercased at write time");
+
+        for query in ["python", "Python", "PYTHON"] {
+            let filtered: Vec<Value> = hub
+                .client
+                .get(format!("{}/tasks?capability={query}", hub.base_url))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(filtered.len(), 1, "query {query:?} should match the normalized stored tag regardless of case");
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_filter_composes_with_limit_and_offset() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let base_time = Utc::now();
+
+        let mut ids = Vec::new();
+        {
+            let mut board = hub.state.board.write().await;
+            for i in 0..4u32 {
+                let mut task = board.create_task(
+                    hub.state.operator_public_key.clone(),
+                    format!("python task {i}"),
+                    10,
+                    Hash::hash_bytes(format!("py{i}").as_bytes()),
+                );
+                task.created_at = base_time + chrono::Duration::seconds(i as i64);
+                task.capabilities = BTreeSet::from(["python".to_string()]);
+                ids.push(task.id);
+                board.restore_task(task);
+            }
+            // A same-vintage distractor tagged differently, to prove the
+            // capability filter is applied before pagination rather than
+            // the assertions below passing by coincidence.
+            let mut distractor = board.create_task(
+                hub.state.operator_public_key.clone(),
+                "rust distractor".to_string(),
+                10,
+                Hash::hash_bytes(b"rust-distractor"),
+            );
+            distractor.created_at = base_time + chrono::Duration::milliseconds(1500);
+            distractor.capabilities = BTreeSet::from(["rust".to_string()]);
+            board.restore_task(distractor);
+        }
+
+        let page: Vec<Value> = hub
+            .client
+            .get(format!("{}/tasks?capability=python&limit=2&offset=1", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), ids[1], "oldest-first among python-tagged tasks, so offset=1 starts at the 2nd-oldest");
+        assert_eq!(page[1]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), ids[2]);
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_too_many_capability_tags() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let too_many: BTreeSet<String> = (0..21).map(|i| format!("tag{i}")).collect();
+        let payload = handlers::CreateTaskPayload {
+            description: "too many tags".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"a").as_bytes()),
+            min_reputation: 0,
+            capabilities: too_many,
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
     fn parse_pubkey(hex_str: &str) -> PublicKey {
         PublicKey::from_sec1_bytes(&hex::decode(hex_str).unwrap()).unwrap()
     }
@@ -1328,6 +1585,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"42").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let resp = hub
             .client
@@ -1374,6 +1632,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client
@@ -1412,6 +1671,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client
@@ -1461,6 +1721,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client
@@ -1516,6 +1777,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client
@@ -1551,6 +1813,7 @@ mod tests {
             bounty: 1_000,
             expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client
@@ -1617,6 +1880,7 @@ mod tests {
             join_window_minutes: 60,
             submission_window_minutes: 30,
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client
@@ -1701,6 +1965,7 @@ mod tests {
             bounty,
             dispute_window_minutes,
             min_reputation: 0,
+            capabilities: Default::default(),
         };
         let reservation: Value = hub
             .client

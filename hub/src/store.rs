@@ -275,6 +275,7 @@ mod tests {
             min_reputation: 0,
             close_reason: None,
             escrow_id: None,
+            capabilities: Default::default(),
         };
         store.save_task(&task).unwrap();
         let loaded = store.load_all_tasks().unwrap();
@@ -320,6 +321,7 @@ mod tests {
                 bounty: 500,
                 expected_output_hash: Hash::hash_bytes(b"x"),
                 min_reputation: 0,
+                capabilities: Default::default(),
             }),
             status: crate::board::EscrowStatus::Reserved,
             created_at: Utc::now(),

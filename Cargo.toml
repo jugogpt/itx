@@ -5,6 +5,7 @@ members = [
     "lib",
     "miner",
     "node",
+    "sdk",
     "wallet",
 ]
 

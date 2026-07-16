@@ -1,6 +1,6 @@
 use tracing::*;
 
-use crate::auth::{AuthError, SignedEnvelope};
+use crate::auth::{AuthError, SignedEnvelope, VerifyEnvelope};
 use crate::board::{
     BoardError, CloseReason, ConsensusTaskIntent, Dispute, DisputableTaskIntent, DisputeResolution,
     EscrowConfirmation, EscrowPurpose, EscrowStatus, PendingDeposit, Reputation, Task, TaskBoard, TaskIntent,
@@ -17,6 +17,7 @@ use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use static_init::dynamic;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -52,6 +53,12 @@ const MAX_TASKS_PAGE_SIZE: usize = 200;
 /// showed up late). An hour is generous slack for an on-chain payment to
 /// actually confirm on this testnet.
 const ESCROW_RESERVATION_TTL_MINUTES: i64 = 60;
+/// Upper bound on how many capability tags one task may carry -- a sanity
+/// limit, not a taxonomy (there is none -- see `validate_capabilities`).
+const MAX_CAPABILITY_TAGS: usize = 20;
+/// Upper bound on one capability tag's length in characters (after
+/// normalization).
+const MAX_CAPABILITY_TAG_LENGTH: usize = 64;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -210,6 +217,9 @@ pub struct TaskDto {
     pub min_reputation: u64,
     /// `Consensus`-only: why the task ended `Closed`, if it did.
     pub close_reason: Option<CloseReason>,
+    /// Free-form capability tags, already normalized. Empty means
+    /// unrestricted -- see `GET /tasks?capability=`.
+    pub capabilities: BTreeSet<String>,
     #[serde(flatten)]
     pub kind: TaskKindDto,
 }
@@ -240,6 +250,7 @@ impl From<&Task> for TaskDto {
             failed_attempts: task.failed_attempts,
             min_reputation: task.min_reputation,
             close_reason: task.close_reason,
+            capabilities: task.capabilities.clone(),
             kind,
         }
     }
@@ -306,6 +317,11 @@ pub struct CreateTaskPayload {
     /// (or send `0`) for no gate at all.
     #[serde(default)]
     pub min_reputation: u64,
+    /// Free-form capability tags (e.g. `"python"`, `"translation"`).
+    /// Omit (or send an empty set) for unrestricted -- see
+    /// `validate_capabilities` for normalization/limits.
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -325,6 +341,9 @@ pub struct CreateConsensusTaskPayload {
     /// Same meaning as `CreateTaskPayload::min_reputation`.
     #[serde(default)]
     pub min_reputation: u64,
+    /// Same meaning as `CreateTaskPayload::capabilities`.
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -346,6 +365,12 @@ pub struct ListTasksQuery {
     #[serde(default)]
     pub offset: usize,
     pub limit: Option<usize>,
+    /// Single-tag exact match against a task's normalized capability
+    /// tags. Absent means unfiltered. Normalized (trim + lowercase) the
+    /// same way stored tags already are, so casing doesn't matter here
+    /// either. Multi-tag AND/OR filtering isn't built -- nothing needs it
+    /// yet, and it'd be a pure handler-side change if that changes.
+    pub capability: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -363,6 +388,8 @@ pub struct EscrowTaskPayload {
     pub expected_output_hash: String,
     #[serde(default)]
     pub min_reputation: u64,
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
 }
 
 /// Same shape as `CreateConsensusTaskPayload`, minus the operator
@@ -376,6 +403,8 @@ pub struct EscrowConsensusTaskPayload {
     pub submission_window_minutes: i64,
     #[serde(default)]
     pub min_reputation: u64,
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -395,6 +424,8 @@ pub struct EscrowDisputableTaskPayload {
     pub dispute_window_minutes: i64,
     #[serde(default)]
     pub min_reputation: u64,
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
 }
 
 /// Reserves a bond escrow for disputing `task_id`'s submitted answer.
@@ -453,12 +484,21 @@ pub async fn list_tasks(
     Query(query): Query<ListTasksQuery>,
 ) -> Json<Vec<TaskDto>> {
     let limit = query.limit.unwrap_or(DEFAULT_TASKS_PAGE_SIZE).min(MAX_TASKS_PAGE_SIZE);
+    // Normalized the same way stored tags already are (see
+    // validate_capabilities) -- a task with no capability tags at all
+    // always matches an unfiltered query (no filter -> no exclusion), but
+    // never matches a *specific* capability filter (nothing to match).
+    let capability_filter = query.capability.map(|c| c.trim().to_lowercase());
     let board = state.board.read().await;
     let mut tasks = board.list_open_tasks();
     tasks.sort_by_key(|t| t.created_at);
     Json(
         tasks
             .into_iter()
+            .filter(|t| match &capability_filter {
+                Some(tag) => t.capabilities.contains(tag),
+                None => true,
+            })
             .skip(query.offset)
             .take(limit)
             .map(TaskDto::from)
@@ -485,6 +525,7 @@ pub async fn create_task(
     require_operator(&pubkey, &state)?;
     let expected_output_hash = parse_hex_hash(&envelope.payload.expected_output_hash)?;
     let bounty = envelope.payload.bounty;
+    let capabilities = validate_capabilities(&envelope.payload.capabilities)?;
 
     // Held across the balance check below on purpose: this is what makes
     // two concurrent task-creation requests safe (the second one's
@@ -495,6 +536,7 @@ pub async fn create_task(
     ensure_operator_can_fund(&state, &board, bounty).await?;
     let mut task = board.create_task(pubkey, envelope.payload.description.clone(), bounty, expected_output_hash);
     apply_min_reputation(&mut board, &mut task, envelope.payload.min_reputation);
+    apply_capabilities(&mut board, &mut task, capabilities);
     drop(board);
 
     state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -520,6 +562,7 @@ pub async fn create_consensus_task(
     validate_positive_minutes(envelope.payload.join_window_minutes, "join_window_minutes")?;
     validate_positive_minutes(envelope.payload.submission_window_minutes, "submission_window_minutes")?;
     let bounty = envelope.payload.bounty;
+    let capabilities = validate_capabilities(&envelope.payload.capabilities)?;
 
     let mut board = state.board.write().await;
     ensure_operator_can_fund(&state, &board, bounty).await?;
@@ -540,6 +583,7 @@ pub async fn create_consensus_task(
         envelope.payload.submission_window_minutes,
     );
     apply_min_reputation(&mut board, &mut task, envelope.payload.min_reputation);
+    apply_capabilities(&mut board, &mut task, capabilities);
     drop(board);
 
     state.store.save_task(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -559,12 +603,14 @@ pub async fn create_task_escrow(
     let expected_output_hash = parse_hex_hash(&envelope.payload.expected_output_hash)?;
     let bounty = envelope.payload.bounty;
     let required_amount = bounty + HUB_TRANSACTION_FEE;
+    let capabilities = validate_capabilities(&envelope.payload.capabilities)?;
 
     let intent = TaskIntent {
         description: envelope.payload.description.clone(),
         bounty,
         expected_output_hash,
         min_reputation: envelope.payload.min_reputation,
+        capabilities,
     };
     let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
     let deposit = state.board.write().await.reserve_escrow(
@@ -597,6 +643,7 @@ pub async fn create_consensus_task_escrow(
     validate_positive_minutes(envelope.payload.submission_window_minutes, "submission_window_minutes")?;
     let bounty = envelope.payload.bounty;
     let required_amount = bounty + HUB_TRANSACTION_FEE;
+    let capabilities = validate_capabilities(&envelope.payload.capabilities)?;
 
     let intent = ConsensusTaskIntent {
         description: envelope.payload.description.clone(),
@@ -605,6 +652,7 @@ pub async fn create_consensus_task_escrow(
         join_window_minutes: envelope.payload.join_window_minutes,
         submission_window_minutes: envelope.payload.submission_window_minutes,
         min_reputation: envelope.payload.min_reputation,
+        capabilities,
     };
     let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
     let deposit = state.board.write().await.reserve_escrow(
@@ -629,12 +677,14 @@ pub async fn create_disputable_task_escrow(
     validate_positive_minutes(envelope.payload.dispute_window_minutes, "dispute_window_minutes")?;
     let bounty = envelope.payload.bounty;
     let required_amount = bounty + HUB_TRANSACTION_FEE;
+    let capabilities = validate_capabilities(&envelope.payload.capabilities)?;
 
     let intent = DisputableTaskIntent {
         description: envelope.payload.description.clone(),
         bounty,
         dispute_window_minutes: envelope.payload.dispute_window_minutes,
         min_reputation: envelope.payload.min_reputation,
+        capabilities,
     };
     let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
     let deposit = state.board.write().await.reserve_escrow(
@@ -1679,6 +1729,53 @@ fn apply_min_reputation(board: &mut TaskBoard, task: &mut Task, min_reputation: 
             .set_min_reputation(task.id, min_reputation)
             .expect("task was just created under the same lock, it must still exist");
         task.min_reputation = min_reputation;
+    }
+}
+
+/// Normalizes (trim + lowercase) and validates a task's proposed
+/// capability tags: caps how many tags and how long each one may be
+/// (`MAX_CAPABILITY_TAGS`/`MAX_CAPABILITY_TAG_LENGTH`), and drops any tag
+/// that's empty after trimming. No taxonomy or registry behind these --
+/// free-form tags match this project's existing style (`min_reputation`
+/// is a bare numeric threshold with no registry behind it either), and a
+/// permissionless marketplace has no natural admin to maintain one
+/// anyway. Normalizing here, once, at write time -- rather than at every
+/// read/query site -- is what makes `"Python"` and `"python"` match
+/// without every comparison needing to re-normalize both sides; `GET
+/// /tasks?capability=` only needs to normalize the one incoming query
+/// tag against already-normalized stored ones.
+fn validate_capabilities(raw: &BTreeSet<String>) -> Result<BTreeSet<String>, ApiError> {
+    if raw.len() > MAX_CAPABILITY_TAGS {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_CAPABILITY_TAGS} capability tags are allowed, got {}",
+            raw.len()
+        )));
+    }
+    raw.iter()
+        .map(|tag| tag.trim().to_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| {
+            if tag.chars().count() > MAX_CAPABILITY_TAG_LENGTH {
+                Err(ApiError::BadRequest(format!(
+                    "capability tag {tag:?} exceeds the {MAX_CAPABILITY_TAG_LENGTH}-character limit"
+                )))
+            } else {
+                Ok(tag)
+            }
+        })
+        .collect()
+}
+
+/// Applies validated capability tags to a just-created task, keeping the
+/// board's copy and the caller's local `task` (about to be
+/// returned/persisted) in sync -- same shape and reasoning as
+/// `apply_min_reputation`.
+fn apply_capabilities(board: &mut TaskBoard, task: &mut Task, capabilities: BTreeSet<String>) {
+    if !capabilities.is_empty() {
+        board
+            .set_capabilities(task.id, capabilities.clone())
+            .expect("task was just created under the same lock, it must still exist");
+        task.capabilities = capabilities;
     }
 }
 

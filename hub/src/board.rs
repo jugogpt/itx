@@ -252,6 +252,13 @@ pub struct Task {
     /// address, and which `allocated_bounty()` must not double-count
     /// against the operator's balance.
     pub escrow_id: Option<Uuid>,
+    /// Free-form capability tags (already normalized -- trimmed and
+    /// lowercased -- by the HTTP layer before reaching here), e.g.
+    /// `"python"`/`"translation"`. Empty means unrestricted, mirroring
+    /// `min_reputation`'s `0`-means-ungated convention. No fixed taxonomy
+    /// or registry, matching this project's existing style -- a
+    /// permissionless marketplace has no natural admin to maintain one.
+    pub capabilities: BTreeSet<String>,
 }
 
 impl Task {
@@ -400,6 +407,7 @@ pub struct TaskIntent {
     pub bounty: u64,
     pub expected_output_hash: Hash,
     pub min_reputation: u64,
+    pub capabilities: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +418,7 @@ pub struct ConsensusTaskIntent {
     pub join_window_minutes: i64,
     pub submission_window_minutes: i64,
     pub min_reputation: u64,
+    pub capabilities: BTreeSet<String>,
 }
 
 /// What a `PendingDeposit`'s funds are earmarked for.
@@ -431,6 +440,7 @@ pub struct DisputableTaskIntent {
     pub bounty: u64,
     pub dispute_window_minutes: i64,
     pub min_reputation: u64,
+    pub capabilities: BTreeSet<String>,
 }
 
 /// A one-time, hub-generated keypair handed out as a deposit address for
@@ -521,6 +531,7 @@ impl TaskBoard {
             min_reputation: 0,
             close_reason: None,
             escrow_id: None,
+            capabilities: BTreeSet::new(),
         };
         self.tasks.insert(task.id, task.clone());
         task
@@ -563,6 +574,7 @@ impl TaskBoard {
             min_reputation: 0,
             close_reason: None,
             escrow_id: None,
+            capabilities: BTreeSet::new(),
         };
         self.tasks.insert(task.id, task.clone());
         task
@@ -596,6 +608,7 @@ impl TaskBoard {
             min_reputation: 0,
             close_reason: None,
             escrow_id: None,
+            capabilities: BTreeSet::new(),
         };
         self.tasks.insert(task.id, task.clone());
         task
@@ -610,6 +623,18 @@ impl TaskBoard {
     pub fn set_min_reputation(&mut self, id: Uuid, min_reputation: u64) -> Result<(), BoardError> {
         let task = self.tasks.get_mut(&id).ok_or(BoardError::NotFound)?;
         task.min_reputation = min_reputation;
+        Ok(())
+    }
+
+    /// Sets `id`'s capability tags, same "call right after creation"
+    /// convention as `set_min_reputation`. Callers (the HTTP layer, or
+    /// `confirm_escrow` for the escrow-funded path) are responsible for
+    /// normalizing (trim + lowercase) and validating tag count/length
+    /// before calling this -- `board.rs` stores whatever it's given
+    /// as-is, same division of labor as every other validated field here.
+    pub fn set_capabilities(&mut self, id: Uuid, capabilities: BTreeSet<String>) -> Result<(), BoardError> {
+        let task = self.tasks.get_mut(&id).ok_or(BoardError::NotFound)?;
+        task.capabilities = capabilities;
         Ok(())
     }
 
@@ -735,6 +760,10 @@ impl TaskBoard {
                     self.set_min_reputation(task.id, intent.min_reputation)
                         .expect("task was just created under the same lock, it must still exist");
                 }
+                if !intent.capabilities.is_empty() {
+                    self.set_capabilities(task.id, intent.capabilities)
+                        .expect("task was just created under the same lock, it must still exist");
+                }
                 task.id
             }
             EscrowPurpose::FundConsensusTask(intent) => {
@@ -757,6 +786,10 @@ impl TaskBoard {
                     self.set_min_reputation(task.id, intent.min_reputation)
                         .expect("task was just created under the same lock, it must still exist");
                 }
+                if !intent.capabilities.is_empty() {
+                    self.set_capabilities(task.id, intent.capabilities)
+                        .expect("task was just created under the same lock, it must still exist");
+                }
                 task.id
             }
             EscrowPurpose::FundDisputableTask(intent) => {
@@ -768,6 +801,10 @@ impl TaskBoard {
                 );
                 if intent.min_reputation > 0 {
                     self.set_min_reputation(task.id, intent.min_reputation)
+                        .expect("task was just created under the same lock, it must still exist");
+                }
+                if !intent.capabilities.is_empty() {
+                    self.set_capabilities(task.id, intent.capabilities)
                         .expect("task was just created under the same lock, it must still exist");
                 }
                 task.id
@@ -2136,6 +2173,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(
             depositor.clone(),
@@ -2160,6 +2198,7 @@ mod tests {
             bounty: 500,
             expected_output_hash: expected,
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(
             depositor.clone(),
@@ -2192,6 +2231,7 @@ mod tests {
             join_window_minutes: 60,
             submission_window_minutes: 30,
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(
             depositor.clone(),
@@ -2216,6 +2256,7 @@ mod tests {
             bounty: 500,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(
             pubkey(),
@@ -2241,6 +2282,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(
             pubkey(),
@@ -2263,6 +2305,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(
             pubkey(),
@@ -2296,6 +2339,7 @@ mod tests {
             bounty,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let expired = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent(100)), now - chrono::Duration::seconds(1));
         let still_fresh = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent(100)), now + chrono::Duration::minutes(30));
@@ -2316,6 +2360,7 @@ mod tests {
             bounty: 100,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(pubkey(), 100, EscrowPurpose::FundHashMatchTask(intent), Utc::now() - chrono::Duration::seconds(1));
 
@@ -2334,6 +2379,7 @@ mod tests {
             bounty: 900,
             expected_output_hash: Hash::hash_bytes(b"y"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(pubkey(), 900, EscrowPurpose::FundHashMatchTask(intent), Utc::now() + chrono::Duration::minutes(30));
         board.confirm_escrow(deposit.id, 900, Utc::now()).unwrap();
@@ -2378,6 +2424,7 @@ mod tests {
             bounty: 10,
             expected_output_hash: Hash::hash_bytes(b"x"),
             min_reputation: 0,
+            capabilities: BTreeSet::new(),
         };
         let deposit = board.reserve_escrow(pubkey(), 10, EscrowPurpose::FundHashMatchTask(intent), Utc::now() + chrono::Duration::minutes(30));
         let EscrowConfirmation::TaskCreated(task) = board.confirm_escrow(deposit.id, 10, Utc::now()).unwrap();

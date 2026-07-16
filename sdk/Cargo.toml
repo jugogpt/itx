@@ -1,0 +1,20 @@
+[package]
+name = "sdk"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sdk"
+path = "src/lib.rs"
+
+[dependencies]
+btclib = { path = "../lib" }
+serde = { workspace = true }
+serde_json = "1.0"
+chrono = { workspace = true }
+
+[dev-dependencies]
+# Only pulled in for `examples/gen_fixtures.rs`, which writes the
+# conformance fixture `agent-sdk-py`'s test suite checks itself against --
+# never part of anything else in this crate's dependency tree.
+hex = { workspace = true }

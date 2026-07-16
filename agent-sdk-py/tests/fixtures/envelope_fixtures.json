@@ -1,0 +1,47 @@
+[
+  {
+    "expected_signature_hex": "0019ef82647e087b0e5303cad2ec956668a8e41eb31f9ed360b15c0203da274279c79766f6e0b6fa67c2f1c249a389a062a5453d82659d29a2616e4b9b347f5d",
+    "expected_signing_string": "038fad25e7cf43d6f027d2eb3cd9ad6359034db13875e3d12cb750df4a2bd3b5a2:2026-01-01T00:00:00+00:00:null",
+    "name": "unit_payload",
+    "payload_json": "null",
+    "private_key_hex": "2207621b28e394b7c6d15af51e470076eba39706d22a2013424a67fc67a68a7d",
+    "pubkey_hex": "038fad25e7cf43d6f027d2eb3cd9ad6359034db13875e3d12cb750df4a2bd3b5a2",
+    "timestamp": "2026-01-01T00:00:00+00:00"
+  },
+  {
+    "expected_signature_hex": "93d1dcb14405c9bd2ac4de904912769ad045a990b66fbb121a13d2dc27d3a4bd75011443cd5859a0bae99620cde9b7a8e3e15acac0860487d0a169b44004002e",
+    "expected_signing_string": "038fad25e7cf43d6f027d2eb3cd9ad6359034db13875e3d12cb750df4a2bd3b5a2:2026-01-01T00:00:00+00:00:{\"task_id\":\"11111111-2222-3333-4444-555555555555\"}",
+    "name": "simple_struct",
+    "payload_json": "{\"task_id\":\"11111111-2222-3333-4444-555555555555\"}",
+    "private_key_hex": "2207621b28e394b7c6d15af51e470076eba39706d22a2013424a67fc67a68a7d",
+    "pubkey_hex": "038fad25e7cf43d6f027d2eb3cd9ad6359034db13875e3d12cb750df4a2bd3b5a2",
+    "timestamp": "2026-01-01T00:00:00+00:00"
+  },
+  {
+    "expected_signature_hex": "b4d3da48182ea211b0065a69cd1b5f7a0582534d26e5f091a3163ed3e5f253242691c5ca477c8223f4117ea0160ba042b8e0d49d2af7ea220a3e805034e553e5",
+    "expected_signing_string": "03cb8eec73b83f6c9ba0d872f382319f36acbda44ea815db4e22a2711f534149c6:2026-06-15T12:30:45.123+00:00:{\"description\":\"reference SDK fixture task\",\"bounty\":1000000,\"min_reputation\":3,\"capabilities\":[\"python\",\"rust\"]}",
+    "name": "multi_field_with_capabilities",
+    "payload_json": "{\"description\":\"reference SDK fixture task\",\"bounty\":1000000,\"min_reputation\":3,\"capabilities\":[\"python\",\"rust\"]}",
+    "private_key_hex": "ca2090cbc395cb0f5d2b51498530e1af5880df6ad3fd9130281433acd7160077",
+    "pubkey_hex": "03cb8eec73b83f6c9ba0d872f382319f36acbda44ea815db4e22a2711f534149c6",
+    "timestamp": "2026-06-15T12:30:45.123+00:00"
+  },
+  {
+    "expected_signature_hex": "4f2d1504be40acab7a94fd1215a912ac1330f828ed009ae34462133dc8ed871a4a13cd3953c91462d277c16fceaa2b8a9b198e8eb99e7c2efe7bca591361822c",
+    "expected_signing_string": "03cb8eec73b83f6c9ba0d872f382319f36acbda44ea815db4e22a2711f534149c6:2026-01-01T00:00:00+00:00:{\"description\":\"no tags\",\"bounty\":10,\"min_reputation\":0,\"capabilities\":[]}",
+    "name": "multi_field_empty_capabilities",
+    "payload_json": "{\"description\":\"no tags\",\"bounty\":10,\"min_reputation\":0,\"capabilities\":[]}",
+    "private_key_hex": "ca2090cbc395cb0f5d2b51498530e1af5880df6ad3fd9130281433acd7160077",
+    "pubkey_hex": "03cb8eec73b83f6c9ba0d872f382319f36acbda44ea815db4e22a2711f534149c6",
+    "timestamp": "2026-01-01T00:00:00+00:00"
+  },
+  {
+    "expected_signature_hex": "8f4398c91ad419a9597a9e14410ba603640435a72b01fa3e80bc2572b54a095d78ca75d91379a0f05d72de271057da7508c978dce132af1d9ee4dbe8cfe4a58a",
+    "expected_signing_string": "038fad25e7cf43d6f027d2eb3cd9ad6359034db13875e3d12cb750df4a2bd3b5a2:2026-06-15T12:30:45.123+00:00:{\"note\":\"café \\\"quoted\\\" \\\\ newline:\\n テスト 🦄\"}",
+    "name": "unicode_and_escaping_stress",
+    "payload_json": "{\"note\":\"café \\\"quoted\\\" \\\\ newline:\\n テスト 🦄\"}",
+    "private_key_hex": "2207621b28e394b7c6d15af51e470076eba39706d22a2013424a67fc67a68a7d",
+    "pubkey_hex": "038fad25e7cf43d6f027d2eb3cd9ad6359034db13875e3d12cb750df4a2bd3b5a2",
+    "timestamp": "2026-06-15T12:30:45.123+00:00"
+  }
+]

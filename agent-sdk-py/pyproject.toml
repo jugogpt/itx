@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itx-agent-sdk"
+version = "0.1.0"
+description = "Reference Python client for the itx agent hub"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31",
+    "ecdsa>=0.18",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["itx_agent_sdk*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

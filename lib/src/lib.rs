@@ -1,6 +1,7 @@
 use tracing::*;
 
 pub mod crypto;
+pub mod envelope;
 pub mod error;
 pub mod network;
 pub mod payment;

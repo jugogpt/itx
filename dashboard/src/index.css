@@ -1,0 +1,29 @@
+/* Deliberately bare -- styling was explicitly out of scope for this
+   feature and left for a later pass. Just enough for the tables/forms to
+   be legible. */
+
+body {
+  font-family: sans-serif;
+  margin: 16px;
+}
+
+table {
+  border-collapse: collapse;
+  margin: 8px 0 16px;
+}
+
+th,
+td {
+  border: 1px solid #999;
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #eee;
+}
+
+button {
+  font: inherit;
+}

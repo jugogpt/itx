@@ -5,13 +5,14 @@
 //!   cargo run -p hub --example smoke_agent -- <hub_base_url> <operator_priv_key_file> [node_address]
 
 use anyhow::{Context, Result};
-use btclib::crypto::{PrivateKey, Signature};
+use btclib::crypto::PrivateKey;
 use btclib::network::Message;
 use btclib::sha256::Hash;
 use btclib::util::Saveable;
-use chrono::Utc;
+use sdk::build_envelope;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
+use std::collections::BTreeSet;
 use tokio::net::TcpStream;
 
 // Mirrors of `hub::handlers::{CreateTaskPayload, ClaimPayload,
@@ -23,12 +24,19 @@ use tokio::net::TcpStream;
 // would serialize its keys alphabetically instead (it's backed by a
 // `BTreeMap`), silently producing a different string and failing
 // signature verification for any struct whose fields aren't already in
-// alphabetical order.
+// alphabetical order. This drifting out of sync with the real struct (it
+// was missing `min_reputation`/`capabilities` until this was caught by
+// actually running this file against a live hub -- every operator task
+// creation here was silently failing signature verification) is exactly
+// that failure mode; there is no compiler check tying this mirror to the
+// real one, only running it.
 #[derive(Serialize)]
 struct CreateTaskPayload {
     description: String,
     bounty: u64,
     expected_output_hash: String,
+    min_reputation: u64,
+    capabilities: BTreeSet<String>,
 }
 
 #[derive(Serialize)]
@@ -40,25 +48,6 @@ struct ClaimPayload {
 struct SubmitPayload {
     task_id: String,
     output: String,
-}
-
-/// Reproduces exactly what `hub::auth::SignedEnvelope::verify` expects:
-/// hex(pubkey) + ":" + rfc3339(timestamp) + ":" + json(payload), SHA256'd
-/// and signed. Any HTTP client in any language builds requests this way --
-/// this function is the reference implementation restated in Rust.
-fn build_envelope<T: Serialize>(private_key: &PrivateKey, payload: T) -> Value {
-    let pubkey_hex = private_key.public_key().to_string();
-    let timestamp = Utc::now().to_rfc3339();
-    let payload_json = serde_json::to_string(&payload).expect("payload must serialize");
-    let signing_string = format!("{pubkey_hex}:{timestamp}:{payload_json}");
-    let hash = Hash::hash_bytes(signing_string.as_bytes());
-    let signature = Signature::sign_hash(&hash, private_key);
-    json!({
-        "pubkey": pubkey_hex,
-        "timestamp": timestamp,
-        "payload": payload,
-        "signature": hex::encode(signature.to_bytes()),
-    })
 }
 
 #[tokio::main]
@@ -116,6 +105,8 @@ async fn main() -> Result<()> {
         description: "should be rejected".to_string(),
         bounty: 10,
         expected_output_hash: hex::encode(Hash::hash_bytes(b"x").as_bytes()),
+        min_reputation: 0,
+        capabilities: BTreeSet::new(),
     };
     let envelope = build_envelope(&impostor_key, payload);
     let resp = client
@@ -133,6 +124,8 @@ async fn main() -> Result<()> {
         description: "reply with the answer to everything".to_string(),
         bounty: 1_000_000u64,
         expected_output_hash: expected_hash,
+        min_reputation: 0,
+        capabilities: BTreeSet::new(),
     };
     let envelope = build_envelope(&operator_key, payload);
     let resp = client
