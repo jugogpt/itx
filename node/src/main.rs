@@ -21,6 +21,17 @@ pub static BLOCKCHAIN: RwLock<Blockchain> = RwLock::new(Blockchain::new());
 #[dynamic]
 pub static NODES: DashMap<String, TcpStream> = DashMap::new();
 
+/// `BLOCKCHAIN`/`NODES`/the ban list are process-wide statics shared by
+/// every test in this crate's test binary, which cargo runs in parallel
+/// by default -- any test that touches them must hold this lock first, or
+/// two tests will race and corrupt each other's view of the chain/peer
+/// list. `node/src/time_sync.rs`'s test sidesteps this by keeping its
+/// tested logic pure and state-free; the network-facing tests in
+/// `handler.rs`/`util.rs` can't do that (they need a real `Blockchain` to
+/// serve/sync), so they serialize on this instead.
+#[cfg(test)]
+pub static TEST_GLOBAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Initialized once at startup with the CLI-provided path, then read from
 // everywhere else. A plain OnceLock (rather than the #[dynamic] statics
 // above) because its value depends on a runtime argument, not just a

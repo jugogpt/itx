@@ -1,7 +1,6 @@
 use crate::core::Core;
 use crate::ui::run_ui;
 use crate::util::big_mode_btc;
-use btclib::types::Transaction;
 use cursive::views::TextContent;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -13,17 +12,6 @@ pub async fn update_utxos(core: Arc<Core>) {
         interval.tick().await;
         if let Err(e) = core.fetch_utxos().await {
             error!("Failed to update UTXOs: {}", e);
-        }
-    }
-}
-
-pub async fn handle_transactions(
-    rx: kanal::AsyncReceiver<Transaction>,
-    core: Arc<Core>,
-) {
-    while let Ok(transaction) = rx.recv().await {
-        if let Err(e) = core.send_transaction(transaction).await {
-            error!("Failed to send transaction: {}", e);
         }
     }
 }

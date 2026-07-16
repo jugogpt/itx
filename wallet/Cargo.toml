@@ -12,9 +12,8 @@ btclib = { path = "../lib" }
 anyhow = "1.0.86"
 clap = { version = "4.5.8", features = ["derive"] }
 crossbeam-skiplist = "0.1.3"
-cursive = "0.20.0"
+cursive = { version = "0.20.0", default-features = false, features = ["crossterm-backend"] }
 futures = "0.3.30"
-kanal = "0.1.0-pre8"
 serde = { version = "1.0.204", features = ["derive"] }
 text-to-ascii-art = "0.1.10"
 tokio = { version = "1.38.0", features = ["full"] }

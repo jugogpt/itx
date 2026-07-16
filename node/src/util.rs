@@ -201,50 +201,73 @@ pub async fn find_best_chain_node() -> Result<(String, u32)> {
     Ok((best_name, best_height))
 }
 
-pub async fn download_blockchain(store: &BlockStore, node: &str, count: u32) -> Result<()> {
-    // Start from whatever height we're already at (at minimum, our own
-    // locally-established genesis) rather than always from 0 -- otherwise
-    // we'd re-fetch genesis itself from the peer and reject it as a
-    // "competing" one, since it wouldn't extend our current tip.
-    let start = BLOCKCHAIN.read().await.block_height() as usize;
-    let mut stream = NODES.get_mut(node).unwrap();
-    for i in start..count as usize {
-        let message = Message::FetchBlock(i);
+/// Downloads and applies every block between our current height and
+/// `target_height` (an absolute height, not a delta -- e.g. from
+/// `find_best_chain_node`'s `AskChainTip` round trip), in batches of up to
+/// `btclib::BLOCKS_PER_FETCH_BATCH` blocks per round trip via
+/// `Message::FetchBlocks`/`Message::Blocks` rather than one `FetchBlock`
+/// round trip per block.
+pub async fn download_blockchain(store: &BlockStore, node: &str, target_height: u32) -> Result<()> {
+    let mut stream = NODES.get_mut(node).context("no node")?;
+    loop {
+        // Re-read our height every pass (at minimum, our own
+        // locally-established genesis) rather than assuming it only ever
+        // advances by exactly one batch -- otherwise we'd re-fetch
+        // already-applied blocks or, worse, blocks at/before genesis and
+        // reject them as "competing" ones, since they wouldn't extend our
+        // current tip.
+        let start = BLOCKCHAIN.read().await.block_height() as usize;
+        if start as u32 >= target_height {
+            break;
+        }
+        let count = (target_height - start as u32).min(btclib::BLOCKS_PER_FETCH_BATCH as u32);
+        let message = Message::FetchBlocks { start, count };
         message.send_async(&mut *stream).await?;
         let message = Message::receive_async(&mut *stream).await?;
         match message {
-            Message::NewBlock(block) => {
-                let result = {
-                    let mut blockchain = BLOCKCHAIN.write().await;
-                    blockchain.add_block(block.clone())
-                };
-                match result {
-                    Ok(()) => {
-                        persist_chain_state(store, &block).await?;
-                    }
-                    // Not the peer's fault -- our own chain state can
-                    // shift between the AskChainTip that picked this peer
-                    // and a later FetchBlock in the same session. Abort
-                    // this sync attempt without punishing them for it.
-                    Err(btclib::error::BtcError::OrphanBlock) => {
-                        anyhow::bail!(
-                            "peer {node} sent a block that doesn't connect to our chain during sync"
-                        );
-                    }
-                    // A real content-validation failure. Same category of
-                    // error handler.rs treats leniently (a strike, not an
-                    // immediate ban) -- an occasional bad block here isn't
-                    // necessarily malicious either.
-                    Err(e) => {
-                        if let Some(ip) = addr_ip(node) {
-                            crate::ban::strike(ip, false);
+            Message::Blocks(blocks) => {
+                if blocks.is_empty() {
+                    // The peer has nothing more past `start`, whatever the
+                    // reason -- stop instead of looping forever asking for
+                    // blocks it's already told us it doesn't have.
+                    break;
+                }
+                for block in blocks {
+                    let result = {
+                        let mut blockchain = BLOCKCHAIN.write().await;
+                        blockchain.add_block(block.clone())
+                    };
+                    match result {
+                        Ok(()) => {
+                            persist_chain_state(store, &block).await?;
                         }
-                        return Err(e).context("peer sent an invalid block during sync");
+                        // Not the peer's fault -- our own chain state can
+                        // shift between the AskChainTip that picked this
+                        // peer and a later FetchBlocks in the same
+                        // session. Abort this sync attempt without
+                        // punishing them for it.
+                        Err(btclib::error::BtcError::OrphanBlock) => {
+                            anyhow::bail!(
+                                "peer {node} sent a block that doesn't connect to our chain during sync"
+                            );
+                        }
+                        // A real content-validation failure. Same category
+                        // of error handler.rs treats leniently (a strike,
+                        // not an immediate ban) -- an occasional bad block
+                        // here isn't necessarily malicious either. Abort
+                        // rather than process the rest of this batch.
+                        Err(e) => {
+                            if let Some(ip) = addr_ip(node) {
+                                crate::ban::strike(ip, false);
+                            }
+                            return Err(e).context("peer sent an invalid block during sync");
+                        }
                     }
                 }
             }
             _ => {
-                println!("unexpected message from {}", node);
+                println!("unexpected message from {}, aborting sync", node);
+                break;
             }
         }
     }
@@ -258,5 +281,227 @@ pub async fn cleanup() {
         println!("cleaning the mempool from old transactions");
         let mut blockchain = BLOCKCHAIN.write().await;
         blockchain.cleanup_mempool();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btclib::crypto::PrivateKey;
+    use btclib::types::{Block, BlockHeader, Transaction, TransactionOutput};
+    use btclib::util::MerkleRoot;
+    use btclib::U256;
+    use chrono::Utc;
+    use std::collections::VecDeque;
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    fn temp_store_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("itx_node_util_test_{name}_{}.redb", Uuid::new_v4()))
+    }
+
+    /// Mirrors `blockchain.rs`'s own private test helper of the same
+    /// shape (not importable across the crate boundary) -- mines a valid
+    /// single-coinbase child block extending `parent`.
+    fn mined_child_block(parent: Hash, target: U256, reward: u64) -> Block {
+        let private_key = PrivateKey::new_key();
+        let coinbase = Transaction::new(
+            vec![],
+            vec![TransactionOutput {
+                value: reward,
+                unique_id: Uuid::new_v4(),
+                pubkey: private_key.public_key(),
+            }],
+        );
+        let merkle_root = MerkleRoot::calculate(&[coinbase.clone()]);
+        let mut header = BlockHeader::new(Utc::now(), 0, parent, merkle_root, target);
+        assert!(
+            header.mine(1_000_000),
+            "failed to find a valid nonce within the test mining budget"
+        );
+        Block::new(header, vec![coinbase])
+    }
+
+    /// Ensures `crate::BLOCKCHAIN` (a global shared by every test in this
+    /// binary) has at least a genesis block. Caller must already hold
+    /// `crate::TEST_GLOBAL_STATE_LOCK`. Returns the current height.
+    async fn ensure_genesis() -> u64 {
+        let mut blockchain = BLOCKCHAIN.write().await;
+        if blockchain.block_height() == 0 {
+            blockchain
+                .add_block(Blockchain::genesis_block().clone())
+                .expect("BUG: canonical genesis must always be accepted by a fresh chain");
+        }
+        blockchain.block_height()
+    }
+
+    /// A fake peer that replies to each `FetchBlocks` it receives with the
+    /// next canned batch from `responses`, in order; once exhausted, every
+    /// further request gets an empty `Blocks` (simulating "nothing more
+    /// past here"). Good enough to drive `download_blockchain`'s client
+    /// loop without a real second `node` process.
+    struct FakeBlockServer {
+        addr: String,
+    }
+
+    impl FakeBlockServer {
+        async fn spawn(responses: Vec<Vec<Block>>) -> Self {
+            let mut responses: VecDeque<Vec<Block>> = responses.into();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                loop {
+                    let message = match Message::receive_async(&mut socket).await {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    };
+                    match message {
+                        Message::FetchBlocks { .. } => {
+                            let batch = responses.pop_front().unwrap_or_default();
+                            if Message::Blocks(batch).send_async(&mut socket).await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => return,
+                    }
+                }
+            });
+            FakeBlockServer { addr }
+        }
+    }
+
+    /// Connects to `fake` and registers the connection in the real
+    /// `crate::NODES` map under a fresh, unique key -- `download_blockchain`
+    /// looks its target node up there, same as real peer connections
+    /// established by `populate_connections`.
+    async fn connect_and_register(fake: &FakeBlockServer) -> String {
+        let stream = TcpStream::connect(&fake.addr).await.unwrap();
+        let key = format!("fake-{}", Uuid::new_v4());
+        NODES.insert(key.clone(), stream);
+        key
+    }
+
+    #[tokio::test]
+    async fn download_blockchain_batches_multiple_round_trips_until_target_height() {
+        let _guard = crate::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base_height = ensure_genesis().await;
+
+        // Two batches, the first deliberately shorter than the client
+        // will ask for -- exercising the fix where "shorter than
+        // requested" must NOT be read as "peer's tip reached."
+        let (batch1, batch2) = {
+            let blockchain = BLOCKCHAIN.read().await;
+            let mut parent = blockchain.blocks().last().unwrap().hash();
+            let target = blockchain.target();
+            let reward = blockchain.calculate_block_reward();
+            let mut make = |n: usize| {
+                (0..n)
+                    .map(|_| {
+                        let b = mined_child_block(parent, target, reward);
+                        parent = b.hash();
+                        b
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (make(2), make(1))
+        };
+
+        let target_height = base_height as u32 + 3;
+        let fake = FakeBlockServer::spawn(vec![batch1, batch2]).await;
+        let node_key = connect_and_register(&fake).await;
+        let store_path = temp_store_path("multi_batch");
+        let store = BlockStore::open_or_create(&store_path).unwrap();
+
+        download_blockchain(&store, &node_key, target_height)
+            .await
+            .unwrap();
+
+        assert_eq!(BLOCKCHAIN.read().await.block_height(), target_height as u64);
+
+        NODES.remove(&node_key);
+        std::fs::remove_file(&store_path).ok();
+    }
+
+    #[tokio::test]
+    async fn download_blockchain_stops_on_an_empty_reply_even_if_target_not_yet_reached() {
+        let _guard = crate::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base_height = ensure_genesis().await;
+
+        let one_block = {
+            let blockchain = BLOCKCHAIN.read().await;
+            let parent = blockchain.blocks().last().unwrap().hash();
+            vec![mined_child_block(parent, blockchain.target(), blockchain.calculate_block_reward())]
+        };
+
+        // Claim a target height far beyond what the fake peer will
+        // actually supply (one batch of 1, then it goes empty) --
+        // simulating a stale/optimistic target_height, e.g. a peer that
+        // looked ahead at AskChainTip time but has since fallen behind.
+        let target_height = base_height as u32 + 50;
+        let fake = FakeBlockServer::spawn(vec![one_block]).await;
+        let node_key = connect_and_register(&fake).await;
+        let store_path = temp_store_path("stale_target");
+        let store = BlockStore::open_or_create(&store_path).unwrap();
+
+        download_blockchain(&store, &node_key, target_height)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            BLOCKCHAIN.read().await.block_height(),
+            base_height + 1,
+            "must stop cleanly once the peer runs dry, not loop or error"
+        );
+
+        NODES.remove(&node_key);
+        std::fs::remove_file(&store_path).ok();
+    }
+
+    #[tokio::test]
+    async fn download_blockchain_aborts_on_an_invalid_block_but_keeps_earlier_progress_in_the_same_batch() {
+        let _guard = crate::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base_height = ensure_genesis().await;
+
+        // one genuinely valid block, followed by one with a bogus parent
+        // hash (never connects to our chain) in the SAME batch reply
+        let (valid_block, bad_block) = {
+            let blockchain = BLOCKCHAIN.read().await;
+            let parent = blockchain.blocks().last().unwrap().hash();
+            let target = blockchain.target();
+            let reward = blockchain.calculate_block_reward();
+            let valid = mined_child_block(parent, target, reward);
+            let bad = mined_child_block(Hash::hash_bytes(b"not a real parent"), target, reward);
+            (valid, bad)
+        };
+
+        let target_height = base_height as u32 + 10;
+        let fake = FakeBlockServer::spawn(vec![vec![valid_block.clone(), bad_block]]).await;
+        let node_key = connect_and_register(&fake).await;
+        let store_path = temp_store_path("invalid_mid_batch");
+        let store = BlockStore::open_or_create(&store_path).unwrap();
+
+        let result = download_blockchain(&store, &node_key, target_height).await;
+        assert!(result.is_err(), "an invalid block in the batch must abort the sync");
+
+        let blockchain = BLOCKCHAIN.read().await;
+        assert_eq!(
+            blockchain.block_height(),
+            base_height + 1,
+            "the valid block before the bad one must still have been applied"
+        );
+        assert_eq!(blockchain.blocks().last().unwrap().hash(), valid_block.hash());
+        drop(blockchain);
+
+        NODES.remove(&node_key);
+        std::fs::remove_file(&store_path).ok();
     }
 }

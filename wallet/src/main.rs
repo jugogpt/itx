@@ -7,10 +7,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use core::Core;
 use cursive::views::TextContent;
-use kanal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tasks::{handle_transactions, ui_task, update_balance, update_utxos};
+use tasks::{ui_task, update_balance, update_utxos};
 use tracing::*;
 use util::{big_mode_btc, generate_dummy_config, setup_panic_hook, setup_tracing};
 
@@ -55,8 +54,6 @@ async fn main() -> Result<()> {
         core.config.default_node = node;
     }
 
-    let (tx_sender, tx_receiver) = kanal::bounded(10);
-    core.tx_sender = tx_sender;
     let core = Arc::new(core);
 
     info!("Starting background tasks");
@@ -64,7 +61,6 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = ui_task(core.clone(), balance_content.clone()) => (),
         _ = update_utxos(core.clone()) => (),
-        _ = handle_transactions(tx_receiver.clone_async(), core.clone()) => (),
         _ = update_balance(core.clone(), balance_content) => (),
     }
 

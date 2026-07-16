@@ -42,8 +42,10 @@ pub fn generate_dummy_config(path: &PathBuf) -> Result<()> {
         ],
         default_node: "127.0.0.1:9000".to_string(),
         fee_config: FeeConfig {
-            fee_type: FeeType::Percent,
-            value: 0.1,
+            // 1 satoshi/byte -- a modest testnet default for the
+            // realistic, size-based fee model.
+            fee_type: FeeType::PerByte,
+            value: 1.0,
         },
     };
     let config_str = toml::to_string_pretty(&dummy_config)?;
@@ -59,5 +61,5 @@ pub fn sats_to_btc(sats: u64) -> String {
 
 pub fn big_mode_btc(core: &Core) -> String {
     let balance = sats_to_btc(core.get_balance());
-    textart::to_art(balance.clone(), 0, 1, 0).unwrap_or(balance)
+    text_to_ascii_art::to_art(balance.clone(), "standard", 0, 1, 0).unwrap_or(balance)
 }
