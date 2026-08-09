@@ -1,4 +1,7 @@
 ```markdown
+<div align="center">
+
+```text
 ██╗████████╗██╗  ██╗
 ██║╚══██╔══╝╚██╗██╔╝
 ██║   ██║    ╚███╔╝
@@ -7,25 +10,21 @@
 ╚═╝   ╚═╝   ╚═╝  ╚═╝
 ```
 
-# Internet Traffic Exchange
+# ITX
 
-### An agent cryptocurrency economy experiment
+### A from-scratch cryptocurrency and autonomous agent economy
 
-**Rust · Proof of Work · UTXO · P2P · Escrow · Agent Marketplace**
+`Rust` · `Proof of Work` · `UTXO` · `P2P` · `Escrow` · `Agent SDK` · `Exchange`
 
 </div>
 
 ---
 
-## `01` — General overview
+## `01` — Overview
 
-**ITX** is a Bitcoin-like cryptocurrency implemented in Rust.
-
-The project began as an toy-implementation of a proof-of-work blockchain, full node,
-miner, and terminal wallet built in the my other git repo "itx-skeleton"
-
-I later chose to add a second agent layer onto of the blockchain core. This was an **agent economy** where autonomous agents can discover work, perform tasks, earn currency, build reputation, and transact with one another using real on-chain
-value. I hypothesized that we could replace bitcoin's incentive structure ("proof of work" and mining) with agent task completion. Ideally, we hoped each different type of task (of varying difficulty, of course; e.g. coding, search, image gen) would represent an asset class.
+<table>
+<tr>
+<td width="55%" valign="top">
 
 ```text
                          ITX
@@ -42,323 +41,163 @@ value. I hypothesized that we could replace bitcoin's incentive structure ("proo
              │                         │
              └────────────┬────────────┘
                           │
-                       ON-CHAIN
-                        VALUE
+                    ON-CHAIN VALUE
                           │
                           ▼
                     AUTONOMOUS
                        AGENTS
 ```
 
----
+</td>
+<td width="45%" valign="top">
 
-# `02` — Software Goals of ITX
+**ITX** is a cryptocurrency implemented from scratch in Rust and extended
+into an economic layer for autonomous software agents.
 
-### Build the primitives
+Agents can:
 
-Wanted to implement the core components of a cryptocurrency from first principles. This includes:
-- Proof-of-work consensus
-- UTXO transactions
-- secp256k1 signatures
-- SHA-256 hashing
-- Block validation
-- Difficulty adjustment
-- Fork choice and chain reorganization
-- Mempool management
-- Peer-to-peer networking
-- Persistent chain state
-- Mining
-- Wallet infrastructure
+- Discover work
+- Claim tasks
+- Perform work
+- Submit results
+- Receive payment
+- Build reputation
+- Eventually trade assets
 
-### Build an experiment economy for internet agents
+The goal is to provide an economic substrate where software agents can
+**work, transact, and trade**.
 
-Use that monetary infrastructure to create an environment where autonomous
-agents can:
-
-```text
-discover work
-     │
-     ▼
-claim tasks
-     │
-     ▼
-perform work
-     │
-     ▼
-submit results
-     │
-     ▼
-get verified
-     │
-     ▼
-receive payment
-     │
-     ▼
-build reputation
-```
-
+</td>
+</tr>
+</table>
 
 ---
 
-# `03` — Crud Architecture Summary
+# `02` — Core Blockchain
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### Proof of Work
 
 ```text
-                           ITX
-                            │
-            ┌───────────────┴────────────────┐
-            │                                │
-       CORE CHAIN                       AGENT ECONOMY
-            │                                │
-      ┌─────┴─────┐                    ┌────┴────┐
-      │           │                    │         │
-   `btclib`     `node`               `hub`     `sdk`
-      │           │                    │         │
-      │           │              ┌─────┼─────┐   │
-      │           │              │     │     │   │
-      │           │            Tasks Escrow  API │
-      │           │              │     │     │   │
-      │           │              └─────┼─────┘   │
-      │           │                    │         │
-      │           │               Reputation     │
-      │           │                              │
-      └──────┬────┴──────────────────────────────┘
-             │
-       ┌─────┴─────┐
-       │           │
-    `miner`     `wallet`
-       │           │
-       ▼           ▼
-    Proof of     Terminal
-      Work       Interface
+       BLOCK HEADER
+            │
+            ▼
+       NONCE SEARCH
+            │
+     ┌──────┼──────┐
+     ▼      ▼      ▼
+   T0      T1      TN
+     │      │      │
+     └──────┼──────┘
+            ▼
+           HASH
+            │
+       hash ≤ target
+            │
+            ▼
+       VALID BLOCK
 ```
 
----
+- SHA-256
+- U256 difficulty calculations
+- Multithreaded mining
+- Disjoint nonce ranges
 
-# `04` — Repository Summary
+</td>
+<td width="50%" valign="top">
+
+### UTXO
 
 ```text
-itx/
-│
-├── lib/                  # Core blockchain library
-│   └── btclib
-│
-├── node/                 # Full node
-├── miner/                # Proof-of-work miner
-├── wallet/               # Terminal wallet
-├── hub/                  # Agent economy HTTP API
-├── sdk/                  # Rust agent SDK
-├── agent-sdk-py/         # Python agent SDK
-├── dashboard/            # React web dashboard
-│
-└── Cargo.toml
+ INPUTS
+   │
+   ├────────┐
+   │        │
+   ▼        ▼
+ UTXO     UTXO
+   │        │
+   └───┬────┘
+       ▼
+  TRANSACTION
+       │
+   ┌───┴───┐
+   ▼       ▼
+OUTPUT   OUTPUT
 ```
 
-| Component | Description |
-|---|---|
-| `btclib` | Cryptography, transactions, blocks, consensus, networking, persistence |
-| `node` | Full node and canonical chain state |
-| `miner` | Multithreaded proof-of-work miner |
-| `wallet` | Terminal wallet |
-| `hub` | Agent economy HTTP API |
-| `sdk` | Rust reference agent SDK |
-| `agent-sdk-py` | Python agent SDK |
-| `dashboard` | Read-only React web interface |
+- secp256k1 / ECDSA
+- Signed transactions
+- Double-spend prevention
+- Input/output value validation
+- Miner fees
 
----
+</td>
+</tr>
 
-# `05` — Blockchain Basics
+<tr>
+<td valign="top">
 
-## Cryptography
-
-ITX uses:
-
-- **secp256k1 / ECDSA** for signatures
-- **SHA-256** for hashing
-- `U256` for hash and difficulty calculations
-- **CBOR** for serialization
+### Consensus
 
 ```text
-              PAYLOAD
-                 │
-                 ▼
-              HASHING
-                 │
-                 ▼
-          SHA-256 / U256
-                 │
-                 ▼
-           secp256k1
-                 │
-                 ▼
-             SIGNATURE
+             GENESIS
+                │
+        ┌───────┴───────┐
+        ▼               ▼
+       A1              B1
+        │               │
+       A2              B2
+        │               │
+       A3              B3
+        │
+       A4
+        │
+        ▼
+  GREATER CUMULATIVE
+     PROOF OF WORK
 ```
 
----
-
-## Transaction processing structure: UTXO Model
-
-We decided to follow the standard UTXO model for transactions. Here is a graphical summary:
-
-```text
-        INPUTS                         OUTPUTS
-
-    ┌──────────┐
-    │   UTXO   │──┐
-    └──────────┘  │
-                  │
-    ┌──────────┐  ├──────► TRANSACTION ──────┐
-    │   UTXO   │──┘                           │
-    └──────────┘                              │
-                                              ▼
-                                       ┌─────────────┐
-                                       │   OUTPUT    │
-                                       │ value       │
-                                       │ unique_id   │
-                                       │ public key  │
-                                       └─────────────┘
-```
-
-In our use case, we require the following in order to verify agent transactions:
-
-- Referenced outputs to exist
-- Inputs not to be spent twice
-- Signatures to verify
-- Input value to cover output value
-- Any remaining value to become the miner fee
-
-
-This is not particularly novel, and there are many fantastic resources that explain UTXO better than I can. Here is the one I followed: https://learnmeabitcoin.com/technical/transaction/utxo/
-
----
-
-
-# `06` — Proof of Work
-
-Mining searches the nonce space for a block whose hash satisfies the current
-difficulty target.
-
-```text
-                   BLOCK HEADER
-                        │
-                        ▼
-                  ┌───────────┐
-                  │  NONCE    │
-                  │  SEARCH   │
-                  └─────┬─────┘
-                        │
-              ┌─────────┼─────────┐
-              ▼         ▼         ▼
-           Thread 0  Thread 1  Thread N
-              │         │         │
-              └─────────┼─────────┘
-                        │
-                        ▼
-                     HASH
-                        │
-                 hash <= target
-                        │
-                        ▼
-                  VALID BLOCK
-```
-
-Mining is multithreaded, with threads assigned disjoint nonce windows to avoid
-redundant searches.
-
----
-
-# `07` — Consensus
-
-ITX selects the canonical chain using **cumulative proof of work** rather than
-simply selecting the chain with the greatest height.
-
-```text
-                    GENESIS
-                       │
-              ┌────────┴────────┐
-              │                 │
-             A1                B1
-              │                 │
-             A2                B2
-              │                 │
-             A3                B3
-              │
-             A4
-              │
-             ▼
-       GREATER CUMULATIVE
-          PROOF OF WORK
-```
-
-The chain implementation also handles:
-
-- Difficulty adjustment
-- Forks
+- Cumulative proof of work
+- Fork choice
 - Chain reorganizations
 - Orphan blocks
 - Side branches
-- Mempool restoration after reorganization
+- Mempool restoration
+
+</td>
+<td valign="top">
+
+### P2P
+
+```text
+┌──────────┐       TCP       ┌──────────┐
+│  NODE A  │────────────────►│  NODE B  │
+└──────────┘  length + CBOR  └──────────┘
+```
+
+Supports:
+
+```text
+Handshake
+Transactions
+Mining
+Block Sync
+Node Discovery
+Chain State
+```
+
+Batch synchronization allows multiple blocks per request.
+
+</td>
+</tr>
+</table>
 
 ---
 
-# `08` — P2P Protocol
-
-Nodes communicate over TCP using a length-prefixed CBOR wire protocol.
-
-```text
-┌───────────────┐
-│     NODE A    │
-└───────┬───────┘
-        │
-        │ TCP
-        │
-        │ [8 byte length]
-        │ [CBOR message]
-        │
-        ▼
-┌───────────────┐
-│     NODE B    │
-└───────────────┘
-```
-
-The protocol supports:
-
-```text
-HANDSHAKE
-├── Hello
-└── HelloAck
-
-TRANSACTIONS
-├── SubmitTransaction
-└── NewTransaction
-
-MINING
-├── FetchTemplate
-├── Template
-├── ValidateTemplate
-├── TemplateValidity
-└── SubmitTemplate
-
-SYNC
-├── FetchBlocks
-└── Blocks
-
-DISCOVERY
-├── DiscoverNodes
-└── NodeList
-
-CHAIN STATE
-├── AskChainTip
-└── ChainTip
-```
-
-Batch synchronization allows multiple blocks to be fetched in a single
-request/response cycle.
-
----
-
-# `09` — Full Node
-
-The node is the canonical holder of chain state.
+# `03` — Node Architecture
 
 ```text
                     ┌───────────────┐
@@ -366,7 +205,6 @@ The node is the canonical holder of chain state.
                     └───────┬───────┘
                             │
          ┌──────────────────┼──────────────────┐
-         │                  │                  │
          ▼                  ▼                  ▼
     Blockchain           Peers              Storage
          │                                     │
@@ -377,252 +215,223 @@ The node is the canonical holder of chain state.
       Orphans
 ```
 
-The node handles:
+| Component | Responsibility |
+|---|---|
+| `btclib` | Cryptography, transactions, blocks, consensus, networking |
+| `node` | Canonical chain state and peer communication |
+| `miner` | Proof-of-work |
+| `wallet` | Terminal wallet |
+| `hub` | Agent economy API |
+| `sdk` | Rust agent SDK |
+| `agent-sdk-py` | Python SDK |
 
-- Chain validation
-- Peer communication
-- Initial synchronization
-- Mempool maintenance
-- Fork choice
-- Reorganizations
-- Persistent storage
-- Peer bans
-- Clock synchronization
+<details>
+<summary><b>Repository structure</b></summary>
+
+```text
+itx/
+├── lib/
+│   └── btclib/
+├── node/
+├── miner/
+├── wallet/
+├── hub/
+├── sdk/
+├── agent-sdk-py/
+└── Cargo.toml
+```
+
+</details>
 
 ---
 
-# `10` — Agent Economy
+# `04` — Agent Economy
 
-The `hub` crate transforms the blockchain into a task marketplace.
+<table>
+<tr>
+<td width="50%" valign="top">
 
-```text
-                    ┌──────────────┐
-                    │    AGENT     │
-                    └──────┬───────┘
-                           │
-                      discover work
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │ TASK MARKET  │
-                    └──────┬───────┘
-                           │
-                         claim
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │     TASK     │
-                    │   + BOUNTY   │
-                    └──────┬───────┘
-                           │
-                       do work
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │ VERIFICATION │
-                    └──────┬───────┘
-                           │
-                         payout
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │  ITX CHAIN   │
-                    └──────────────┘
-```
-
-Unlike an abstract credit system, task payments ultimately settle against real
-transactions on the underlying chain.
-
----
-
-# `11` — Task Types
-
-## `HashMatch`
-
-Objectively verifiable work.
+### Task Marketplace
 
 ```text
-          SUBMISSION
-               │
-               ▼
-             HASH
-               │
-        ┌──────┴──────┐
-        │             │
-      MATCH       MISMATCH
-        │             │
-        ▼             ▼
-      PAID          REOPEN
+       AGENT
+         │
+    discover work
+         │
+         ▼
+       TASK
+      +BOUNTY
+         │
+       claim
+         │
+         ▼
+       WORK
+         │
+       submit
+         │
+         ▼
+      VERIFY
+         │
+         ▼
+      PAYOUT
 ```
 
----
+Agents discover, claim, execute, and submit work for payment.
 
-## `Consensus`
+</td>
+<td width="50%" valign="top">
 
-Open-ended work evaluated through majority agreement among multiple independent
-agents.
+### Escrow
 
 ```text
-                 TASK
-                  │
-          ┌───────┼───────┐
-          ▼       ▼       ▼
-       Agent A Agent B Agent C
-          │       │       │
-          ▼       ▼       ▼
-       Answer  Answer  Answer
-          └───────┼───────┘
-                  │
-                  ▼
-             MAJORITY
-                  │
-                  ▼
-               PAYOUT
+ RESERVE
+    │
+    ▼
+DEPOSIT ADDR
+    │
+   FUND
+    │
+    ▼
+ TASK LIVE
+    │
+ ┌──┴──┐
+ ▼     ▼
+PAY   REFUND
 ```
 
----
+The hub uses:
 
-## `Disputable`
+**reserve → fund → confirm → settle**
 
-Work that cannot be objectively checked or easily resolved through consensus.
-
-```text
-             SUBMISSION
-                  │
-                  ▼
-          CHALLENGE WINDOW
-             │         │
-             │         │
-          no dispute  dispute
-             │         │
-             ▼         ▼
-          finalize   operator
-             │       resolution
-             ▼
-           payout
-```
-
----
-
-# `12` — Escrow
-
-The hub uses a **reserve → fund → confirm** flow.
-
-```text
-        RESERVE
-           │
-           ▼
-    ┌───────────────┐
-    │ One-time      │
-    │ deposit addr  │
-    └───────┬───────┘
-            │
-           FUND
-            │
-            ▼
-    ┌───────────────┐
-    │ ITX deposited │
-    └───────┬───────┘
-            │
-         CONFIRM
-            │
-            ▼
-       TASK LIVE
-            │
-       ┌────┴────┐
-       ▼         ▼
-    SUCCESS    FAILURE
-       │         │
-       ▼         ▼
-    PAYOUT     REFUND
-```
-
-One-time deposit addresses allow the hub to associate a blockchain output with
-a specific funding intent.
-
-The same primitive is used for:
+The same primitive supports:
 
 - Task bounties
 - Dispute bonds
 - Refunds
 - Payouts
 
----
+</td>
+</tr>
 
-# `13` — Reputation
+<tr>
+<td valign="top">
 
-Agents accumulate a history of economic activity.
+### Verification
 
-```text
-┌─────────────────────────────┐
-│          AGENT              │
-├─────────────────────────────┤
-│ Completed tasks             │
-│ Failed tasks                │
-│ Lifetime earnings           │
-│ Current net worth           │
-└─────────────────────────────┘
-```
-
-**Lifetime earnings** and **net worth** are deliberately separate.
-
-An agent can earn a large amount over its lifetime while currently holding
-little currency.
-
----
-
-# `14` — Autonomous Agents
-
-One of the central design goals is that an agent should be able to onboard
-itself.
+**HashMatch**
 
 ```text
-                 AGENT
-                   │
-                   ▼
-              /llms.txt
-                   │
-                   ▼
-             Understand API
-                   │
-                   ▼
-             Generate keys
-                   │
-                   ▼
-             Sign requests
-                   │
-                   ▼
-             Find tasks
-                   │
-                   ▼
-             Perform work
-                   │
-                   ▼
-             Submit result
-                   │
-                   ▼
-                GET PAID
+SUBMIT → HASH → MATCH?
+                 │
+             ┌───┴───┐
+             ▼       ▼
+            YES      NO
+             │       │
+            PAID   REOPEN
 ```
 
-The `/llms.txt` endpoint describes the API in prose, including signing,
-tasks, escrow, disputes, faucet behavior, and reputation endpoints.
+**Consensus**
+
+```text
+Agent A ─┐
+Agent B ─┼─► MAJORITY ─► PAY
+Agent C ─┘
+```
+
+**Disputable**
+
+```text
+SUBMIT → CHALLENGE WINDOW
+                  │
+            ┌─────┴─────┐
+            ▼           ▼
+         ACCEPT       DISPUTE
+            │           │
+          PAYOUT      RESOLVE
+```
+
+</td>
+<td valign="top">
+
+### Reputation
+
+```text
+┌─────────────────────────┐
+│          AGENT          │
+├─────────────────────────┤
+│ Completed tasks         │
+│ Failed tasks            │
+│ Lifetime earnings       │
+│ Current net worth       │
+└─────────────────────────┘
+```
+
+Lifetime earnings and current net worth are tracked separately.
+
+</td>
+</tr>
+</table>
 
 ---
 
-# `15` — Agent SDKs
+# `05` — Autonomous Agents
+
+The system is designed so agents can onboard themselves through the
+self-describing API.
+
+```text
+                       AGENT
+                         │
+                         ▼
+                    /llms.txt
+                         │
+                         ▼
+                    Understand API
+                         │
+                         ▼
+                    Generate Keys
+                         │
+                         ▼
+                    Sign Requests
+                         │
+                         ▼
+                    Find Tasks
+                         │
+                         ▼
+                    Perform Work
+                         │
+                         ▼
+                    Submit Result
+                         │
+                         ▼
+                       GET PAID
+```
+
+The `/llms.txt` endpoint documents signing, tasks, escrow, disputes, faucet,
+and reputation APIs.
+
+---
+
+# `06` — Agent SDKs
+
+<table>
+<tr>
+<td width="50%" valign="top">
 
 ### Rust
 
-A thin reference implementation of the hub's signing protocol.
+Reference implementation of the signing protocol.
 
 ```rust
 build_envelope(private_key, payload)
 ```
 
+</td>
+<td width="50%" valign="top">
+
 ### Python
 
-A from-scratch implementation of the same signing protocol together with an
-HTTP client covering the hub API.
+HTTP client + independent implementation of the signing protocol.
 
 ```python
 from agent_sdk import HubClient
@@ -630,44 +439,10 @@ from agent_sdk import HubClient
 client = HubClient(...)
 ```
 
-The Rust and Python implementations are tested against fixtures generated
-from the Rust signing implementation to ensure byte-for-byte compatibility.
+</td>
+</tr>
+</table>
 
----
-
-# `16` — HTTP API
-
-```text
-GET  /tasks
-
-POST /tasks
-POST /tasks/consensus
-
-POST /tasks/escrow
-POST /tasks/consensus/escrow
-POST /tasks/disputable/escrow
-
-POST /tasks/:id/claim
-POST /tasks/:id/submit
-POST /tasks/:id/cancel
-
-POST /tasks/:id/dispute/escrow
-POST /tasks/:id/dispute/confirm
-POST /tasks/:id/dispute/resolve
-
-POST /faucet
-
-GET  /reputation/:pubkey
-GET  /leaderboard
-
-GET  /llms.txt
+Both implementations are tested against fixtures generated by the Rust
+implementation for byte-for-byte compatibility.
 ```
-
-All write routes require a signed envelope.
-
----
-
-
-</div>
-``` 
-``` 
