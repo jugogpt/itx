@@ -72,6 +72,17 @@ const DEFAULT_TRADES_PAGE_SIZE: usize = 50;
 /// Upper bound on `GET /exchange/trades`'s `limit`, mirroring
 /// `MAX_TASKS_PAGE_SIZE`.
 const MAX_TRADES_PAGE_SIZE: usize = 200;
+/// Upper bound on any free-text field a caller supplies directly (a
+/// task's `description`, a submitted `output`, a dispute `reason`).
+/// These are otherwise-unbounded `String`s inside a request body already
+/// capped by axum's default 2MB-per-request limit, but that limit alone
+/// isn't enough here: a task's description/reason is persisted in the
+/// store indefinitely (no TTL the way a claim or escrow reservation
+/// has), so without a per-field cap one request could still write an
+/// unreasonably large blob that sticks around forever and gets echoed
+/// back on every future `GET /tasks`. Generous enough for real prose or
+/// a real submitted answer, not a meaningful constraint on legitimate use.
+const MAX_TEXT_FIELD_LENGTH: usize = 20_000;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -594,6 +605,13 @@ pub struct TradeDto {
     pub price: u64,
     pub quantity: u64,
     pub executed_at: DateTime<Utc>,
+    /// Which side placed the order that caused this match -- needed to
+    /// know what `taker_fee` is denominated in (see `Trade`'s own doc
+    /// comment): compute if `buy`, the base currency if `sell`.
+    pub taker_side: Side,
+    /// Already deducted from what the taker received; the maker side of
+    /// every trade is always paid in full.
+    pub taker_fee: u64,
 }
 
 impl From<&Trade> for TradeDto {
@@ -607,6 +625,8 @@ impl From<&Trade> for TradeDto {
             price: t.price,
             quantity: t.quantity,
             executed_at: t.executed_at,
+            taker_side: t.taker_side,
+            taker_fee: t.taker_fee,
         }
     }
 }
@@ -665,6 +685,7 @@ pub async fn create_task(
 ) -> Result<Json<TaskDto>, ApiError> {
     let pubkey = envelope.verify()?;
     require_operator(&pubkey, &state)?;
+    validate_text_field(&envelope.payload.description, "description")?;
     let expected_output_hash = parse_hex_hash(&envelope.payload.expected_output_hash)?;
     let bounty = envelope.payload.bounty;
     let capabilities = validate_capabilities(&envelope.payload.capabilities)?;
@@ -691,6 +712,7 @@ pub async fn create_consensus_task(
 ) -> Result<Json<TaskDto>, ApiError> {
     let pubkey = envelope.verify()?;
     require_operator(&pubkey, &state)?;
+    validate_text_field(&envelope.payload.description, "description")?;
     if envelope.payload.num_assignees < 2 {
         return Err(ApiError::BadRequest(
             "a consensus task needs at least 2 assignees for majority agreement to mean anything".into(),
@@ -742,6 +764,7 @@ pub async fn create_task_escrow(
     Json(envelope): Json<SignedEnvelope<EscrowTaskPayload>>,
 ) -> Result<Json<EscrowReservationDto>, ApiError> {
     let pubkey = envelope.verify()?;
+    validate_text_field(&envelope.payload.description, "description")?;
     let expected_output_hash = parse_hex_hash(&envelope.payload.expected_output_hash)?;
     let bounty = envelope.payload.bounty;
     let required_amount = bounty + HUB_TRANSACTION_FEE;
@@ -771,6 +794,7 @@ pub async fn create_consensus_task_escrow(
     Json(envelope): Json<SignedEnvelope<EscrowConsensusTaskPayload>>,
 ) -> Result<Json<EscrowReservationDto>, ApiError> {
     let pubkey = envelope.verify()?;
+    validate_text_field(&envelope.payload.description, "description")?;
     if envelope.payload.num_assignees < 2 {
         return Err(ApiError::BadRequest(
             "a consensus task needs at least 2 assignees for majority agreement to mean anything".into(),
@@ -816,6 +840,7 @@ pub async fn create_disputable_task_escrow(
     Json(envelope): Json<SignedEnvelope<EscrowDisputableTaskPayload>>,
 ) -> Result<Json<EscrowReservationDto>, ApiError> {
     let pubkey = envelope.verify()?;
+    validate_text_field(&envelope.payload.description, "description")?;
     validate_positive_minutes(envelope.payload.dispute_window_minutes, "dispute_window_minutes")?;
     let bounty = envelope.payload.bounty;
     let required_amount = bounty + HUB_TRANSACTION_FEE;
@@ -907,6 +932,7 @@ pub async fn create_dispute_escrow(
         ));
     }
     let pubkey = envelope.verify()?;
+    validate_text_field(&envelope.payload.reason, "reason")?;
 
     let bounty = {
         let board = state.board.read().await;
@@ -1101,6 +1127,7 @@ pub async fn submit_task(
         ));
     }
     let pubkey = envelope.verify()?;
+    validate_text_field(&envelope.payload.output, "output")?;
 
     enum Dispatch {
         HashMatch,
@@ -1840,7 +1867,39 @@ pub async fn place_order(
         Utc::now(),
     )?;
     persist_order_and_related(&state, &order, &trades).await;
+    credit_taker_fees_to_operator(&state, &trades).await;
     Ok(Json(OrderDto::from(&order)))
+}
+
+/// Routes every trade's taker fee (see `TaskBoard::place_order`'s own
+/// doc comment, and `board::TAKER_FEE_BPS`) to the operator's own
+/// exchange account -- the hub's fee sink, the same role it already
+/// plays for the faucet and every operator-funded task. `TaskBoard`
+/// itself has no notion of "the operator", so this is deliberately a
+/// handler-level concern, not folded into `place_order`. A no-op call
+/// (nothing to credit) is harmless and cheap, so callers don't need to
+/// check `trades.is_empty()` themselves first.
+async fn credit_taker_fees_to_operator(state: &AppState, trades: &[Trade]) {
+    let (compute_fees, base_fees) = trades.iter().fold((0u64, 0u64), |(compute, base), t| match t.taker_side {
+        Side::Buy => (compute + t.taker_fee, base),
+        Side::Sell => (compute, base + t.taker_fee),
+    });
+    if compute_fees == 0 && base_fees == 0 {
+        return;
+    }
+    {
+        let mut board = state.board.write().await;
+        if compute_fees > 0 {
+            board.credit_compute(&state.operator_public_key, compute_fees);
+        }
+        if base_fees > 0 {
+            board.credit_base(&state.operator_public_key, base_fees);
+        }
+    }
+    let operator_account = state.board.read().await.exchange_account(&state.operator_public_key);
+    if let Err(e) = state.store.save_exchange_account(&state.operator_public_key, &operator_account) {
+        println!("failed to persist operator fee revenue: {e}");
+    }
 }
 
 /// Cancels an open (or partially filled) order, releasing whatever
@@ -2189,6 +2248,9 @@ already have on deposit with the hub is a reserve-then-confirm flow:
 to filter by them. You cannot claim or join a task you posted yourself,
 escrow-funded or not.
 
+`description`, a submitted `output`, and a dispute `reason` are each
+capped at {max_text_field_length} characters.
+
 The hub operator can also post `hash_match`/`consensus` tasks directly
 (POST /tasks / POST /tasks/consensus, no escrow step, funded from the
 operator's own balance) -- that's the only difference for the operator
@@ -2199,6 +2261,55 @@ Only the operator can cancel a task (POST /tasks/<id>/cancel, payload
 {{"task_id": "<id>"}}) -- even one you posted and funded yourself.
 Cancelling refunds any remaining escrow to whoever posted it and has no
 reputation impact on anyone.
+
+## Trading on the exchange
+
+Separate from your on-chain wallet balance, you can hold a ledger
+balance with the hub itself and trade it against a second, purely
+internal asset called compute. Compute has no on-chain existence at
+all -- it only lives in this ledger, and the only way to acquire it is
+by completing a task tagged `"compute"` (see "Posting work"), which
+mints you an amount equal to whatever that task paid out, on top of the
+ordinary bounty. There is one trading pair: the base currency against
+compute, priced in base units per one compute unit.
+
+1. POST /exchange/deposit (signed, empty payload) reserves a deposit
+   address, same shape as a task escrow reservation
+   ({{"escrow_id", "deposit_address", "required_amount", "expires_at"}}),
+   except `required_amount` here is just a floor -- send at least
+   {min_exchange_deposit} units, any amount at or above it is credited
+   in full, net of the network fee.
+2. Send funds on-chain to `deposit_address`.
+3. POST /exchange/deposit/<escrow_id>/confirm (signed, payload
+   {{"escrow_id": "<id>"}}) credits your exchange ledger balance once the
+   deposit confirms.
+
+GET /exchange/orders returns the current order book, `{{"bids": [...],
+"asks": [...]}}`, each ordered best-first. POST /exchange/orders (signed,
+payload {{"side": "buy"}} or `"sell"`, `"price"`, `"quantity"`) places a
+limit order, matching immediately in price-time priority against any
+crossing resting orders at the resting order's own price, and resting
+for whatever's left unfilled. Placing a buy locks `price * quantity` of
+your base balance; a sell locks `quantity` of your compute balance.
+POST /exchange/orders/<id>/cancel (signed, payload {{"order_id": "<id>"}})
+cancels an order you own and releases whatever's still locked.
+
+Whichever order crosses the book (the "taker") pays a
+{taker_fee_bps}-basis-point fee, deducted from what they receive, never
+charged as an extra amount beyond what was already locked. Whichever
+order was already resting (the "maker") is paid in full, no fee. GET
+/exchange/trades lists executed trades newest-first, paginated
+(`?limit=`, default {default_trades_page_size}, capped at
+{max_trades_page_size}; `?offset=`), each one naming which side was the
+taker and how much fee they paid.
+
+GET /exchange/account/<pubkey> shows a ledger balance:
+{{"base_balance", "locked_base", "compute_balance", "locked_compute"}} --
+the spendable amount for a new order or a withdrawal is always the
+balance minus its locked counterpart. POST /exchange/withdraw (signed,
+payload {{"amount"}}) pays that much of your base balance back to your
+own on-chain wallet; compute is never withdrawable, it only exists to be
+traded here.
 
 ## Reputation
 
@@ -2220,6 +2331,11 @@ before POST .../claim will accept you; below the bar gets you a 403.
         escrow_ttl = ESCROW_RESERVATION_TTL_MINUTES,
         max_capability_tags = MAX_CAPABILITY_TAGS,
         max_capability_tag_length = MAX_CAPABILITY_TAG_LENGTH,
+        max_text_field_length = MAX_TEXT_FIELD_LENGTH,
+        min_exchange_deposit = MIN_EXCHANGE_DEPOSIT,
+        taker_fee_bps = crate::board::TAKER_FEE_BPS,
+        default_trades_page_size = DEFAULT_TRADES_PAGE_SIZE,
+        max_trades_page_size = MAX_TRADES_PAGE_SIZE,
     )
 }
 
@@ -2319,6 +2435,21 @@ fn apply_capabilities(board: &mut TaskBoard, task: &mut Task, capabilities: BTre
             .expect("task was just created under the same lock, it must still exist");
         task.capabilities = capabilities;
     }
+}
+
+/// Enforces `MAX_TEXT_FIELD_LENGTH` on a caller-supplied free-text field
+/// (description, submitted output, dispute reason) -- see that constant's
+/// doc comment for why this exists alongside the request's overall body
+/// size limit rather than relying on it alone. Counts characters, not
+/// bytes, so the limit means the same thing regardless of how many bytes
+/// a particular character takes to encode.
+fn validate_text_field(value: &str, field: &str) -> Result<(), ApiError> {
+    if value.chars().count() > MAX_TEXT_FIELD_LENGTH {
+        return Err(ApiError::BadRequest(format!(
+            "{field} exceeds the {MAX_TEXT_FIELD_LENGTH}-character limit"
+        )));
+    }
+    Ok(())
 }
 
 /// Validates a minutes-denominated window field is both positive and

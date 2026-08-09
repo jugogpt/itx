@@ -4,6 +4,7 @@ mod auth;
 mod board;
 mod handlers;
 mod node_client;
+mod rate_limit;
 mod store;
 
 use anyhow::Result;
@@ -15,6 +16,7 @@ use board::{PendingDeposit, Reputation, Task, TaskBoard, TaskStatus};
 use btclib::crypto::{PrivateKey, PublicKey};
 use btclib::util::Saveable;
 use node_client::NodeClient;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use store::HubStore;
 use tokio::sync::{Mutex, RwLock};
@@ -68,6 +70,11 @@ pub struct AppState {
     /// different UTXO set, no reason to serialize exchange withdrawals
     /// against unrelated operator payouts (or vice versa).
     pub exchange_custody_payout_lock: Mutex<()>,
+    /// Per-client-IP request counters for `rate_limit::middleware`. Same
+    /// instance-scoping reasoning as `payout_lock` -- see
+    /// `rate_limit::RateLimitTable`'s own doc comment for why this can't
+    /// be a global static.
+    pub rate_limits: rate_limit::RateLimitTable,
 }
 
 #[derive(FromArgs)]
@@ -234,6 +241,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
     }
 
     auth::cleanup_replay_guard();
+    rate_limit::cleanup(&state.rate_limits);
 }
 
 /// Fetches `task_id` and persists it, logging (rather than failing) on
@@ -312,6 +320,7 @@ async fn main() -> Result<()> {
         exchange_custody_private_key,
         exchange_custody_public_key,
         exchange_custody_payout_lock: Mutex::new(()),
+        rate_limits: rate_limit::new_table(),
     });
 
     tokio::spawn(sweep_loop(state.clone()));
@@ -321,7 +330,7 @@ async fn main() -> Result<()> {
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("hub listening on {addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -369,6 +378,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/exchange/withdraw", post(handlers::withdraw))
         .route("/exchange/trades", get(handlers::list_trades))
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), rate_limit::middleware))
         .with_state(state)
 }
 
@@ -547,13 +557,14 @@ mod tests {
             exchange_custody_private_key,
             exchange_custody_public_key,
             exchange_custody_payout_lock: Mutex::new(()),
+            rate_limits: rate_limit::new_table(),
         });
 
         let app = build_router(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await;
         });
 
         TestHub {
@@ -863,6 +874,59 @@ mod tests {
         ] {
             assert!(llms.contains(expected), "llms.txt no longer mentions {expected:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn llms_txt_mentions_the_exchange() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let llms = hub
+            .client
+            .get(format!("{}/llms.txt", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        for expected in [
+            "/exchange/deposit",
+            "/exchange/deposit/<escrow_id>/confirm",
+            "/exchange/orders",
+            "/exchange/orders/<id>/cancel",
+            "/exchange/account/<pubkey>",
+            "/exchange/withdraw",
+            "/exchange/trades",
+            "compute",
+            "taker",
+            "maker",
+            "basis-point",
+        ] {
+            assert!(llms.contains(expected), "llms.txt no longer mentions {expected:?}");
+        }
+    }
+
+    /// Exercises `rate_limit::middleware` through the real router (not just
+    /// `check_and_record` in isolation) -- confirms the layer is actually
+    /// wired up, `ConnectInfo` extraction works end to end, and a client
+    /// that stays under the limit is never bothered while one that exceeds
+    /// it gets a 429, both against a genuine HTTP server on a real socket.
+    #[tokio::test]
+    async fn exceeding_the_per_ip_request_limit_gets_a_429() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        for _ in 0..rate_limit::MAX_REQUESTS_PER_WINDOW {
+            let status = hub.client.get(format!("{}/llms.txt", hub.base_url)).send().await.unwrap().status();
+            assert_eq!(status, reqwest::StatusCode::OK, "request within the limit must succeed");
+        }
+
+        let status = hub.client.get(format!("{}/llms.txt", hub.base_url)).send().await.unwrap().status();
+        assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS, "one past the limit must be rejected");
     }
 
     /// `net_worth` (current on-chain balance) and `total_earned`
@@ -1772,6 +1836,70 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn create_task_rejects_an_oversized_description() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let payload = handlers::CreateTaskPayload {
+            description: "x".repeat(20_001),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"a").as_bytes()),
+            min_reputation: 0,
+            capabilities: BTreeSet::new(),
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn submit_task_rejects_an_oversized_output() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let assignee_key = PrivateKey::new_key();
+
+        let payload = handlers::CreateTaskPayload {
+            description: "t".to_string(),
+            bounty: 10,
+            expected_output_hash: hex::encode(Hash::hash_bytes(b"a").as_bytes()),
+            min_reputation: 0,
+            capabilities: BTreeSet::new(),
+        };
+        let resp = hub
+            .client
+            .post(format!("{}/tasks", hub.base_url))
+            .json(&envelope(&hub.operator_key, payload))
+            .send()
+            .await
+            .unwrap();
+        let created: Value = resp.json().await.unwrap();
+        let task_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+        hub.client
+            .post(format!("{}/tasks/{task_id}/claim", hub.base_url))
+            .json(&envelope(&assignee_key, handlers::ClaimPayload { task_id }))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = hub
+            .client
+            .post(format!("{}/tasks/{task_id}/submit", hub.base_url))
+            .json(&envelope(&assignee_key, handlers::SubmitPayload { task_id, output: "x".repeat(20_001) }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
     fn parse_pubkey(hex_str: &str) -> PublicKey {
         PublicKey::from_sec1_bytes(&hex::decode(hex_str).unwrap()).unwrap()
     }
@@ -2653,6 +2781,80 @@ mod tests {
             hub.client.get(format!("{}/exchange/orders", hub.base_url)).send().await.unwrap().json().await.unwrap();
         assert!(order_book["bids"].as_array().unwrap().is_empty());
         assert!(order_book["asks"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn place_order_via_http_credits_the_taker_fee_to_the_operator() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key.clone(), fake_node.addr.clone()).await;
+        let seller_key = PrivateKey::new_key();
+        let buyer_key = PrivateKey::new_key();
+        seed_exchange_account(&hub.state, &seller_key.public_key(), 0, 5_000).await;
+        seed_exchange_account(&hub.state, &buyer_key.public_key(), 100_000, 0).await;
+
+        hub.client
+            .post(format!("{}/exchange/orders", hub.base_url))
+            .json(&envelope(
+                &seller_key,
+                handlers::PlaceOrderPayload { side: board::Side::Sell, price: 10, quantity: 5_000 },
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        // The buyer is the taker here (crossing a resting ask), so the
+        // fee comes out of the compute they receive.
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/orders", hub.base_url))
+            .json(&envelope(
+                &buyer_key,
+                handlers::PlaceOrderPayload { side: board::Side::Buy, price: 10, quantity: 5_000 },
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let buyer_account: Value = hub
+            .client
+            .get(format!("{}/exchange/account/{}", hub.base_url, buyer_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(buyer_account["compute_balance"], 4_995, "5_000 fill minus 5 (10 bps) fee");
+
+        let seller_account: Value = hub
+            .client
+            .get(format!("{}/exchange/account/{}", hub.base_url, seller_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(seller_account["base_balance"], 50_000, "the maker side pays no fee");
+
+        let operator_account: Value = hub
+            .client
+            .get(format!("{}/exchange/account/{}", hub.base_url, operator_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(operator_account["compute_balance"], 5, "the fee lands in the operator's own exchange account");
+
+        let trades: Value =
+            hub.client.get(format!("{}/exchange/trades", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        let trade = &trades.as_array().unwrap()[0];
+        assert_eq!(trade["taker_side"], "buy");
+        assert_eq!(trade["taker_fee"], 5);
     }
 
     #[tokio::test]
