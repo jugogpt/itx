@@ -1,0 +1,390 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{underscore}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black,
+  pdftitle={itx: Technical Overview and Project Goals},
+  pdfauthor={Hugo Sanchez}
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{gray!50},
+  backgroundcolor=\color{gray!5},
+  xleftmargin=2pt,
+  xrightmargin=2pt,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{itx: Technical Overview and Project Goals}
+\author{Hugo Sanchez}
+\date{\today}
+
+\begin{document}
+\sloppy
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Introduction and Goals}
+
+\texttt{itx} is a from scratch, Bitcoin like cryptocurrency implemented in Rust. It began as an implementation exercise following a Rust cryptocurrency course: a proof of work chain, a full node, a miner, and a terminal wallet, built up primitive by primitive rather than assembled from an existing chain framework. The coding conventions throughout (global \code{\#[dynamic]} statics for shared state, a length prefixed CBOR over TCP wire protocol, a \code{thiserror}/\code{anyhow} split between library and application error handling) trace back to that course rather than to ad hoc choices, and are preserved deliberately rather than replaced with heavier machinery such as gRPC or a database server.
+
+The project later grew a second, independent direction on top of the same chain: the \code{hub} crate, an HTTP API implementing an \emph{agent economy}. The hub is a task marketplace, bounties, escrow, reputation, and dispute resolution, all settled with real transactions on the underlying chain, explicitly designed so that autonomous LLM agents, not only humans, can earn and spend the currency by performing verifiable work. A dedicated endpoint, \code{/llms.txt}, documents the entire API in prose specifically so that an agent can read it and act on it without a human intermediary.
+
+The current, largest goal is a further reconciliation of this into a broader vision: a small internal exchange where agents trade more than one asset class against a currency with genuinely scarce, capped supply, with net worth (not just task earnings) as the leaderboard's real measure of standing. Two small pieces of that vision are already implemented; the exchange itself is fully designed but not yet built. Section~\ref{sec:exchange} covers this in detail, and Section~\ref{sec:state} gives the current, precise state of what is committed versus what is only sitting in the working tree.
+
+At a high level, the goals driving the project are:
+\begin{itemize}[leftmargin=1.5em]
+  \item Implement the core primitives of a proof of work cryptocurrency correctly from first principles: signatures, hashing, block validation, difficulty adjustment, fork choice, mempool management, and a real wire protocol, rather than relying on an existing chain library.
+  \item Build infrastructure so that autonomous agents can participate in a genuine economy: post work, claim it, get paid, build reputation, and dispute bad outcomes, with money that actually moves on chain rather than an abstracted credit system.
+  \item Make that infrastructure self describing, so an agent can onboard itself by reading \code{/llms.txt} rather than requiring a human to read documentation and configure the agent by hand.
+  \item Extend the single currency, single purpose design into a small exchange: more than one tradable asset, continuous pricing via order matching, and a currency supply that behaves like a genuinely scarce asset rather than one that fully mints out in under a day.
+\end{itemize}
+
+\section{Repository and Workspace Layout}
+
+The Cargo workspace root is \code{itx/Cargo.toml}. Table~\ref{tab:layout} lists every member and its role; \code{agent-sdk-py} and \code{dashboard} sit outside the Cargo workspace, being Python and TypeScript projects respectively.
+
+\begin{longtable}{@{}p{2.6cm}p{2.6cm}p{9cm}@{}}
+\toprule
+\textbf{Path} & \textbf{Kind} & \textbf{Role} \\
+\midrule
+\endhead
+\code{lib} & Rust library (\code{btclib}) & Core chain: cryptography, transactions, blocks, consensus, wire protocol, persistence. Shared by every other crate. \\
+\code{node} & Rust binary & Full node: holds canonical chain state, serves peers, miners, and wallets over TCP. \\
+\code{miner} & Rust binary & Proof of work miner: multithreaded nonce search, multi node block submission. \\
+\code{wallet} & Rust binary & Terminal UI wallet (\code{cursive}/\code{crossterm}) for balances and sending funds. \\
+\code{hub} & Rust binary (axum) & Agent economy HTTP API: task marketplace, escrow, disputes, reputation. \\
+\code{sdk} & Rust library & Reference implementation of the hub's request signing protocol. \\
+\code{agent-sdk-py} & Python package & Python port of the same signing protocol plus a hub HTTP client. \\
+\code{dashboard} & TypeScript/React app & Read only web UI over the hub's public endpoints. \\
+\bottomrule
+\caption{Workspace layout.}
+\label{tab:layout}
+\end{longtable}
+
+\section{Core Chain Library (\code{lib}, crate \code{btclib})}
+
+\subsection{Cryptographic primitives}
+
+Signing uses the secp256k1 curve via the \code{k256}/\code{ecdsa} crates (\code{lib/src/crypto.rs}). \code{PrivateKey} wraps \code{ecdsa::SigningKey<Secp256k1>}, \code{PublicKey} wraps \code{ecdsa::VerifyingKey<Secp256k1>}, and \code{Signature} wraps \code{ecdsa::Signature<Secp256k1>}.
+
+Hashing uses a dedicated \code{Hash(U256)} type (\code{lib/src/sha256.rs}). \code{Hash::hash<T>} CBOR serializes a value via \code{ciborium}, hashes the bytes with a single round of SHA-256, and stores the digest little endian inside the \code{U256}. \code{Hash::hash_bytes} does the same without the CBOR step, for hashing raw external bytes directly.
+
+Signing (\code{Signature::sign_output}/\code{sign_hash}) calls \code{SigningKey::sign} on the hash's raw bytes, and verification mirrors this on \code{VerifyingKey}. This has a subtle, non deliberate consequence worth documenting precisely: the \code{ecdsa} crate's blanket \code{Signer} implementation for \code{SigningKey<C>} hashes its input again internally before the RFC6979 signing step, and secp256k1's associated digest type is SHA-256. So every signed value is effectively \code{SHA256(SHA256(payload))}: one explicit round performed by \code{Hash::hash_bytes}, and a second, implicit round performed inside the signing library. This is not a deliberate Bitcoin style \code{hash256} primitive; it is an artifact of feeding an already hashed value into a \code{Signer} implementation that hashes its own input, and both the Python SDK and the hub had to replicate it exactly (twice, not once) for cross language signature verification to work at all.
+
+Encodings differ by context. On disk, a \code{PrivateKey} is persisted as CBOR of its raw scalar bytes, and a \code{PublicKey} as PEM/SPKI text. On the wire and in the hub's HTTP API, a \code{PublicKey} is hex encoded compressed SEC1 bytes (33 bytes), and a \code{Signature} is a fixed size, hex encoded concatenation of \code{r} and \code{s} (\code{r} then \code{s}, back to back), not DER.
+
+\subsection{Transactions and the UTXO model}
+
+\begin{lstlisting}
+struct TransactionInput { prev_transaction_output_hash: Hash, signature: Signature }
+struct TransactionOutput { value: u64, unique_id: Uuid, pubkey: PublicKey }
+struct Transaction { inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput> }
+\end{lstlisting}
+
+The \code{unique_id} field on an output exists purely so that two outputs with identical value and recipient still hash differently. The UTXO set is keyed directly by an output's own hash, not by a \code{(txid, vout)} pair.
+
+Validation (\code{Block::verify_transactions}) requires, for every non coinbase transaction: every input's referenced output exists in the UTXO set, no input is spent twice within the same transaction, each input's signature verifies against the referenced output's hash and public key (the signature covers only the spent output, not the spending transaction's own inputs or outputs), and the sum of input values is at least the sum of output values, the surplus being the miner fee.
+
+The coinbase transaction (index 0) must have no inputs, and its total output value must equal the block reward plus the sum of every other transaction's fee in the block, exactly: \code{block\_reward = INITIAL\_REWARD * 10\textsuperscript{8} / 2\textsuperscript{height / HALVING\_INTERVAL}}. The \code{10\textsuperscript{8}} factor means the base currency unit has eight decimal places, the same granularity as a Bitcoin satoshi; a value of \code{50\_000\_000} therefore represents half of one coin.
+
+\subsection{Blocks and chain state}
+
+\begin{lstlisting}
+struct BlockHeader { timestamp: DateTime<Utc>, nonce: u64, prev_block_hash: Hash, merkle_root: MerkleRoot, target: U256 }
+struct Block { header: BlockHeader, transactions: Vec<Transaction> }
+\end{lstlisting}
+
+\code{BlockHeader::mine(steps)} brute forces \code{nonce} upward until the header's hash is at or below \code{target}. The target is stored as a raw 256 bit integer rather than Bitcoin's compact bits encoding, and cumulative chain work is computed as \code{(2\textsuperscript{256} - 1 - target) / (target + 1) + 1} per block, summed along a branch.
+
+The \code{Blockchain} struct holds the UTXO set, the current difficulty target, every known block keyed by hash, the active chain as an ordered list of hashes, a fee sorted mempool with insertion timestamps, a buffer of orphan blocks, a set of prunable side blocks, and a clock offset used to interpret peer supplied timestamps. A candidate block is accepted only if it correctly extends a known parent (or triggers a reorganization, Section~\ref{sec:forkchoice}), its target matches the recomputed expected target, its hash actually satisfies that target, its serialized size is within the byte cap, its timestamp is within the allowed future drift of the node's (offset adjusted) clock and is strictly greater than its parent's, its merkle root matches its transactions, and every transaction in it validates.
+
+\subsection{Consensus parameters}
+
+Table~\ref{tab:constants} lists the economically and protocol relevant constants, all defined in \code{lib/src/lib.rs}, with their values as they currently sit in the working tree. One is flagged because it differs from the last commit; see Section~\ref{sec:state} for why.
+
+\begin{longtable}{@{}p{5.2cm}p{3cm}p{6.5cm}@{}}
+\toprule
+\textbf{Constant} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+\endhead
+\code{INITIAL_REWARD} & 50 coins & Coinbase reward for the first halving window. \\
+\code{HALVING_INTERVAL} & 210 blocks & Blocks per reward window before it halves. \\
+\code{IDEAL_BLOCK_TIME} & 600 s\footnotemark & Target seconds between blocks; feeds difficulty retargeting. \\
+\code{DIFFICULTY_UPDATE_INTERVAL} & 50 blocks & How often the target is recomputed. \\
+\code{MAX_MEMPOOL_TRANSACTION_AGE} & 600 s & Age at which an unconfirmed transaction is dropped. \\
+\code{BLOCK_BYTE_CAP} & 1{,}000{,}000 bytes & Maximum serialized block size. \\
+\code{PROTOCOL_MAGIC} & \code{0x4954_5800} (\code{"ITX\textbackslash 0"}) & Handshake magic number. \\
+\code{PROTOCOL_VERSION} & 3 & Wire protocol version; incompatible across a bump. \\
+\code{MAX_MESSAGE_SIZE} & 10 MiB & Upper bound checked before allocating a decode buffer. \\
+\code{BLOCKS_PER_FETCH_BATCH} & 8 blocks & Cap on blocks returned per batch sync reply. \\
+\code{MAX_FETCH_BATCH_BYTES} & 9 MiB & Byte budget per batch sync reply. \\
+\code{MAX_FUTURE_BLOCK_DRIFT_SECONDS} & 7200 s & How far a block's timestamp may sit ahead of local time. \\
+\code{SIDE_BRANCH_PRUNE_DEPTH} & 100 blocks & Depth behind the tip before a losing branch is pruned. \\
+\bottomrule
+\caption{Consensus and protocol constants (\code{lib/src/lib.rs}).}
+\label{tab:constants}
+\end{longtable}
+\footnotetext{Uncommitted as of this writing: committed \code{HEAD} still has \code{10}. See Section~\ref{sec:state}.}
+
+The supply cap has no dedicated constant; it is an emergent property of a flat reward held for \code{HALVING_INTERVAL} blocks and then halved forever after, which converges to \code{2 * INITIAL_REWARD * HALVING_INTERVAL = 21{,}000} coins, deliberately mirroring Bitcoin's own cap. At the original \code{IDEAL_BLOCK_TIME} of 10 seconds, that entire cap mints out in under 19 hours, leaving no real window for the currency to function as a scarce asset. Raising it to 600 seconds stretches minting to roughly 48 days without touching the cap itself, since the cap depends only on \code{INITIAL_REWARD} and \code{HALVING_INTERVAL}. It was deliberately not pushed slower than that, because several of the hub's own timers (Section~\ref{sec:hub}) are minute scale, and a much slower block time would leave too little confirmation margin inside those windows for a normal deposit and confirm flow to behave predictably.
+
+\subsection{Fork choice, reorganization, and orphans}
+\label{sec:forkchoice}
+
+Chain selection is by cumulative proof of work, not by height. When a new block extends a branch other than the active tip, the chain is reorganized to that branch if and only if its cumulative work exceeds the active chain's; reorganization recomputes the difficulty target and UTXO set for the new tip and re-offers every non coinbase transaction displaced from the old branch back into the mempool. Blocks whose parent is not yet known are buffered as orphans (bounded by \code{MAX_ORPHAN_BLOCKS = 50}) and reattached automatically once their parent arrives. Side branches are pruned from storage once their fork point falls more than \code{SIDE_BRANCH_PRUNE_DEPTH} blocks behind the tip, checked every \code{DIFFICULTY_UPDATE_INTERVAL} blocks.
+
+\subsection{Mempool and fee based replacement}
+
+A transaction is rejected from the mempool if any input is unknown or already claimed there, \emph{unless} it replaces the existing claimant with a strictly higher total fee, an automatic, always on replace by fee rule with no opt in flag required. The mempool is kept sorted by fee, descending, after every insertion, and entries older than \code{MAX_MEMPOOL_TRANSACTION_AGE} are swept out periodically.
+
+\subsection{Wire protocol}
+
+Every peer message is one variant of an 18 case \code{Message} enum (\code{lib/src/network.rs}): handshake (\code{Hello}, \code{HelloAck}), UTXO queries (\code{FetchUTXOs}, \code{UTXOs}), transaction relay (\code{SubmitTransaction}, \code{NewTransaction}), mining (\code{FetchTemplate}, \code{Template}, \code{ValidateTemplate}, \code{TemplateValidity}, \code{SubmitTemplate}), peer discovery (\code{DiscoverNodes}, \code{NodeList}), chain tip comparison (\code{AskChainTip}, \code{ChainTip}), batch sync (\code{FetchBlocks}, \code{Blocks}), and block relay (\code{NewBlock}). Every message is serialized with \code{ciborium} (CBOR) and framed with an 8 byte big endian length prefix ahead of the CBOR body, in both a blocking, synchronous form and an async Tokio form; a declared length above \code{MAX_MESSAGE_SIZE} is rejected before any buffer is allocated for it.
+
+Batch synchronization is a request/response pair, \code{FetchBlocks\{start, count\}} and \code{Blocks(Vec<Block>)}, added specifically to replace an earlier one block per round trip design. A reply is capped at \code{BLOCKS_PER_FETCH_BATCH} blocks and a running \code{MAX_FETCH_BATCH_BYTES} byte budget (coinbase size is not bounded by consensus, so capping by count alone was not safe), and the server always answers, with an empty \code{Blocks} reply if nothing lies past the requested start height, rather than silently dropping the connection on an out of range request as an earlier version did.
+
+A handshake exchanges \code{Hello}/\code{HelloAck} (each carrying the protocol magic, version, and a timestamp) and yields a clock offset sample for the peer, used by node level time synchronization (Section~\ref{sec:node}).
+
+\subsection{Persistence}
+
+Chain state is persisted with \code{redb}, an embedded, transactional key value store, in three tables: a blocks table mapping hash to CBOR encoded block, a meta table holding the active chain (as a concatenation of 32 byte hashes) and a schema version marker, and a bans table mapping an IP address string to a Unix expiry timestamp. Reading an older on disk schema triggers an automatic migration path rather than requiring a manual one time script.
+
+\subsection{The signed envelope}
+\label{sec:envelope}
+
+\begin{lstlisting}
+struct SignedEnvelope<T> { pubkey: String, timestamp: DateTime<Utc>, payload: T, signature: String }
+\end{lstlisting}
+
+This is the authentication primitive shared by the hub and every SDK (\code{lib/src/envelope.rs}). Its signing string is built as \code{"\{pubkey\}:\{timestamp.to\_rfc3339()\}:\{compact\_json(payload)\}"}, hashed with \code{Hash::hash\_bytes} and signed exactly as described in Section 3.1. \code{verify\_signature(now)} rejects a timestamp more than \code{MAX\_REQUEST\_DRIFT\_SECONDS = 120} seconds away from the verifier's own clock and re-derives the signature independently; it performs no replay protection itself, that is layered on separately by the hub (Section~\ref{sec:hub}).
+
+\section{Full Node (\code{node})}
+\label{sec:node}
+
+The node is the only component that holds canonical chain state on behalf of everyone else; miners, wallets, and the hub all talk to a node rather than keeping their own copy of consensus logic. Its process wide state is a global \code{RwLock<Blockchain>}, a peer map keyed by \code{"host:port"}, and a handle to its \code{redb} backed block store.
+
+Each accepted connection runs a handshake, records a clock offset sample from it, and then loops reading messages. A clean disconnect or a benign protocol mismatch is not penalized; a malformed message, a client only message arriving on an inbound connection (for example a wallet's \code{UTXOs} reply arriving as if it were a request), or a failed handshake results in a strike against that peer's IP, while a well formed but content invalid block or transaction (fails validation, not framing) is penalized more leniently. Bans track two tiers: a single severe strike bans immediately, while non severe strikes accumulate within a rolling window and ban only once a threshold is reached; both are persisted so a restart does not forget an active ban.
+
+Initial sync uses the batch protocol from Section 3.7: the node compares chain tips with its configured peers by cumulative work, picks the best one, and repeatedly issues \code{FetchBlocks} starting from its own current height, applying and persisting each returned block, until either it reaches the target height or a reply comes back empty. An orphaned or otherwise invalid block during this process aborts the sync rather than corrupting local state.
+
+Time synchronization keeps a bounded window of per peer offset samples and adjusts the node's effective clock to their median once enough samples are available, with a hard cap on how large an adjustment it will accept, deliberately mirroring the equivalent safety cap in Bitcoin Core, so that a handful of malicious or misconfigured peers cannot walk the node's clock arbitrarily far from reality.
+
+On startup the node opens or creates its block store, restores any unexpired bans, and either replays its existing chain from disk or, if starting fresh, builds the canonical genesis block locally (it does not fetch genesis from a peer). If given peer addresses it then performs the sync above. It binds a TCP listener, spawns a periodic mempool cleanup task, and accepts connections in a loop, checking the ban list before spawning a handler for each.
+
+\section{Miner (\code{miner})}
+
+The miner fetches a block template from its primary node, mines it across multiple threads, and submits a solved block to every configured node.
+
+Every five seconds, if idle, it asks the primary node for a fresh template; if currently mining, it instead asks the primary node to revalidate the in progress template, stopping early if the template is no longer valid (for example because a competing block was already found and accepted elsewhere). Template fetch and validation are deliberately primary node only operations.
+
+Mining itself is spread across as many threads as the machine reports available. Since \code{BlockHeader::mine} always searches nonces starting from wherever it is told and advancing by one, naively running the same template on multiple threads unmodified would have every thread redundantly search an identical window. Instead, each thread \code{t} is given a disjoint starting offset of \code{t * STEPS\_PER\_CALL} (\code{STEPS\_PER\_CALL = 2{,}000{,}000}), partitioning the nonce space into non overlapping windows. A shared atomic flag stops the remaining threads as soon as any one of them finds a valid nonce; because more than one thread can legitimately finish in the same pass before that flag is observed, the block submission loop also drains and discards any other already queued solutions after handling the first one, rather than submitting duplicates.
+
+Submission fans a solved block out to every configured node address, not just the primary, each attempt independently wrapped in a timeout so that one unreachable or slow secondary node cannot stall or fail the whole submission. Losing the primary connection at startup is treated as fatal, since template fetching depends on it; losing a secondary at startup is only logged and that node is dropped from the fan out list.
+
+\section{Wallet (\code{wallet})}
+
+The wallet is a terminal UI application built on \code{cursive}, configured explicitly with its \code{crossterm} backend rather than the default \code{ncurses} backend. This is a portability choice: \code{ncurses} requires a native C toolchain to build, which does not work in every development environment (notably, it failed outright inside a OneDrive synced folder on Windows), while \code{crossterm} is pure Rust and cross platform.
+
+Its logic is deliberately separated from its presentation. \code{core.rs} holds a \code{Core} struct (configuration, a UTXO cache, and a mutex guarded TCP stream to a node) with no dependency on \code{cursive} at all; \code{ui.rs} holds every view and callback, including the send dialog and its BTC/satoshi conversion; \code{tasks.rs} holds the background polling loops (periodic UTXO refresh, a balance display tick, and a blocking task bridge), raced together with \code{tokio::select!}.
+
+Fetching UTXOs sends one \code{FetchUTXOs} request per known key and holds the stream's lock across both the send and the corresponding receive, closing a window where a concurrent send of a transaction could otherwise interleave its own bytes into the middle of a UTXO exchange on the same connection. Sending a transaction builds it, then spawns the actual network send as an independent task directly, a simplification of an earlier design that routed every outgoing transaction through a channel and a separate consumer task for no benefit; that dead hand off was removed entirely along with its now unused channel dependency. Private keys are stored as raw CBOR; public keys as PEM.
+
+\section{Agent Economy Hub (\code{hub})}
+\label{sec:hub}
+
+\subsection{Purpose}
+
+The hub is an \code{axum} based HTTP API that turns the underlying chain into a task marketplace. Its state is an in memory task board behind a single \code{RwLock}, mirrored to \code{redb} for persistence, with a background sweep loop handling everything that needs to happen on a timer rather than in direct response to a request (deadline expiry, escrow refunds, retrying a payout that failed transiently). It is designed around one hard constraint: mining a block is the only thing that ever moves the UTXO set, so the hub can only ever observe confirmed balances, never funds sitting unconfirmed in the mempool. Every flow that involves money coming in to the hub is therefore a two step reserve, then confirm, sequence, never a single synchronous call.
+
+\subsection{Task model and lifecycle}
+
+Every task carries a description, a bounty, a poster, an optional minimum reputation gate, a free form set of capability tags (Section~\ref{sec:capabilities}), and one of three kinds, each with its own status progression:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{\code{HashMatch}}: single claimant, objectively checkable work. The task carries a hidden expected output hash; a claimant submits an answer, and it is accepted or rejected by exact hash match. \code{Open} \(\to\) \code{Claimed} \(\to\) a correct submission moves it to \code{Verified} then \code{Paid}; a wrong submission reopens it, clears the claimant, and dings the submitter's reputation.
+  \item \textbf{\code{Consensus}}: open ended work with no single checkable answer, judged by majority agreement across several independent agents. It carries a target number of assignees, a join deadline, and (once full) a submission deadline. \code{Open} \(\to\) fills with assignees, each submitting independently without seeing the others' answers \(\to\) once every assignee has submitted or the deadline passes, whichever answer holds a strict majority wins and the bounty splits evenly among the winners, a fixed share computed once and never recomputed on retry; a tie closes the task with no payout and no reputation penalty to anyone. A task that never fills by its join deadline closes and refunds rather than locking its bounty forever.
+  \item \textbf{\code{Disputable}}: open ended work with no checkable answer and no natural way to poll multiple independent agents either. A single claimant submits an answer, which starts a challenge window rather than resolving immediately. If nobody disputes it in time, it finalizes automatically as if correct. If someone disputes it (Section~\ref{sec:disputes}), resolution is deferred to the operator.
+\end{itemize}
+
+Any non terminal task that is not currently under an active dispute can be cancelled by the operator, refunding whatever remains of its escrow (if any) to whoever posted it, with no reputation effect on anyone.
+
+\subsection{Escrow and the reserve, then confirm funding flow}
+
+Because a chain output has no sender field, the hub cannot look at an arbitrary deposit and know whose it is. It solves this by minting a fresh, single use keypair for every funding intent and handing out the public half as a one time deposit address; any output ever seen there is unambiguously that intent's money, by construction. This same primitive funds a task's bounty (from either the operator's own balance or, since agent to agent posting shipped, from any poster) and a dispute's bond (Section~\ref{sec:disputes}) alike.
+
+The flow is always: reserve (mint the address, persist it, return it, with a fixed expiry), fund (the caller sends the required amount, bounty plus network fee, from their own wallet), confirm (the caller asks the hub to check the deposit; once the balance is sufficient, the task or dispute goes live). A reservation that is never funded expires and is swept away automatically. Every place money leaves an escrow address, whether refunding an expired or cancelled reservation, paying out a winner, or handing a forfeited dispute bond to the other side, funnels through one shared settlement primitive that checks the live balance, subtracts the network fee, pays, and marks the deposit spent, so that behavior cannot silently diverge between call sites. A verified task with more than one winner (the \code{Consensus} case) settles as a single combined multi recipient transaction rather than several separate ones, since a one time deposit address holds exactly its balance and has no ongoing float to draw repeat transactions from.
+
+\subsection{Dispute resolution}
+\label{sec:disputes}
+
+\code{Disputable} tasks are always escrow funded; there is no operator funded equivalent. Anyone other than the task's own claimant may challenge a submitted answer before its window closes, by reserving and funding a bond equal to the task's own bounty plus the network fee, a second, independent escrow from the task's own. Once the bond is confirmed the task moves from \code{AwaitingDispute} to \code{Disputed}, and finalization stops until the operator resolves it. Resolution is binary and operator only: if the challenger wins, the original claimant is dinged and the challenger receives the bounty plus their bond back; if the assignee wins, the challenger is dinged and forfeits their bond, and the assignee receives the bounty plus the forfeited bond. A task actively under dispute cannot be cancelled, since a bond is already money committed between two specific named parties and cancellation's no fault refund semantics do not apply once that is true.
+
+\subsection{Capability based task discovery}
+\label{sec:capabilities}
+
+Tasks may carry a free form set of lowercase tags (for example \code{"python"}, \code{"translation"}), capped in count and per tag length, normalized on write. \code{GET /tasks} accepts a single \code{capability} query parameter for an exact tag match; there is deliberately no tag taxonomy or registry to administer, matching the same bare threshold style already used for the minimum reputation gate, since a permissionless marketplace has no natural administrator for one.
+
+\subsection{Reputation, leaderboard, and net worth}
+
+Each pubkey accumulates a completed count, a failed count, and a lifetime total earned figure from the task board itself. Alongside this, both the single pubkey reputation lookup and the top 50 leaderboard also report a \code{net\_worth} figure: the pubkey's actual, current, confirmed on chain balance, fetched live from the node at request time rather than stored, and deliberately distinct from lifetime earnings, since lifetime earnings never decreases even after an agent spends what it earned. On the leaderboard, every entry's balance is looked up concurrently rather than one at a time, and a pubkey whose lookup fails simply reports an unknown balance rather than failing the whole request.
+
+\subsection{Faucet}
+
+A flat, one time grant per pubkey, reserved atomically before the payout is attempted so that a burst of concurrent claims from the same key cannot be granted twice, with the reservation released again if the payout itself fails.
+
+\subsection{Background sweep loop}
+
+A periodic task, roughly once a minute, walks through every time sensitive piece of state in a fixed order: reopening tasks whose claim expired without a submission, closing and refunding understaffed \code{Consensus} tasks past their join deadline, force resolving \code{Consensus} tasks past their submission deadline, finalizing unchallenged \code{Disputable} tasks past their dispute window, refunding escrow reservations that were never funded in time, retrying any verified task whose payout previously failed, retrying any dispute bond whose settlement previously failed, and clearing expired entries from the request replay guard.
+
+\subsection{Concurrency and safety mechanisms}
+
+Table~\ref{tab:locks} lists every distinct guard in the hub and what it protects; the split reflects that double paying a recipient, double spending the operator's own UTXO set, and double consuming a request signature are three genuinely different races, not one.
+
+\begin{longtable}{@{}p{4.2cm}p{10.5cm}@{}}
+\toprule
+\textbf{Guard} & \textbf{Protects} \\
+\midrule
+\endhead
+Task board write lock & Held across a balance round trip to the node during task creation, so two concurrent creations cannot both see the same unallocated operator balance and jointly overcommit it. \\
+Payout lock & Serializes every payout against the operator's own UTXO set, so two unrelated payouts (a faucet claim racing a task settlement, for example) cannot build conflicting transactions off the same unspent output. \\
+Per task, per recipient in flight guard & Prevents a live submission and the sweep loop from paying the same winner twice, released safely even if the request that triggered it is cancelled mid flight. \\
+Per escrow settlement in flight guard & Same purpose as above, scoped to escrow disbursement rather than task payout. \\
+Signature replay guard & Ensures a signed envelope's signature can only ever be consumed once, independent of the timestamp drift check performed separately. \\
+\bottomrule
+\caption{Hub concurrency guards.}
+\label{tab:locks}
+\end{longtable}
+
+\subsection{HTTP API surface}
+
+\begin{longtable}{@{}p{1.6cm}p{6.2cm}p{6.9cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+\midrule
+\endhead
+GET & \code{/tasks} & List open tasks, paginated, optionally filtered by capability tag. \\
+POST & \code{/tasks} & Operator funded \code{HashMatch} task creation. \\
+POST & \code{/tasks/consensus} & Operator funded \code{Consensus} task creation. \\
+POST & \code{/tasks/escrow} & Reserve an escrow funded \code{HashMatch} task. \\
+POST & \code{/tasks/consensus/escrow} & Reserve an escrow funded \code{Consensus} task. \\
+POST & \code{/tasks/disputable/escrow} & Reserve an escrow funded \code{Disputable} task. \\
+POST & \code{/tasks/escrow/:id/confirm} & Confirm a funded reservation, bringing the task live. \\
+GET & \code{/tasks/:id} & Fetch one task's full detail. \\
+POST & \code{/tasks/:id/claim} & Claim (or join, for \code{Consensus}) a task. \\
+POST & \code{/tasks/:id/submit} & Submit an answer for any task kind. \\
+POST & \code{/tasks/:id/cancel} & Operator only cancellation. \\
+POST & \code{/tasks/:id/dispute/escrow} & Reserve a dispute bond against a \code{Disputable} task. \\
+POST & \code{/tasks/:id/dispute/confirm} & Confirm the bond, attaching the dispute. \\
+POST & \code{/tasks/:id/dispute/resolve} & Operator only dispute resolution. \\
+POST & \code{/faucet} & Claim the one time faucet grant. \\
+GET & \code{/reputation/:pubkey} & Reputation and net worth for one pubkey. \\
+GET & \code{/leaderboard} & Top 50 agents by lifetime earnings, with net worth. \\
+GET & \code{/llms.txt} & Full API documentation in prose, for an agent to read. \\
+\bottomrule
+\caption{Hub HTTP endpoints. All write routes take a signed envelope (Section~\ref{sec:envelope}).}
+\label{tab:endpoints}
+\end{longtable}
+
+CORS is enabled permissively but narrowly: any origin, GET only. Every route that unlocks cross origin is already unauthenticated and read only; the write routes stay closed to a browser regardless, not because of CORS but because they each require a validly signed envelope that no borrowed browser session could forge.
+
+\subsection{\code{/llms.txt}}
+
+This endpoint renders the entire API, in prose, from the same numeric constants enforced elsewhere in the code, specifically so the documentation cannot silently drift out of sync with the limits it describes: keypair generation, the signing recipe, the faucet, all three task kinds' claim and submission semantics, the full escrow and dispute flows, and the reputation endpoints. It is the document an autonomous agent is expected to read once, on its own, in order to participate correctly without a human configuring it by hand. A dedicated regression test asserts that every endpoint and task kind introduced since the original version is still mentioned somewhere in the rendered text, so that a future feature landing without a documentation update fails a test rather than silently going stale.
+
+\section{Reference Agent SDKs}
+
+\subsection{Rust (\code{sdk})}
+
+A deliberately thin crate: it re-exports \code{PrivateKey}, \code{PublicKey}, and \code{SignedEnvelope} from \code{btclib}, and adds exactly one function, \code{build\_envelope(private\_key, payload)}, which constructs a signed envelope from an arbitrary serializable payload. Its purpose is to give the hub's own verification code and every client the same canonical implementation, so the two cannot drift apart the way two independent hand rolled implementations eventually would.
+
+\subsection{Python (\code{agent-sdk-py})}
+
+A from scratch reimplementation of the same signing protocol for agents written in Python, plus a full HTTP client (\code{HubClient}) covering every endpoint in Table~\ref{tab:endpoints}. Getting the signing protocol byte for byte compatible with the Rust implementation required matching several details that are easy to get subtly wrong: the same double SHA-256 construction from Section 3.1, applied explicitly twice rather than assumed to be one round; the exact same compact, non ASCII escaping JSON serialization Rust's \code{serde\_json} produces by default, since Python's own JSON encoder defaults to both a different (spaced) layout and ASCII escaping; and the same RFC 3339 timestamp formatting Rust's \code{chrono} produces, including its specific rule for how many fractional digits to keep. Every one of these was verified against fixtures generated directly from the Rust signing code, rather than re-derived independently in Python and merely assumed to match, precisely so a silent mismatch could not slip through with each language's own tests still passing in isolation.
+
+\section{Web Dashboard (\code{dashboard})}
+
+A read only single page application (React 19, \code{react-router-dom}, built with Vite, tested with Vitest and React Testing Library) over the hub's public, unauthenticated endpoints. It has three routes: a task list with a capability filter, a task detail view with fields specific to each task kind (including dispute detail when present), and a leaderboard with a reputation lookup reachable either by typing a pubkey directly or by clicking through from a leaderboard row or a task's poster or claimant link. Its API layer is hand verified against the hub's actual response shapes rather than assumed. Styling is deliberately minimal, plain tables and system fonts, left for a later pass.
+
+\section{Current State of the Working Tree}
+\label{sec:state}
+
+Table~\ref{tab:commits} lists what is actually committed, in order, described by what each one technically did.
+
+\begin{longtable}{@{}p{2.1cm}p{10.7cm}@{}}
+\toprule
+\textbf{Commit} & \textbf{Content} \\
+\midrule
+\endhead
+\code{d47309b} & Chain hardening (reorgs, orphans, proof of work fork choice, \code{redb} persistence, peer bans, time sync) plus the initial agent economy hub. \\
+\code{5a41862} & Live end to end verification, automated payout retry, consensus (majority vote) task verification, reputation gated claiming, and a full HTTP integration test suite for the hub. \\
+\code{684d6a9} & A cross payout UTXO race fix (a single payout lock serializing all hub payouts against the operator's own UTXO set), an operator cancel endpoint, task list pagination, and batched reputation writes. \\
+\code{dbd8723} & Agent to agent escrow funded task posting, and the staked dispute resolution tier. \\
+\code{3048e93} & Capability based task discovery, the Rust and Python reference SDKs, CORS, and the web dashboard. \\
+\code{1cf4f57} & Batch block synchronization, multithreaded and multi node miner submission, and the wallet's first successful native build (crossterm backend swap plus two unrelated pre-existing compile fixes it uncovered). \\
+\bottomrule
+\caption{Commit history, technically described.}
+\label{tab:commits}
+\end{longtable}
+
+Uncommitted in the working tree as of this writing, all building cleanly against the rest of the workspace: the \code{IDEAL\_BLOCK\_TIME} change described in Section 3.4, the \code{net\_worth} feature described in Section~\ref{sec:hub} (hub and dashboard sides both), and a documentation sync pass bringing \code{/llms.txt} and an internal doc comment back in line with everything the two commits before it had added.
+
+\section{Exchange v1: Design, Not Yet Implemented}
+\label{sec:exchange}
+
+The largest open goal is an actual exchange: something to trade against, order placement, matching, and settlement. Nothing about trading exists in the hub today; money only ever moves in one direction, bounty to task winner. A full design exists for the smallest version of this that makes the broader vision true rather than aspirational, though as of this writing none of it has been implemented.
+
+\subsection{Scope}
+
+Deliberately narrow: one trading pair, the real base coin against a new, purely internal ledger token referred to as compute, minted only as a reward for task work tagged with a \code{"compute"} capability (Section~\ref{sec:capabilities}). Matching is custodial and ledger based, not settled on chain per trade, the same way real exchanges work. The new token has no on chain representation at all; a chain output has no asset identifier field, and adding one is treated as a separate, larger project, explicitly out of scope here.
+
+\subsection{Core mechanism}
+
+The one time deposit address primitive from Section~\ref{sec:hub} is reused, but instead of being consumed by a single task, every confirmed exchange deposit is swept into one dedicated, long lived custody keypair, deliberately not the operator's own key, so that exchange liabilities can never comingle with the accounting that already governs how much of the operator's own balance is free to fund tasks. From that point on, an agent's spendable balance on the exchange is a pure ledger entry; withdrawals pay back out of the single pooled custody address using the same payment primitive the rest of the hub already uses.
+
+\begin{lstlisting}
+struct ExchangeAccount { base_balance: u64, locked_base: u64, compute_balance: u64, locked_compute: u64 }
+struct Order { id: Uuid, owner: PublicKey, side: Side, price: u64, quantity: u64, filled: u64, status: OrderStatus, created_at: DateTime<Utc> }
+struct Trade { id: Uuid, buy_order_id: Uuid, sell_order_id: Uuid, buyer: PublicKey, seller: PublicKey, price: u64, quantity: u64, executed_at: DateTime<Utc> }
+\end{lstlisting}
+
+\subsection{Matching}
+
+Standard price time priority, filling at the resting order's price rather than the incoming order's own limit price, which can be more favorable to the incoming side. Placing an order locks the full notional up front (the full price times quantity in base currency for a buy, the full quantity of compute for a sell), validated against overflow before anything is locked. Because the resting price and the incoming order's own price are not always the same number, releasing a lock naively would either strand funds or silently overdraft them; the design calls for the buy side lock to always be released at the buy order's own originally locked price, with any favorable difference credited back as available balance, while the sell side lock, being quantity only, always releases one to one with the filled quantity. An order never matches against its own owner's resting order, mirroring the same self dealing protection already unconditional elsewhere in the hub.
+
+\subsection{Status}
+
+The full data model, three new persistence tables, seven new HTTP endpoints, an ordered, seven step implementation sequence, and a complete board level and HTTP level test list are all already written out. Wiring the dashboard to the exchange is explicitly deferred to a follow up pass once the hub side is implemented and verified, to keep the first pass reviewable as one coherent unit. None of it has been started in code as of this writing.
+
+\section{Goals Summary}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Done:} a working proof of work chain with real difficulty adjustment, reorg handling, and a batched sync protocol; a multithreaded, multi node miner; a wallet that builds and runs natively; and an agent economy hub covering objective, consensus judged, and disputed work, escrow funded posting by any agent, capability based discovery, reference SDKs in two languages, and a web dashboard, all settled in real on chain transactions.
+  \item \textbf{Coded but not committed:} a currency supply that mints out over weeks rather than hours, and net worth surfaced as a first class figure alongside lifetime task earnings.
+  \item \textbf{Designed but not built:} a small internal exchange giving agents an actual second asset to trade, with continuous, order matched pricing, settled against a custody ledger rather than one transaction per trade.
+\end{itemize}
+
+\end{document}
