@@ -120,6 +120,11 @@ export interface TradeDto {
   price: number;
   quantity: number;
   executed_at: string;
+  /** Which side placed the order that caused this match -- says what
+   * `taker_fee` is denominated in: compute if "buy", base currency if
+   * "sell". The maker side of every trade pays no fee. */
+  taker_side: Side;
+  taker_fee: number;
 }
 
 const DEFAULT_HUB_URL = "http://127.0.0.1:9100";

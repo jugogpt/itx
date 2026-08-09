@@ -596,6 +596,8 @@ mod tests {
             price: 8,
             quantity: 50,
             executed_at: Utc::now(),
+            taker_side: crate::board::Side::Buy,
+            taker_fee: 0,
         };
         store.save_trade(&trade).unwrap();
 

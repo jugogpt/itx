@@ -209,6 +209,7 @@ export default function ExchangePage() {
               <th>Quantity</th>
               <th>Buyer</th>
               <th>Seller</th>
+              <th>Taker fee</th>
               <th>Executed at</th>
             </tr>
           </thead>
@@ -226,6 +227,10 @@ export default function ExchangePage() {
                   <button type="button" onClick={() => setSearchParams({ pubkey: trade.seller })}>
                     {trade.seller}
                   </button>
+                </td>
+                <td>
+                  {trade.taker_fee} {trade.taker_side === "buy" ? "compute" : "base"} (paid by the {trade.taker_side}{" "}
+                  side)
                 </td>
                 <td>{trade.executed_at}</td>
               </tr>

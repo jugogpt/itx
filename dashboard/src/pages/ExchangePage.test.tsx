@@ -57,6 +57,8 @@ describe("ExchangePage", () => {
         price: 8,
         quantity: 50,
         executed_at: "2026-08-09T00:00:00Z",
+        taker_side: "buy",
+        taker_fee: 0,
       },
     ]);
 

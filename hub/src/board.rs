@@ -544,8 +544,25 @@ pub struct Order {
     pub created_at: DateTime<Utc>,
 }
 
+/// Taker fee, in basis points of the fill's notional -- the maker side
+/// of every trade pays nothing (the "rebate," relative to the taker),
+/// which is what's meant to reward whoever brings resting liquidity to
+/// the book rather than whoever crosses it. 10 bps (0.10%) mirrors a
+/// typical real exchange's taker fee. Applied by reducing what the
+/// taker *receives*, never as an extra charge beyond what `place_order`
+/// already locked -- see `place_order`'s own doc comment for why that
+/// matters.
+pub const TAKER_FEE_BPS: u64 = 10;
+
 /// A single match between a taker and a resting maker order, always
-/// executed at the maker's (resting order's) price.
+/// executed at the maker's (resting order's) price. `taker_side` and
+/// `taker_fee` together say who paid the fee and how much: `taker_fee`
+/// is denominated in compute if `taker_side` is `Buy` (the taker
+/// received compute, fee taken out of that) or in the base currency if
+/// `taker_side` is `Sell` (the taker received base, fee taken out of
+/// that) -- without `taker_side` recorded here, a `Trade` read back
+/// later (e.g. from `GET /exchange/trades`) would have no way to know
+/// which asset `taker_fee` was actually charged in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
     pub id: Uuid,
@@ -556,6 +573,8 @@ pub struct Trade {
     pub price: u64,
     pub quantity: u64,
     pub executed_at: DateTime<Utc>,
+    pub taker_side: Side,
+    pub taker_fee: u64,
 }
 
 /// Pure in-memory task-marketplace state: no I/O, no knowledge of the
@@ -1704,6 +1723,19 @@ impl TaskBoard {
         self.exchange_accounts.entry(recipient.clone()).or_default().compute_balance += amount;
     }
 
+    /// Credits `recipient`'s base currency balance -- mirrors
+    /// `credit_compute` exactly, for the base side. Kept a distinct,
+    /// clearly named method rather than reused from
+    /// `credit_back_withdrawal` even though mechanically identical,
+    /// matching this module's convention of one method per semantic
+    /// purpose. Used by `handlers::place_order` to route taker fee
+    /// revenue to the exchange's fee sink -- `TaskBoard` itself has no
+    /// concept of an operator or fee recipient, it just credits whatever
+    /// pubkey it's given.
+    pub fn credit_base(&mut self, recipient: &PublicKey, amount: u64) {
+        self.exchange_accounts.entry(recipient.clone()).or_default().base_balance += amount;
+    }
+
     /// Atomically checks and debits `owner`'s withdrawable balance in one
     /// step -- the single guard that stops two concurrent withdrawal
     /// requests from jointly overdrawing the same ledger balance
@@ -1844,17 +1876,31 @@ impl TaskBoard {
                 Side::Sell => (resting.owner.clone(), resting.price, taker.owner.clone()),
             };
 
+            // The taker pays TAKER_FEE_BPS on this fill, taken out of
+            // whatever they're receiving (never as an extra charge
+            // beyond what was already locked, which is what keeps this
+            // provably free of underflow risk -- see this fn's own doc
+            // comment). The maker side is always credited in full,
+            // which is the "rebate" half of a maker/taker fee model.
+            let notional = execution_price * fill_qty;
+            let taker_fee = match taker.side {
+                Side::Buy => fill_qty * TAKER_FEE_BPS / 10_000,
+                Side::Sell => notional * TAKER_FEE_BPS / 10_000,
+            };
+
             {
                 let buyer_account = self.exchange_accounts.entry(buy_owner.clone()).or_default();
                 buyer_account.locked_base -= buy_price * fill_qty;
-                buyer_account.base_balance -= execution_price * fill_qty;
-                buyer_account.compute_balance += fill_qty;
+                buyer_account.base_balance -= notional;
+                let compute_credit = if taker.side == Side::Buy { fill_qty - taker_fee } else { fill_qty };
+                buyer_account.compute_balance += compute_credit;
             }
             {
                 let seller_account = self.exchange_accounts.entry(sell_owner.clone()).or_default();
                 seller_account.locked_compute -= fill_qty;
                 seller_account.compute_balance -= fill_qty;
-                seller_account.base_balance += execution_price * fill_qty;
+                let base_credit = if taker.side == Side::Sell { notional - taker_fee } else { notional };
+                seller_account.base_balance += base_credit;
             }
 
             let (buy_order_id, sell_order_id) = match taker.side {
@@ -1868,6 +1914,8 @@ impl TaskBoard {
                 buyer: buy_owner,
                 seller: sell_owner,
                 price: execution_price,
+                taker_side: taker.side,
+                taker_fee,
                 quantity: fill_qty,
                 executed_at: now,
             });
@@ -3316,6 +3364,78 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(board.exchange_account(&seller).base_balance, 400, "50 * 8");
         assert_eq!(board.exchange_account(&buyer).compute_balance, 50);
+    }
+
+    #[test]
+    fn small_fills_round_the_taker_fee_down_to_zero() {
+        // 10 bps of a fill under 1000 units floors to 0 -- every other
+        // matching test in this file uses quantities well under that,
+        // which is exactly why adding the fee didn't change any of
+        // their expected balances; this test makes that fact explicit
+        // rather than leaving it implicit.
+        let mut board = TaskBoard::new();
+        let seller = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 50, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+
+        board.place_order(seller, Side::Sell, 10, 50, Utc::now()).unwrap();
+        let (_, trades) = board.place_order(buyer.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        assert_eq!(trades[0].taker_fee, 0);
+        assert_eq!(board.exchange_account(&buyer).compute_balance, 50, "no fee actually withheld at this size");
+    }
+
+    #[test]
+    fn buy_taker_pays_the_fee_in_compute_and_the_sell_maker_is_unaffected() {
+        let mut board = TaskBoard::new();
+        let seller = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 5_000, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 100_000, ..Default::default() });
+
+        board.place_order(seller.clone(), Side::Sell, 10, 5_000, Utc::now()).unwrap(); // resting ask
+        let (_, trades) = board.place_order(buyer.clone(), Side::Buy, 10, 5_000, Utc::now()).unwrap(); // taker bid, crosses
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].taker_side, Side::Buy);
+        assert_eq!(trades[0].taker_fee, 5, "5_000 * 10 bps");
+        assert_eq!(
+            board.exchange_account(&buyer).compute_balance,
+            4_995,
+            "taker receives the fill minus the fee, never charged as an extra debit"
+        );
+        assert_eq!(
+            board.exchange_account(&seller).base_balance,
+            50_000,
+            "the maker side is paid in full -- 5_000 * 10, no fee deducted"
+        );
+    }
+
+    #[test]
+    fn sell_taker_pays_the_fee_in_base_and_the_buy_maker_is_unaffected() {
+        let mut board = TaskBoard::new();
+        let buyer = pubkey();
+        let seller = pubkey();
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 100_000, ..Default::default() });
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 1_000, ..Default::default() });
+
+        board.place_order(buyer.clone(), Side::Buy, 10, 1_000, Utc::now()).unwrap(); // resting bid
+        let (_, trades) = board.place_order(seller.clone(), Side::Sell, 10, 1_000, Utc::now()).unwrap(); // taker ask, crosses
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].taker_side, Side::Sell);
+        assert_eq!(trades[0].taker_fee, 10, "notional 10_000 * 10 bps");
+        assert_eq!(
+            board.exchange_account(&seller).base_balance,
+            9_990,
+            "taker receives the notional minus the fee"
+        );
+        assert_eq!(
+            board.exchange_account(&buyer).compute_balance,
+            1_000,
+            "the maker side is paid in full -- no fee deducted"
+        );
     }
 
     #[test]
