@@ -7,9 +7,9 @@
 ╚═╝   ╚═╝   ╚═╝  ╚═╝
 ```
 
-# ITX
+# Internet Traffic Exchange
 
-### A from-scratch cryptocurrency and autonomous agent economy
+### An agent cryptocurrency economy experiment
 
 **Rust · Proof of Work · UTXO · P2P · Escrow · Agent Marketplace**
 
@@ -17,18 +17,15 @@
 
 ---
 
-## `01` — Overview
+## `01` — General overview
 
-**ITX** is a from-scratch, Bitcoin-like cryptocurrency implemented in Rust.
+**ITX** is a Bitcoin-like cryptocurrency implemented in Rust.
 
-The project began as an implementation of a proof-of-work blockchain, full node,
-miner, and terminal wallet, built primitive-by-primitive rather than assembled
-from an existing blockchain framework.
+The project began as an toy-implementation of a proof-of-work blockchain, full node,
+miner, and terminal wallet built in the my other git repo "itx-skeleton"
 
-It later evolved into a second layer: an **agent economy** built directly on top
-of the chain, where autonomous agents can discover work, perform tasks, earn
-currency, build reputation, and transact with one another using real on-chain
-value.
+I later chose to add a second agent layer onto of the blockchain core. This was an **agent economy** where autonomous agents can discover work, perform tasks, earn currency, build reputation, and transact with one another using real on-chain
+value. I hypothesized that we could replace bitcoin's incentive structure ("proof of work" and mining) with agent task completion. Ideally, we hoped each different type of task (of varying difficulty, of course; e.g. coding, search, image gen) would represent an asset class.
 
 ```text
                          ITX
@@ -45,8 +42,8 @@ value.
              │                         │
              └────────────┬────────────┘
                           │
-                    REAL ON-CHAIN
-                       VALUE
+                       ON-CHAIN
+                        VALUE
                           │
                           ▼
                     AUTONOMOUS
@@ -55,14 +52,11 @@ value.
 
 ---
 
-# `02` — Why ITX?
-
-The project has two goals:
+# `02` — Software Goals of ITX
 
 ### Build the primitives
 
-Implement the core components of a cryptocurrency from first principles:
-
+Wanted to implement the core components of a cryptocurrency from first principles. This includes:
 - Proof-of-work consensus
 - UTXO transactions
 - secp256k1 signatures
@@ -76,7 +70,7 @@ Implement the core components of a cryptocurrency from first principles:
 - Mining
 - Wallet infrastructure
 
-### Build an economy for agents
+### Build an experiment economy for internet agents
 
 Use that monetary infrastructure to create an environment where autonomous
 agents can:
@@ -103,12 +97,10 @@ receive payment
 build reputation
 ```
 
-The long-term goal is to extend this into a small multi-asset economy where
-agents can not only earn currency, but trade assets against it.
 
 ---
 
-# `03` — Architecture
+# `03` — Crud Architecture Summary
 
 ```text
                            ITX
@@ -142,7 +134,7 @@ agents can not only earn currency, but trade assets against it.
 
 ---
 
-# `04` — Repository
+# `04` — Repository Summary
 
 ```text
 itx/
@@ -174,7 +166,7 @@ itx/
 
 ---
 
-# `05` — Blockchain
+# `05` — Blockchain Basics
 
 ## Cryptography
 
@@ -203,9 +195,9 @@ ITX uses:
 
 ---
 
-## UTXO Model
+## Transaction processing structure: UTXO Model
 
-Transactions follow a UTXO model.
+We decided to follow the standard UTXO model for transactions. Here is a graphical summary:
 
 ```text
         INPUTS                         OUTPUTS
@@ -226,7 +218,7 @@ Transactions follow a UTXO model.
                                        └─────────────┘
 ```
 
-Transaction validation requires:
+In our use case, we require the following in order to verify agent transactions:
 
 - Referenced outputs to exist
 - Inputs not to be spent twice
@@ -234,7 +226,11 @@ Transaction validation requires:
 - Input value to cover output value
 - Any remaining value to become the miner fee
 
+
+This is not particularly novel, and there are many fantastic resources that explain UTXO better than I can. Here is the one I followed: https://learnmeabitcoin.com/technical/transaction/utxo/
+
 ---
+
 
 # `06` — Proof of Work
 
