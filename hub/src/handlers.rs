@@ -3,8 +3,8 @@ use tracing::*;
 use crate::auth::{AuthError, SignedEnvelope, VerifyEnvelope};
 use crate::board::{
     BoardError, CloseReason, ConsensusTaskIntent, Dispute, DisputableTaskIntent, DisputeResolution,
-    EscrowConfirmation, EscrowPurpose, EscrowStatus, PendingDeposit, Reputation, Task, TaskBoard, TaskIntent,
-    TaskKind, TaskStatus,
+    EscrowConfirmation, EscrowPurpose, EscrowStatus, ExchangeAccount, Order, OrderStatus, PendingDeposit,
+    Reputation, Side, Task, TaskBoard, TaskIntent, TaskKind, TaskStatus, Trade,
 };
 use crate::AppState;
 use axum::extract::{Path, Query, State};
@@ -59,6 +59,19 @@ const MAX_CAPABILITY_TAGS: usize = 20;
 /// Upper bound on one capability tag's length in characters (after
 /// normalization).
 const MAX_CAPABILITY_TAG_LENGTH: usize = 64;
+/// Minimum amount an exchange deposit must actually contain before
+/// `confirm_exchange_deposit` will credit it. Unlike a task escrow,
+/// there's no fixed target amount to reach here -- this is just a floor
+/// above the network fee the eventual custody sweep will pay, so a dust
+/// deposit can't be "confirmed" into a balance that's immediately
+/// unsweepable.
+const MIN_EXCHANGE_DEPOSIT: u64 = HUB_TRANSACTION_FEE + 1;
+/// `GET /exchange/trades`'s page size when the caller doesn't specify
+/// `limit`, mirroring `DEFAULT_TASKS_PAGE_SIZE`.
+const DEFAULT_TRADES_PAGE_SIZE: usize = 50;
+/// Upper bound on `GET /exchange/trades`'s `limit`, mirroring
+/// `MAX_TASKS_PAGE_SIZE`.
+const MAX_TRADES_PAGE_SIZE: usize = 200;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -103,7 +116,9 @@ impl From<AuthError> for ApiError {
 impl From<BoardError> for ApiError {
     fn from(e: BoardError) -> Self {
         match e {
-            BoardError::NotFound | BoardError::EscrowNotFound => ApiError::NotFound(e.to_string()),
+            BoardError::NotFound | BoardError::EscrowNotFound | BoardError::OrderNotFound => {
+                ApiError::NotFound(e.to_string())
+            }
             BoardError::NotOpen
             | BoardError::NotClaimed
             | BoardError::NotVerified
@@ -121,11 +136,15 @@ impl From<BoardError> for ApiError {
             | BoardError::DisputeWindowClosed
             | BoardError::AlreadyDisputed
             | BoardError::NotDisputed
-            | BoardError::CannotCancelWhileDisputed => ApiError::Conflict(e.to_string()),
+            | BoardError::CannotCancelWhileDisputed
+            | BoardError::OrderNotOpen
+            | BoardError::InsufficientBalance { .. } => ApiError::Conflict(e.to_string()),
             BoardError::NotClaimant
             | BoardError::InsufficientReputation { .. }
             | BoardError::PosterCannotClaimOwnTask
-            | BoardError::AssigneeCannotDisputeOwnSubmission => ApiError::Forbidden(e.to_string()),
+            | BoardError::AssigneeCannotDisputeOwnSubmission
+            | BoardError::NotOrderOwner => ApiError::Forbidden(e.to_string()),
+            BoardError::InvalidOrder | BoardError::OrderNotionalOverflow => ApiError::BadRequest(e.to_string()),
         }
     }
 }
@@ -473,6 +492,121 @@ impl From<&PendingDeposit> for EscrowReservationDto {
             deposit_address: deposit.deposit_pubkey.to_string(),
             required_amount: deposit.required_amount,
             expires_at: deposit.expires_at,
+        }
+    }
+}
+
+// ---- Exchange v1 ----
+
+#[derive(Deserialize, Serialize)]
+pub struct ConfirmExchangeDepositPayload {
+    pub escrow_id: Uuid,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PlaceOrderPayload {
+    pub side: Side,
+    pub price: u64,
+    pub quantity: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct CancelOrderPayload {
+    pub order_id: Uuid,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct WithdrawPayload {
+    pub amount: u64,
+}
+
+/// Query params for `GET /exchange/trades`, same shape as `ListTasksQuery`.
+#[derive(Deserialize)]
+pub struct ListTradesQuery {
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct ExchangeAccountDto {
+    pub base_balance: u64,
+    pub locked_base: u64,
+    pub compute_balance: u64,
+    pub locked_compute: u64,
+}
+
+impl From<ExchangeAccount> for ExchangeAccountDto {
+    fn from(a: ExchangeAccount) -> Self {
+        ExchangeAccountDto {
+            base_balance: a.base_balance,
+            locked_base: a.locked_base,
+            compute_balance: a.compute_balance,
+            locked_compute: a.locked_compute,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct OrderDto {
+    pub id: Uuid,
+    pub owner: String,
+    pub side: Side,
+    pub price: u64,
+    pub quantity: u64,
+    pub filled: u64,
+    pub status: OrderStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&Order> for OrderDto {
+    fn from(o: &Order) -> Self {
+        OrderDto {
+            id: o.id,
+            owner: o.owner.to_string(),
+            side: o.side,
+            price: o.price,
+            quantity: o.quantity,
+            filled: o.filled,
+            status: o.status,
+            created_at: o.created_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct OrderBookDto {
+    pub bids: Vec<OrderDto>,
+    pub asks: Vec<OrderDto>,
+}
+
+/// A single executed match, including both counterparties' hex pubkeys
+/// -- unlike a `Consensus` task's hidden-until-resolved answers, there's
+/// no privacy reason to hide who traded with whom; `/exchange/trades` is
+/// meant to be a real, public pricing feed.
+#[derive(Serialize)]
+pub struct TradeDto {
+    pub id: Uuid,
+    pub buy_order_id: Uuid,
+    pub sell_order_id: Uuid,
+    pub buyer: String,
+    pub seller: String,
+    pub price: u64,
+    pub quantity: u64,
+    pub executed_at: DateTime<Utc>,
+}
+
+impl From<&Trade> for TradeDto {
+    fn from(t: &Trade) -> Self {
+        TradeDto {
+            id: t.id,
+            buy_order_id: t.buy_order_id,
+            sell_order_id: t.sell_order_id,
+            buyer: t.buyer.to_string(),
+            seller: t.seller.to_string(),
+            price: t.price,
+            quantity: t.quantity,
+            executed_at: t.executed_at,
         }
     }
 }
@@ -1268,12 +1402,13 @@ async fn settle_escrow_funded_task(
     // Re-check live state immediately before spending, same principle as
     // settle_one_payout_inner's own re-check below: `payouts` may be a
     // stale snapshot if another attempt already settled some of these.
-    let still_owed: Vec<(PublicKey, u64)> = {
+    let (still_owed, is_compute_task): (Vec<(PublicKey, u64)>, bool) = {
         let board = state.board.read().await;
         let Some(task) = board.get_task(task_id) else {
             return false;
         };
-        payouts.into_iter().filter(|(recipient, _)| !task.is_recipient_paid(recipient)).collect()
+        let still_owed = payouts.into_iter().filter(|(recipient, _)| !task.is_recipient_paid(recipient)).collect();
+        (still_owed, task.capabilities.contains("compute"))
     };
     if still_owed.is_empty() {
         return true;
@@ -1297,20 +1432,35 @@ async fn settle_escrow_funded_task(
 
     let mut all_recorded = true;
     for (recipient, amount) in &still_owed {
-        if let Err(e) = state.board.write().await.mark_recipient_paid(task_id, recipient, *amount) {
-            println!(
-                "escrow settlement for task {task_id} succeeded on-chain but mark_recipient_paid failed for {recipient}: {e}"
-            );
-            all_recorded = false;
+        match state.board.write().await.mark_recipient_paid(task_id, recipient, *amount) {
+            Ok(_) => {
+                // Same reasoning as settle_one_payout_inner's own hook:
+                // placed strictly after a successful mark_recipient_paid,
+                // which inherits EscrowSettlementGuard's dedup for free.
+                if is_compute_task {
+                    state.board.write().await.credit_compute(recipient, *amount);
+                }
+            }
+            Err(e) => {
+                println!(
+                    "escrow settlement for task {task_id} succeeded on-chain but mark_recipient_paid failed for {recipient}: {e}"
+                );
+                all_recorded = false;
+            }
         }
     }
 
-    let (final_task, reputations) = {
+    let (final_task, reputations, exchange_accounts) = {
         let board = state.board.read().await;
         let final_task = board.get_task(task_id).cloned();
         let reputations: Vec<(PublicKey, Reputation)> =
             still_owed.iter().map(|(pk, _)| (pk.clone(), board.reputation(pk))).collect();
-        (final_task, reputations)
+        let exchange_accounts: Vec<(PublicKey, ExchangeAccount)> = if is_compute_task {
+            still_owed.iter().map(|(pk, _)| (pk.clone(), board.exchange_account(pk))).collect()
+        } else {
+            Vec::new()
+        };
+        (final_task, reputations, exchange_accounts)
     };
     if let Some(final_task) = final_task {
         if let Err(e) = state.store.save_task(&final_task) {
@@ -1319,6 +1469,9 @@ async fn settle_escrow_funded_task(
     }
     if let Err(e) = state.store.save_reputation_batch(&reputations) {
         println!("failed to persist reputation after escrow settlement for task {task_id}: {e}");
+    }
+    if let Err(e) = state.store.save_exchange_account_batch(&exchange_accounts) {
+        println!("failed to persist compute credit after escrow settlement for task {task_id}: {e}");
     }
     all_recorded
 }
@@ -1516,15 +1669,269 @@ async fn settle_one_payout_inner(
         let board = state.board.read().await;
         (board.get_task(task_id).cloned(), board.reputation(recipient))
     };
-    if let Some(final_task) = final_task {
-        if let Err(e) = state.store.save_task(&final_task) {
+    if let Some(final_task) = &final_task {
+        if let Err(e) = state.store.save_task(final_task) {
             println!("failed to persist task {task_id}: {e}");
+        }
+        // A task tagged "compute" pays its winner in the tradeable
+        // compute asset, on top of (not instead of) the ordinary bounty
+        // payout above -- placed strictly after mark_recipient_paid
+        // already succeeded, so it inherits that call's own dedup/retry
+        // safety (PAYOUT_IN_FLIGHT, re-checked live state) for free
+        // rather than needing a guard of its own.
+        if final_task.capabilities.contains("compute") {
+            let account = {
+                let mut board = state.board.write().await;
+                board.credit_compute(recipient, amount);
+                board.exchange_account(recipient)
+            };
+            if let Err(e) = state.store.save_exchange_account(recipient, &account) {
+                println!("failed to persist compute credit for {recipient}: {e}");
+            }
         }
     }
     if let Err(e) = state.store.save_reputation(recipient, &reputation) {
         println!("failed to persist reputation for {recipient}: {e}");
     }
     true
+}
+
+// ---------------------------------------------------------------------
+// Exchange v1
+// ---------------------------------------------------------------------
+
+/// Reserves a fresh deposit address for funding the caller's own
+/// exchange ledger balance. Unlike a task escrow there's no fixed
+/// target amount to reach -- any amount at or above
+/// `MIN_EXCHANGE_DEPOSIT` will later be accepted and credited in full
+/// (see `confirm_exchange_deposit`).
+pub async fn create_exchange_deposit(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedEnvelope<()>>,
+) -> Result<Json<EscrowReservationDto>, ApiError> {
+    let pubkey = envelope.verify()?;
+    let expires_at = Utc::now() + Duration::minutes(ESCROW_RESERVATION_TTL_MINUTES);
+    let deposit = state.board.write().await.reserve_escrow(
+        pubkey,
+        MIN_EXCHANGE_DEPOSIT,
+        EscrowPurpose::FundExchangeAccount,
+        expires_at,
+    );
+    state.store.save_pending_deposit(&deposit).map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(EscrowReservationDto::from(&deposit)))
+}
+
+/// Checks whether `escrow_id`'s deposit address now holds at least
+/// `MIN_EXCHANGE_DEPOSIT` and, if so, credits the caller's exchange
+/// ledger balance with whatever actually arrived, net of the network
+/// fee reserved for the eventual custody sweep. That sweep is attempted
+/// once inline right after, but never gates this response -- the ledger
+/// credit is durable and immediately spendable/tradeable the moment
+/// this succeeds, exactly like `confirm_task_escrow` returns before its
+/// task's bounty has actually moved anywhere on-chain. Only the
+/// original depositor may confirm their own deposit.
+pub async fn confirm_exchange_deposit(
+    State(state): State<Arc<AppState>>,
+    Path(escrow_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<ConfirmExchangeDepositPayload>>,
+) -> Result<Json<ExchangeAccountDto>, ApiError> {
+    if envelope.payload.escrow_id != escrow_id {
+        return Err(ApiError::BadRequest(
+            "escrow id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+
+    let deposit_pubkey = {
+        let board = state.board.read().await;
+        let deposit = board.get_pending_deposit(escrow_id).ok_or(BoardError::EscrowNotFound)?;
+        if deposit.depositor != pubkey {
+            return Err(ApiError::Forbidden("you are not the depositor of this escrow".into()));
+        }
+        deposit.deposit_pubkey.clone()
+    };
+    let observed_amount = state
+        .node
+        .balance(&deposit_pubkey)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let depositor = {
+        let mut board = state.board.write().await;
+        let (depositor, _credited) =
+            board.confirm_exchange_deposit(escrow_id, observed_amount, HUB_TRANSACTION_FEE, Utc::now())?;
+        depositor
+    };
+    let account = state.board.read().await.exchange_account(&depositor);
+    if let Err(e) = state.store.save_exchange_account(&depositor, &account) {
+        println!("failed to persist exchange account for {depositor}: {e}");
+    }
+    // The now-Consumed deposit's status also needs persisting, or a
+    // restart before the next sweep tick would see it as still Reserved.
+    if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id) {
+        if let Err(e) = state.store.save_pending_deposit(deposit) {
+            println!("failed to persist consumed escrow {escrow_id}: {e}");
+        }
+    }
+    if sweep_exchange_deposit(&state, escrow_id).await {
+        println!("swept exchange deposit {escrow_id} into pooled custody");
+    }
+    Ok(Json(ExchangeAccountDto::from(account)))
+}
+
+/// Persists everything one `TaskBoard::place_order` call may have
+/// touched: the placed order itself, every resting order it matched
+/// against (re-fetched live, since the board already mutated it in
+/// memory), every trade produced, and every distinct account balance
+/// moved by any of it (a match can move up to two accounts' worth of
+/// balance per fill).
+async fn persist_order_and_related(state: &AppState, order: &Order, trades: &[Trade]) {
+    if let Err(e) = state.store.save_order(order) {
+        println!("failed to persist order {}: {e}", order.id);
+    }
+    let mut touched_orders: BTreeSet<Uuid> = BTreeSet::new();
+    let mut touched_accounts: BTreeSet<PublicKey> = BTreeSet::new();
+    for trade in trades {
+        if let Err(e) = state.store.save_trade(trade) {
+            println!("failed to persist trade {}: {e}", trade.id);
+        }
+        touched_orders.insert(trade.buy_order_id);
+        touched_orders.insert(trade.sell_order_id);
+        touched_accounts.insert(trade.buyer.clone());
+        touched_accounts.insert(trade.seller.clone());
+    }
+    touched_orders.remove(&order.id); // already saved above
+
+    let board = state.board.read().await;
+    for order_id in touched_orders {
+        if let Some(resting) = board.get_order(order_id) {
+            if let Err(e) = state.store.save_order(resting) {
+                println!("failed to persist resting order {order_id}: {e}");
+            }
+        }
+    }
+    let accounts: Vec<(PublicKey, ExchangeAccount)> = touched_accounts
+        .into_iter()
+        .map(|pk| {
+            let account = board.exchange_account(&pk);
+            (pk, account)
+        })
+        .collect();
+    drop(board);
+    if let Err(e) = state.store.save_exchange_account_batch(&accounts) {
+        println!("failed to persist exchange account balances after a match: {e}");
+    }
+}
+
+/// Places a limit order against the caller's own exchange ledger
+/// balance, matching immediately against any crossing resting orders --
+/// see `TaskBoard::place_order`'s own doc comment for the matching and
+/// lock/settle reconciliation rules.
+pub async fn place_order(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedEnvelope<PlaceOrderPayload>>,
+) -> Result<Json<OrderDto>, ApiError> {
+    let pubkey = envelope.verify()?;
+    let (order, trades) = state.board.write().await.place_order(
+        pubkey,
+        envelope.payload.side,
+        envelope.payload.price,
+        envelope.payload.quantity,
+        Utc::now(),
+    )?;
+    persist_order_and_related(&state, &order, &trades).await;
+    Ok(Json(OrderDto::from(&order)))
+}
+
+/// Cancels an open (or partially filled) order, releasing whatever
+/// remains of its locked balance back to the caller. Only the order's
+/// own owner may cancel it.
+pub async fn cancel_order(
+    State(state): State<Arc<AppState>>,
+    Path(order_id): Path<Uuid>,
+    Json(envelope): Json<SignedEnvelope<CancelOrderPayload>>,
+) -> Result<Json<OrderDto>, ApiError> {
+    if envelope.payload.order_id != order_id {
+        return Err(ApiError::BadRequest(
+            "order id in the URL doesn't match the signed payload".into(),
+        ));
+    }
+    let pubkey = envelope.verify()?;
+    let order = state.board.write().await.cancel_order(order_id, &pubkey)?;
+    if let Err(e) = state.store.save_order(&order) {
+        println!("failed to persist cancelled order {order_id}: {e}");
+    }
+    let account = state.board.read().await.exchange_account(&pubkey);
+    if let Err(e) = state.store.save_exchange_account(&pubkey, &account) {
+        println!("failed to persist exchange account for {pubkey} after cancel: {e}");
+    }
+    Ok(Json(OrderDto::from(&order)))
+}
+
+pub async fn get_order_book(State(state): State<Arc<AppState>>) -> Json<OrderBookDto> {
+    let board = state.board.read().await;
+    let (bids, asks) = board.order_book();
+    Json(OrderBookDto {
+        bids: bids.into_iter().map(OrderDto::from).collect(),
+        asks: asks.into_iter().map(OrderDto::from).collect(),
+    })
+}
+
+pub async fn get_exchange_account(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<ExchangeAccountDto>, ApiError> {
+    let pubkey = parse_hex_pubkey(&pubkey_hex)?;
+    let account = state.board.read().await.exchange_account(&pubkey);
+    Ok(Json(ExchangeAccountDto::from(account)))
+}
+
+/// Withdraws `amount` of the caller's exchange ledger balance back to
+/// their own on-chain address, paid out of the pooled custody address.
+/// The debit is durable *before* the payout is attempted (`debit_for_withdrawal`
+/// is a single atomic check-and-debit, the guard that stops two
+/// concurrent withdrawals from jointly overdrawing the same balance);
+/// any failure after that point credits it back, so a failed or
+/// unpersisted withdrawal never silently loses the caller's balance.
+pub async fn withdraw(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<SignedEnvelope<WithdrawPayload>>,
+) -> Result<Json<ExchangeAccountDto>, ApiError> {
+    let pubkey = envelope.verify()?;
+    let amount = envelope.payload.amount;
+    {
+        state.board.write().await.debit_for_withdrawal(&pubkey, amount)?;
+    }
+
+    let after_debit = state.board.read().await.exchange_account(&pubkey);
+    if let Err(e) = state.store.save_exchange_account(&pubkey, &after_debit) {
+        state.board.write().await.credit_back_withdrawal(&pubkey, amount);
+        return Err(ApiError::Internal(format!("failed to persist withdrawal debit, aborted: {e}")));
+    }
+    if let Err(e) = pay_from_custody(&state, &pubkey, amount).await {
+        state.board.write().await.credit_back_withdrawal(&pubkey, amount);
+        let reverted = state.board.read().await.exchange_account(&pubkey);
+        if let Err(e) = state.store.save_exchange_account(&pubkey, &reverted) {
+            println!("failed to persist reverted withdrawal balance for {pubkey}: {e}");
+        }
+        return Err(ApiError::Internal(format!("withdrawal payout failed, please retry: {e}")));
+    }
+    let final_account = state.board.read().await.exchange_account(&pubkey);
+    Ok(Json(ExchangeAccountDto::from(final_account)))
+}
+
+/// Lists every executed trade, newest first, paginated via
+/// `?offset=&limit=` -- the "continuous pricing" feed the exchange
+/// exists to provide. Includes both counterparties (see `TradeDto`).
+pub async fn list_trades(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListTradesQuery>,
+) -> Json<Vec<TradeDto>> {
+    let limit = query.limit.unwrap_or(DEFAULT_TRADES_PAGE_SIZE).min(MAX_TRADES_PAGE_SIZE);
+    let board = state.board.read().await;
+    let trades: Vec<TradeDto> =
+        board.all_trades_newest_first().into_iter().skip(query.offset).take(limit).map(TradeDto::from).collect();
+    Json(trades)
 }
 
 pub async fn faucet_claim(
@@ -1998,6 +2405,55 @@ async fn pay_bounty(state: &AppState, recipient: &PublicKey, amount: u64) -> any
         &state.operator_public_key,
     )
     .await
+}
+
+/// Pays a single `recipient` out of the exchange's pooled custody
+/// address -- an exchange withdrawal's only payment path. A thin
+/// wrapper over `pay_from`, mirroring `pay_bounty` exactly except for
+/// which key/lock it uses: a *different* UTXO set than the operator's
+/// own, so this never contends with an unrelated operator payout (see
+/// `AppState::exchange_custody_payout_lock`'s own doc comment).
+async fn pay_from_custody(state: &AppState, recipient: &PublicKey, amount: u64) -> anyhow::Result<()> {
+    let _guard = state.exchange_custody_payout_lock.lock().await;
+    pay_from(
+        state,
+        &state.exchange_custody_private_key,
+        &state.exchange_custody_public_key,
+        &[(recipient.clone(), amount)],
+        &state.exchange_custody_public_key,
+    )
+    .await
+}
+
+/// Sweeps one confirmed `FundExchangeAccount` deposit into the pooled
+/// custody address -- a third call site of `disburse_escrow`, which
+/// already does exactly "pay this escrow's live balance, net of fee, to
+/// an arbitrary recipient, then mark it Refunded" (the other two being
+/// an ordinary refund, where `recipient == depositor`, and dispute-bond
+/// forfeiture). The deposit's own ledger credit already happened inside
+/// `confirm_exchange_deposit` and is immediately spendable/tradeable
+/// from that moment -- this sweep only ever moves the *on-chain* money
+/// to match what the ledger already promised, and is naturally
+/// idempotent to retry: it only ever selects deposits still `Consumed`
+/// (see `TaskBoard::unswept_exchange_deposits`), and `disburse_escrow`
+/// re-checks live balance before paying anything, so a crash between
+/// the sweep's on-chain payment and its `Refunded` write just costs one
+/// harmless retry that pays nothing (balance already 0) and finishes
+/// the status flip. Returns whether the sweep is now complete (no
+/// balance left to move, whether that's because it just swept
+/// everything or because there was nothing to sweep in the first
+/// place) -- `false` only on an actual failure worth retrying later.
+pub async fn sweep_exchange_deposit(state: &AppState, deposit_id: Uuid) -> bool {
+    let deposit = {
+        let board = state.board.read().await;
+        match board.get_pending_deposit(deposit_id) {
+            Some(d) if matches!(d.purpose, EscrowPurpose::FundExchangeAccount) && d.status == EscrowStatus::Consumed => {
+                d.clone()
+            }
+            _ => return true,
+        }
+    };
+    disburse_escrow(state, &deposit, &state.exchange_custody_public_key).await.is_some()
 }
 
 async fn persist_task_and_reputation(

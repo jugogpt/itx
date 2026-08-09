@@ -58,6 +58,18 @@ pub enum BoardError {
     NotDisputed,
     #[error("cannot cancel a task with an active dispute in progress")]
     CannotCancelWhileDisputed,
+    #[error("no such order")]
+    OrderNotFound,
+    #[error("you are not the owner of this order")]
+    NotOrderOwner,
+    #[error("order is not open")]
+    OrderNotOpen,
+    #[error("order price and quantity must both be non-zero")]
+    InvalidOrder,
+    #[error("order notional (price times quantity) overflows")]
+    OrderNotionalOverflow,
+    #[error("insufficient balance: {available} available, {required} required")]
+    InsufficientBalance { available: u64, required: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +444,14 @@ pub enum EscrowPurpose {
     /// than materializing a new one, unlike the other two purposes (see
     /// `TaskBoard::confirm_dispute_bond`).
     DisputeBond { task_id: Uuid, reason: String },
+    /// A deposit into the depositor's own exchange ledger balance
+    /// (`ExchangeAccount::base_balance`) -- payload-less, since unlike a
+    /// task's escrow there's no fixed target amount, any amount at or
+    /// above `handlers::MIN_EXCHANGE_DEPOSIT` is accepted and credited in
+    /// full (see `TaskBoard::confirm_exchange_deposit`). Rejected inside
+    /// `confirm_escrow`'s guard exactly like `DisputeBond` is, for the
+    /// same reason: this purpose doesn't create a `Task` either.
+    FundExchangeAccount,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +493,71 @@ pub enum EscrowConfirmation {
     TaskCreated(Task),
 }
 
+/// One pubkey's balances on the exchange -- a pure ledger, entirely
+/// separate from the on-chain UTXO set. `base_balance` is real currency,
+/// swept into pooled custody once deposited (see
+/// `handlers::sweep_exchange_deposit`) and withdrawable back out via the
+/// existing `pay_from`. `compute_balance` is the internal-only second
+/// asset: it has no on-chain representation at all and is never
+/// withdrawable, only tradeable here or spendable as... nothing yet --
+/// it only exists to be traded. `locked_base`/`locked_compute` are the
+/// portions currently reserved by this owner's own open orders; the
+/// spendable amount for a new order or a withdrawal is always the full
+/// balance minus its locked counterpart, never the raw balance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExchangeAccount {
+    pub base_balance: u64,
+    pub locked_base: u64,
+    pub compute_balance: u64,
+    pub locked_compute: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    Open,
+    Filled,
+    Cancelled,
+}
+
+/// A resting or fully/partially filled limit order. `price` is base
+/// units per one compute unit, fixed at placement -- see `place_order`'s
+/// own doc comment for exactly how a fill's execution price (the
+/// *resting* order's price, which can differ from this order's own) gets
+/// reconciled against the balance this order's own price locked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Order {
+    pub id: Uuid,
+    pub owner: PublicKey,
+    pub side: Side,
+    pub price: u64,
+    pub quantity: u64,
+    pub filled: u64,
+    pub status: OrderStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single match between a taker and a resting maker order, always
+/// executed at the maker's (resting order's) price.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trade {
+    pub id: Uuid,
+    pub buy_order_id: Uuid,
+    pub sell_order_id: Uuid,
+    pub buyer: PublicKey,
+    pub seller: PublicKey,
+    pub price: u64,
+    pub quantity: u64,
+    pub executed_at: DateTime<Utc>,
+}
+
 /// Pure in-memory task-marketplace state: no I/O, no knowledge of the
 /// blockchain or HTTP -- mirrors how `Blockchain` itself is a pure data
 /// structure the node crate drives. `HubStore` is this module's
@@ -486,6 +571,9 @@ pub struct TaskBoard {
     reputation: BTreeMap<PublicKey, Reputation>,
     faucet_grants: BTreeSet<PublicKey>,
     pending_deposits: BTreeMap<Uuid, PendingDeposit>,
+    exchange_accounts: BTreeMap<PublicKey, ExchangeAccount>,
+    orders: BTreeMap<Uuid, Order>,
+    trades: BTreeMap<Uuid, Trade>,
 }
 
 impl TaskBoard {
@@ -729,8 +817,10 @@ impl TaskBoard {
         // materializing a new one, and needs an extra check this generic
         // path doesn't perform (the target task must still actually be
         // awaiting a dispute) -- see `confirm_dispute_bond` instead.
-        // Checked before any mutation below, not after.
-        if matches!(deposit.purpose, EscrowPurpose::DisputeBond { .. }) {
+        // FundExchangeAccount doesn't create a Task at all -- see
+        // `confirm_exchange_deposit` instead. Both checked before any
+        // mutation below, not after.
+        if matches!(deposit.purpose, EscrowPurpose::DisputeBond { .. } | EscrowPurpose::FundExchangeAccount) {
             return Err(BoardError::WrongEscrowPurpose);
         }
         if deposit.status != EscrowStatus::Reserved {
@@ -809,7 +899,9 @@ impl TaskBoard {
                 }
                 task.id
             }
-            EscrowPurpose::DisputeBond { .. } => unreachable!("rejected before any mutation, above"),
+            EscrowPurpose::DisputeBond { .. } | EscrowPurpose::FundExchangeAccount => {
+                unreachable!("rejected before any mutation, above")
+            }
         };
         let task = self.tasks.get_mut(&task_id).expect("just created above, must still exist");
         task.escrow_id = Some(id);
@@ -1529,6 +1621,341 @@ impl TaskBoard {
 
     pub fn all_faucet_grants(&self) -> impl Iterator<Item = &PublicKey> {
         self.faucet_grants.iter()
+    }
+
+    pub fn exchange_account(&self, pubkey: &PublicKey) -> ExchangeAccount {
+        self.exchange_accounts.get(pubkey).cloned().unwrap_or_default()
+    }
+
+    /// Restores an exchange account previously persisted by `HubStore`.
+    pub fn restore_exchange_account(&mut self, pubkey: PublicKey, account: ExchangeAccount) {
+        self.exchange_accounts.insert(pubkey, account);
+    }
+
+    pub fn all_exchange_accounts(&self) -> impl Iterator<Item = (&PublicKey, &ExchangeAccount)> {
+        self.exchange_accounts.iter()
+    }
+
+    /// Confirms a `FundExchangeAccount` deposit is now sufficiently
+    /// funded (at least `handlers::MIN_EXCHANGE_DEPOSIT`, unlike a task
+    /// escrow there is no fixed target) and credits the depositor's
+    /// ledger balance with `observed_amount` net of `network_fee` -- the
+    /// fee the eventual custody sweep will pay to move this deposit's
+    /// UTXO, reserved up front so the credited balance is never more
+    /// than what will actually be recoverable on-chain. Same rejection
+    /// shape as `confirm_escrow`. Returns `(depositor, credited_amount)`.
+    pub fn confirm_exchange_deposit(
+        &mut self,
+        id: Uuid,
+        observed_amount: u64,
+        network_fee: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(PublicKey, u64), BoardError> {
+        let deposit = self.pending_deposits.get(&id).ok_or(BoardError::EscrowNotFound)?;
+        if !matches!(deposit.purpose, EscrowPurpose::FundExchangeAccount) {
+            return Err(BoardError::WrongEscrowPurpose);
+        }
+        if deposit.status != EscrowStatus::Reserved {
+            return Err(BoardError::EscrowNotReserved);
+        }
+        if now > deposit.expires_at {
+            return Err(BoardError::EscrowExpired);
+        }
+        if observed_amount < deposit.required_amount {
+            return Err(BoardError::EscrowUnderfunded {
+                required: deposit.required_amount,
+                have: observed_amount,
+            });
+        }
+        let depositor = deposit.depositor.clone();
+        let credited = observed_amount.saturating_sub(network_fee);
+
+        self.pending_deposits
+            .get_mut(&id)
+            .expect("existence checked above")
+            .status = EscrowStatus::Consumed;
+        self.exchange_accounts.entry(depositor.clone()).or_default().base_balance += credited;
+        Ok((depositor, credited))
+    }
+
+    /// Every `FundExchangeAccount` deposit that's been confirmed (ledger
+    /// already credited) but not yet swept into the pooled custody
+    /// address -- polled by the sweep loop, mirroring
+    /// `overdue_reserved_escrows`'s role for expired reservations.
+    /// Selecting only `Consumed` (never `Refunded`) deposits makes a
+    /// retry naturally idempotent: once swept and marked `Refunded` by
+    /// `handlers::sweep_exchange_deposit`, a deposit drops out of this
+    /// list for good.
+    pub fn unswept_exchange_deposits(&self) -> Vec<Uuid> {
+        self.pending_deposits
+            .values()
+            .filter(|d| d.status == EscrowStatus::Consumed && matches!(d.purpose, EscrowPurpose::FundExchangeAccount))
+            .map(|d| d.id)
+            .collect()
+    }
+
+    /// Credits `recipient`'s tradeable compute balance -- the reward for
+    /// a task payout tagged with the `"compute"` capability (see
+    /// `handlers::settle_one_payout_inner`/`settle_escrow_funded_task`).
+    /// Mirrors `credit_forfeited_bond` exactly: a plain balance credit
+    /// with no reputation side effect, since reputation was already
+    /// handled by the payout itself.
+    pub fn credit_compute(&mut self, recipient: &PublicKey, amount: u64) {
+        self.exchange_accounts.entry(recipient.clone()).or_default().compute_balance += amount;
+    }
+
+    /// Atomically checks and debits `owner`'s withdrawable balance in one
+    /// step -- the single guard that stops two concurrent withdrawal
+    /// requests from jointly overdrawing the same ledger balance
+    /// (mirrors `record_faucet_grant`'s atomic-reserve shape). Callers
+    /// must call `credit_back_withdrawal` if the payout that was
+    /// supposed to follow this debit then fails.
+    pub fn debit_for_withdrawal(&mut self, owner: &PublicKey, amount: u64) -> Result<(), BoardError> {
+        let account = self.exchange_accounts.entry(owner.clone()).or_default();
+        let available = account.base_balance.saturating_sub(account.locked_base);
+        if available < amount {
+            return Err(BoardError::InsufficientBalance { available, required: amount });
+        }
+        account.base_balance -= amount;
+        Ok(())
+    }
+
+    /// Reverses a `debit_for_withdrawal` whose payout failed.
+    pub fn credit_back_withdrawal(&mut self, owner: &PublicKey, amount: u64) {
+        self.exchange_accounts.entry(owner.clone()).or_default().base_balance += amount;
+    }
+
+    /// The best (price-time priority) resting order on the opposite side
+    /// of `taker` that it's actually allowed to match against: open,
+    /// crosses `taker`'s price, and not owned by `taker`'s own owner
+    /// (mirrors the unconditional `PosterCannotClaimOwnTask` precedent --
+    /// a self-tradeable book is a manipulable one, and `/exchange/trades`
+    /// is meant to be a real pricing feed).
+    fn best_resting_match(&self, taker: &Order) -> Option<Uuid> {
+        let opposite = match taker.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let mut candidates: Vec<&Order> = self
+            .orders
+            .values()
+            .filter(|o| {
+                o.status == OrderStatus::Open
+                    && o.side == opposite
+                    && o.owner != taker.owner
+                    && match taker.side {
+                        Side::Buy => o.price <= taker.price,
+                        Side::Sell => o.price >= taker.price,
+                    }
+            })
+            .collect();
+        match taker.side {
+            // Best ask for a buyer: lowest price, then earliest.
+            Side::Buy => candidates.sort_by(|a, b| a.price.cmp(&b.price).then(a.created_at.cmp(&b.created_at))),
+            // Best bid for a seller: highest price, then earliest.
+            Side::Sell => candidates.sort_by(|a, b| b.price.cmp(&a.price).then(a.created_at.cmp(&b.created_at))),
+        }
+        candidates.first().map(|o| o.id)
+    }
+
+    /// Places a limit order, locking the full notional up front (a buy
+    /// locks `price * quantity` base; a sell locks `quantity` compute --
+    /// validated against overflow before anything is locked), then
+    /// matches it immediately against any crossing resting orders in
+    /// price-time priority, filling at each resting (maker) order's own
+    /// price rather than this order's own limit price.
+    ///
+    /// The lock/settle reconciliation is the one genuinely tricky part:
+    /// the buy side's lock was taken at *its own* price, which is not
+    /// always the same number as the execution price, so releasing it
+    /// naively either strands funds or silently overdrafts. Every fill
+    /// releases the buy order's lock at the buy order's own price and
+    /// debits the buyer's spendable balance at the (always equal or
+    /// better) execution price -- when the buy side is the resting
+    /// order these are identical, no slack; when the buy side is the
+    /// taker, the difference becomes available balance again, i.e. a
+    /// taker who crossed a better-priced resting order gets the
+    /// improvement credited back rather than losing it. The sell side's
+    /// lock is quantity-only, so it always releases 1:1 with fill
+    /// quantity, no equivalent correction needed there.
+    pub fn place_order(
+        &mut self,
+        owner: PublicKey,
+        side: Side,
+        price: u64,
+        quantity: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(Order, Vec<Trade>), BoardError> {
+        if price == 0 || quantity == 0 {
+            return Err(BoardError::InvalidOrder);
+        }
+        let notional = price.checked_mul(quantity).ok_or(BoardError::OrderNotionalOverflow)?;
+
+        {
+            let account = self.exchange_accounts.entry(owner.clone()).or_default();
+            match side {
+                Side::Buy => {
+                    let available = account.base_balance.saturating_sub(account.locked_base);
+                    if available < notional {
+                        return Err(BoardError::InsufficientBalance { available, required: notional });
+                    }
+                    account.locked_base += notional;
+                }
+                Side::Sell => {
+                    let available = account.compute_balance.saturating_sub(account.locked_compute);
+                    if available < quantity {
+                        return Err(BoardError::InsufficientBalance { available, required: quantity });
+                    }
+                    account.locked_compute += quantity;
+                }
+            }
+        }
+
+        let mut taker = Order {
+            id: Uuid::new_v4(),
+            owner: owner.clone(),
+            side,
+            price,
+            quantity,
+            filled: 0,
+            status: OrderStatus::Open,
+            created_at: now,
+        };
+
+        let mut trades = Vec::new();
+        while taker.filled < taker.quantity {
+            let Some(resting_id) = self.best_resting_match(&taker) else { break };
+            let resting = self.orders.get(&resting_id).expect("just found by best_resting_match").clone();
+
+            let fill_qty = (taker.quantity - taker.filled).min(resting.quantity - resting.filled);
+            let execution_price = resting.price;
+
+            {
+                let r = self.orders.get_mut(&resting_id).expect("just found by best_resting_match");
+                r.filled += fill_qty;
+                if r.filled >= r.quantity {
+                    r.status = OrderStatus::Filled;
+                }
+            }
+            taker.filled += fill_qty;
+
+            let (buy_owner, buy_price, sell_owner) = match taker.side {
+                Side::Buy => (taker.owner.clone(), taker.price, resting.owner.clone()),
+                Side::Sell => (resting.owner.clone(), resting.price, taker.owner.clone()),
+            };
+
+            {
+                let buyer_account = self.exchange_accounts.entry(buy_owner.clone()).or_default();
+                buyer_account.locked_base -= buy_price * fill_qty;
+                buyer_account.base_balance -= execution_price * fill_qty;
+                buyer_account.compute_balance += fill_qty;
+            }
+            {
+                let seller_account = self.exchange_accounts.entry(sell_owner.clone()).or_default();
+                seller_account.locked_compute -= fill_qty;
+                seller_account.compute_balance -= fill_qty;
+                seller_account.base_balance += execution_price * fill_qty;
+            }
+
+            let (buy_order_id, sell_order_id) = match taker.side {
+                Side::Buy => (taker.id, resting.id),
+                Side::Sell => (resting.id, taker.id),
+            };
+            trades.push(Trade {
+                id: Uuid::new_v4(),
+                buy_order_id,
+                sell_order_id,
+                buyer: buy_owner,
+                seller: sell_owner,
+                price: execution_price,
+                quantity: fill_qty,
+                executed_at: now,
+            });
+        }
+
+        if taker.filled >= taker.quantity {
+            taker.status = OrderStatus::Filled;
+        }
+        self.orders.insert(taker.id, taker.clone());
+        for trade in &trades {
+            self.trades.insert(trade.id, trade.clone());
+        }
+        Ok((taker, trades))
+    }
+
+    /// Cancels an open (or partially filled) order, releasing whatever
+    /// remains of its locked balance back to the owner. Rejects a
+    /// non-owner caller or an already-terminal (`Filled`/`Cancelled`)
+    /// order.
+    pub fn cancel_order(&mut self, order_id: Uuid, caller: &PublicKey) -> Result<Order, BoardError> {
+        let order = self.orders.get(&order_id).ok_or(BoardError::OrderNotFound)?;
+        if &order.owner != caller {
+            return Err(BoardError::NotOrderOwner);
+        }
+        if order.status != OrderStatus::Open {
+            return Err(BoardError::OrderNotOpen);
+        }
+        let remaining = order.quantity - order.filled;
+        let (side, price, owner) = (order.side, order.price, order.owner.clone());
+
+        let order = self.orders.get_mut(&order_id).expect("existence checked above");
+        order.status = OrderStatus::Cancelled;
+        let cancelled = order.clone();
+
+        let account = self.exchange_accounts.entry(owner).or_default();
+        match side {
+            Side::Buy => account.locked_base -= price * remaining,
+            Side::Sell => account.locked_compute -= remaining,
+        }
+        Ok(cancelled)
+    }
+
+    pub fn get_order(&self, id: Uuid) -> Option<&Order> {
+        self.orders.get(&id)
+    }
+
+    /// Every open order, split by side and sorted best-first: bids by
+    /// price descending then earliest first, asks by price ascending
+    /// then earliest first -- the same ordering `best_resting_match`
+    /// uses internally, exposed here for the order-book endpoint.
+    pub fn order_book(&self) -> (Vec<&Order>, Vec<&Order>) {
+        let mut bids: Vec<&Order> = self
+            .orders
+            .values()
+            .filter(|o| o.status == OrderStatus::Open && o.side == Side::Buy)
+            .collect();
+        let mut asks: Vec<&Order> = self
+            .orders
+            .values()
+            .filter(|o| o.status == OrderStatus::Open && o.side == Side::Sell)
+            .collect();
+        bids.sort_by(|a, b| b.price.cmp(&a.price).then(a.created_at.cmp(&b.created_at)));
+        asks.sort_by(|a, b| a.price.cmp(&b.price).then(a.created_at.cmp(&b.created_at)));
+        (bids, asks)
+    }
+
+    /// Restores an order previously persisted by `HubStore`.
+    pub fn restore_order(&mut self, order: Order) {
+        self.orders.insert(order.id, order);
+    }
+
+    pub fn all_orders(&self) -> impl Iterator<Item = &Order> {
+        self.orders.values()
+    }
+
+    pub fn all_trades_newest_first(&self) -> Vec<&Trade> {
+        let mut trades: Vec<&Trade> = self.trades.values().collect();
+        trades.sort_by(|a, b| b.executed_at.cmp(&a.executed_at));
+        trades
+    }
+
+    /// Restores a trade previously persisted by `HubStore`.
+    pub fn restore_trade(&mut self, trade: Trade) {
+        self.trades.insert(trade.id, trade);
+    }
+
+    pub fn all_trades(&self) -> impl Iterator<Item = &Trade> {
+        self.trades.values()
     }
 }
 
@@ -2637,5 +3064,451 @@ mod tests {
 
         board.cancel_task(task_id).unwrap();
         assert_eq!(board.get_task(task_id).unwrap().status, TaskStatus::Closed);
+    }
+
+    // ---- Exchange v1 ----
+
+    #[test]
+    fn exchange_account_defaults_to_zero_for_a_new_pubkey() {
+        let board = TaskBoard::new();
+        let account = board.exchange_account(&pubkey());
+        assert_eq!(account.base_balance, 0);
+        assert_eq!(account.locked_base, 0);
+        assert_eq!(account.compute_balance, 0);
+        assert_eq!(account.locked_compute, 0);
+    }
+
+    #[test]
+    fn confirm_exchange_deposit_credits_net_of_fee() {
+        let mut board = TaskBoard::new();
+        let depositor = pubkey();
+        let deposit = board.reserve_escrow(
+            depositor.clone(),
+            1,
+            EscrowPurpose::FundExchangeAccount,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        let (credited_to, credited_amount) =
+            board.confirm_exchange_deposit(deposit.id, 10_000, 1_000, Utc::now()).unwrap();
+
+        assert_eq!(credited_to, depositor);
+        assert_eq!(credited_amount, 9_000);
+        assert_eq!(board.exchange_account(&depositor).base_balance, 9_000);
+        assert_eq!(board.get_pending_deposit(deposit.id).unwrap().status, EscrowStatus::Consumed);
+    }
+
+    #[test]
+    fn confirm_exchange_deposit_rejects_wrong_purpose() {
+        let mut board = TaskBoard::new();
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 100,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+            capabilities: BTreeSet::new(),
+        };
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            100,
+            EscrowPurpose::FundHashMatchTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        assert!(matches!(
+            board.confirm_exchange_deposit(deposit.id, 100, 0, Utc::now()),
+            Err(BoardError::WrongEscrowPurpose)
+        ));
+    }
+
+    #[test]
+    fn confirm_exchange_deposit_rejects_underfunded() {
+        let mut board = TaskBoard::new();
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            1_001,
+            EscrowPurpose::FundExchangeAccount,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        assert!(matches!(
+            board.confirm_exchange_deposit(deposit.id, 1_000, 0, Utc::now()),
+            Err(BoardError::EscrowUnderfunded { required: 1_001, have: 1_000 })
+        ));
+    }
+
+    #[test]
+    fn confirm_exchange_deposit_rejects_expired() {
+        let mut board = TaskBoard::new();
+        let now = Utc::now();
+        let deposit =
+            board.reserve_escrow(pubkey(), 1, EscrowPurpose::FundExchangeAccount, now + chrono::Duration::minutes(5));
+
+        assert!(matches!(
+            board.confirm_exchange_deposit(deposit.id, 10_000, 0, now + chrono::Duration::minutes(6)),
+            Err(BoardError::EscrowExpired)
+        ));
+    }
+
+    #[test]
+    fn confirm_exchange_deposit_rejects_already_consumed() {
+        let mut board = TaskBoard::new();
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            1,
+            EscrowPurpose::FundExchangeAccount,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        board.confirm_exchange_deposit(deposit.id, 10_000, 0, Utc::now()).unwrap();
+
+        assert!(matches!(
+            board.confirm_exchange_deposit(deposit.id, 10_000, 0, Utc::now()),
+            Err(BoardError::EscrowNotReserved)
+        ));
+    }
+
+    #[test]
+    fn confirm_exchange_deposit_rejects_missing() {
+        let mut board = TaskBoard::new();
+        assert!(matches!(
+            board.confirm_exchange_deposit(Uuid::new_v4(), 10_000, 0, Utc::now()),
+            Err(BoardError::EscrowNotFound)
+        ));
+    }
+
+    #[test]
+    fn confirm_escrow_rejects_a_fund_exchange_account_purpose() {
+        let mut board = TaskBoard::new();
+        let deposit = board.reserve_escrow(
+            pubkey(),
+            1,
+            EscrowPurpose::FundExchangeAccount,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+
+        assert!(matches!(
+            board.confirm_escrow(deposit.id, 10_000, Utc::now()),
+            Err(BoardError::WrongEscrowPurpose)
+        ));
+    }
+
+    #[test]
+    fn unswept_exchange_deposits_lists_only_consumed_exchange_deposits() {
+        let mut board = TaskBoard::new();
+        let confirmed = board.reserve_escrow(
+            pubkey(),
+            1,
+            EscrowPurpose::FundExchangeAccount,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        let still_reserved = board.reserve_escrow(
+            pubkey(),
+            1,
+            EscrowPurpose::FundExchangeAccount,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        let intent = TaskIntent {
+            description: "t".to_string(),
+            bounty: 100,
+            expected_output_hash: Hash::hash_bytes(b"x"),
+            min_reputation: 0,
+            capabilities: BTreeSet::new(),
+        };
+        let unrelated = board.reserve_escrow(
+            pubkey(),
+            100,
+            EscrowPurpose::FundHashMatchTask(intent),
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        board.confirm_exchange_deposit(confirmed.id, 10_000, 0, Utc::now()).unwrap();
+        board.confirm_escrow(unrelated.id, 100, Utc::now()).unwrap();
+
+        assert_eq!(board.unswept_exchange_deposits(), vec![confirmed.id]);
+        assert_eq!(board.get_pending_deposit(still_reserved.id).unwrap().status, EscrowStatus::Reserved);
+    }
+
+    #[test]
+    fn place_order_locks_the_correct_balance_for_a_buy() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+
+        let (order, trades) = board.place_order(owner.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        assert!(trades.is_empty(), "no resting sell orders to match against");
+        assert_eq!(order.status, OrderStatus::Open);
+        let account = board.exchange_account(&owner);
+        assert_eq!(account.locked_base, 500, "10 price * 50 quantity");
+        assert_eq!(account.base_balance, 1_000, "balance itself untouched, only locked, until it actually fills");
+    }
+
+    #[test]
+    fn place_order_locks_the_correct_balance_for_a_sell() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { compute_balance: 100, ..Default::default() });
+
+        let (order, trades) = board.place_order(owner.clone(), Side::Sell, 10, 40, Utc::now()).unwrap();
+
+        assert!(trades.is_empty());
+        assert_eq!(order.status, OrderStatus::Open);
+        let account = board.exchange_account(&owner);
+        assert_eq!(account.locked_compute, 40);
+        assert_eq!(account.compute_balance, 100);
+    }
+
+    #[test]
+    fn place_order_rejects_insufficient_available_balance() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 100, ..Default::default() });
+
+        assert!(matches!(
+            board.place_order(owner, Side::Buy, 10, 20, Utc::now()),
+            Err(BoardError::InsufficientBalance { available: 100, required: 200 })
+        ));
+    }
+
+    #[test]
+    fn place_order_rejects_when_balance_already_locked_by_another_open_order() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+        board.place_order(owner.clone(), Side::Buy, 10, 90, Utc::now()).unwrap(); // locks 900
+
+        assert!(matches!(
+            board.place_order(owner, Side::Buy, 10, 20, Utc::now()), // needs 200, only 100 free
+            Err(BoardError::InsufficientBalance { available: 100, required: 200 })
+        ));
+    }
+
+    #[test]
+    fn place_order_rejects_zero_price_or_quantity() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        assert!(matches!(board.place_order(owner.clone(), Side::Buy, 0, 10, Utc::now()), Err(BoardError::InvalidOrder)));
+        assert!(matches!(board.place_order(owner, Side::Buy, 10, 0, Utc::now()), Err(BoardError::InvalidOrder)));
+    }
+
+    #[test]
+    fn place_order_rejects_overflowing_notional() {
+        let mut board = TaskBoard::new();
+        assert!(matches!(
+            board.place_order(pubkey(), Side::Buy, u64::MAX, 2, Utc::now()),
+            Err(BoardError::OrderNotionalOverflow)
+        ));
+    }
+
+    #[test]
+    fn matching_fills_at_the_resting_makers_price_not_the_takers() {
+        let mut board = TaskBoard::new();
+        let seller = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 100, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 10_000, ..Default::default() });
+
+        board.place_order(seller.clone(), Side::Sell, 8, 50, Utc::now()).unwrap(); // resting ask at 8
+        let (order, trades) = board.place_order(buyer.clone(), Side::Buy, 10, 50, Utc::now()).unwrap(); // taker bid at 10, crosses
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].price, 8, "fills at the resting maker's price, not the taker's own limit");
+        assert_eq!(trades[0].quantity, 50);
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(board.exchange_account(&seller).base_balance, 400, "50 * 8");
+        assert_eq!(board.exchange_account(&buyer).compute_balance, 50);
+    }
+
+    #[test]
+    fn taker_price_improvement_credits_the_slack_back_to_available_balance() {
+        let mut board = TaskBoard::new();
+        let seller = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 50, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+
+        board.place_order(seller, Side::Sell, 8, 50, Utc::now()).unwrap();
+        board.place_order(buyer.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        let account = board.exchange_account(&buyer);
+        // Locked 500 (10*50) at placement, then the fill at 8 debits only
+        // 400 and releases the full 500 lock -- the 100 difference must
+        // land back in available balance (base_balance - locked_base),
+        // not get stranded in a lock that's no longer covering anything.
+        assert_eq!(account.base_balance, 600, "1000 - 400 actually spent");
+        assert_eq!(account.locked_base, 0, "fully filled, nothing left locked");
+    }
+
+    #[test]
+    fn partial_fill_leaves_the_order_open_with_reduced_locked_amount() {
+        let mut board = TaskBoard::new();
+        let seller = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 20, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+
+        board.place_order(seller, Side::Sell, 10, 20, Utc::now()).unwrap();
+        let (order, trades) = board.place_order(buyer.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].quantity, 20);
+        assert_eq!(order.status, OrderStatus::Open, "50 requested, only 20 filled");
+        assert_eq!(order.filled, 20);
+        let account = board.exchange_account(&buyer);
+        assert_eq!(account.locked_base, 300, "30 remaining unfilled quantity * price 10");
+    }
+
+    #[test]
+    fn full_fill_across_multiple_resting_orders_releases_locked_balance_to_exactly_zero() {
+        let mut board = TaskBoard::new();
+        let seller_a = pubkey();
+        let seller_b = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller_a.clone(), ExchangeAccount { compute_balance: 30, ..Default::default() });
+        board.restore_exchange_account(seller_b.clone(), ExchangeAccount { compute_balance: 30, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+
+        board.place_order(seller_a, Side::Sell, 10, 30, Utc::now()).unwrap();
+        board.place_order(seller_b, Side::Sell, 10, 30, Utc::now()).unwrap();
+        let (order, trades) = board.place_order(buyer.clone(), Side::Buy, 10, 60, Utc::now()).unwrap();
+
+        assert_eq!(trades.len(), 2, "one taker order filled across two resting makers");
+        assert_eq!(order.status, OrderStatus::Filled);
+        let account = board.exchange_account(&buyer);
+        assert_eq!(account.locked_base, 0);
+        assert_eq!(account.base_balance, 400, "1000 - 600 spent across both fills");
+    }
+
+    #[test]
+    fn price_time_priority_matches_the_earliest_order_at_a_tied_price() {
+        let mut board = TaskBoard::new();
+        let earlier = pubkey();
+        let later = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(earlier.clone(), ExchangeAccount { compute_balance: 10, ..Default::default() });
+        board.restore_exchange_account(later.clone(), ExchangeAccount { compute_balance: 10, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+        let now = Utc::now();
+
+        board.place_order(earlier.clone(), Side::Sell, 10, 10, now).unwrap();
+        board.place_order(later, Side::Sell, 10, 10, now + chrono::Duration::seconds(1)).unwrap();
+        let (_, trades) = board.place_order(buyer, Side::Buy, 10, 10, now + chrono::Duration::seconds(2)).unwrap();
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].seller, earlier, "same price -- earliest resting order wins");
+    }
+
+    #[test]
+    fn orders_never_self_trade() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(
+            owner.clone(),
+            ExchangeAccount { base_balance: 1_000, compute_balance: 100, ..Default::default() },
+        );
+
+        board.place_order(owner.clone(), Side::Sell, 10, 50, Utc::now()).unwrap();
+        let (order, trades) = board.place_order(owner, Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        assert!(trades.is_empty(), "must not match against its own resting order");
+        assert_eq!(order.status, OrderStatus::Open);
+    }
+
+    #[test]
+    fn cancel_order_releases_remaining_locked_balance() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+        let (order, _) = board.place_order(owner.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        let cancelled = board.cancel_order(order.id, &owner).unwrap();
+
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert_eq!(board.exchange_account(&owner).locked_base, 0);
+    }
+
+    #[test]
+    fn cancel_order_after_a_partial_fill_releases_only_the_unfilled_remainder() {
+        let mut board = TaskBoard::new();
+        let seller = pubkey();
+        let buyer = pubkey();
+        board.restore_exchange_account(seller.clone(), ExchangeAccount { compute_balance: 20, ..Default::default() });
+        board.restore_exchange_account(buyer.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+        board.place_order(seller, Side::Sell, 10, 20, Utc::now()).unwrap();
+        let (order, _) = board.place_order(buyer.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+        assert_eq!(board.exchange_account(&buyer).locked_base, 300, "30 unfilled remaining * 10");
+
+        board.cancel_order(order.id, &buyer).unwrap();
+
+        assert_eq!(board.exchange_account(&buyer).locked_base, 0);
+    }
+
+    #[test]
+    fn cancel_order_rejects_non_owner() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+        let (order, _) = board.place_order(owner, Side::Buy, 10, 50, Utc::now()).unwrap();
+
+        assert!(matches!(board.cancel_order(order.id, &pubkey()), Err(BoardError::NotOrderOwner)));
+    }
+
+    #[test]
+    fn cancel_order_rejects_an_already_terminal_order() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 1_000, ..Default::default() });
+        let (order, _) = board.place_order(owner.clone(), Side::Buy, 10, 50, Utc::now()).unwrap();
+        board.cancel_order(order.id, &owner).unwrap();
+
+        assert!(matches!(board.cancel_order(order.id, &owner), Err(BoardError::OrderNotOpen)));
+    }
+
+    #[test]
+    fn order_book_lists_bids_and_asks_best_first() {
+        let mut board = TaskBoard::new();
+        let a = pubkey();
+        let b = pubkey();
+        board.restore_exchange_account(
+            a.clone(),
+            ExchangeAccount { base_balance: 1_000, compute_balance: 100, ..Default::default() },
+        );
+        board.restore_exchange_account(
+            b.clone(),
+            ExchangeAccount { base_balance: 1_000, compute_balance: 100, ..Default::default() },
+        );
+
+        board.place_order(a.clone(), Side::Buy, 5, 10, Utc::now()).unwrap();
+        board.place_order(b.clone(), Side::Buy, 8, 10, Utc::now()).unwrap();
+        board.place_order(a, Side::Sell, 20, 10, Utc::now()).unwrap();
+        board.place_order(b, Side::Sell, 15, 10, Utc::now()).unwrap();
+
+        let (bids, asks) = board.order_book();
+        assert_eq!(bids.iter().map(|o| o.price).collect::<Vec<_>>(), vec![8, 5], "bids best (highest) first");
+        assert_eq!(asks.iter().map(|o| o.price).collect::<Vec<_>>(), vec![15, 20], "asks best (lowest) first");
+    }
+
+    #[test]
+    fn debit_for_withdrawal_rejects_amount_exceeding_available_balance() {
+        let mut board = TaskBoard::new();
+        let owner = pubkey();
+        board.restore_exchange_account(owner.clone(), ExchangeAccount { base_balance: 100, ..Default::default() });
+
+        assert!(matches!(
+            board.debit_for_withdrawal(&owner, 101),
+            Err(BoardError::InsufficientBalance { available: 100, required: 101 })
+        ));
+        assert_eq!(board.exchange_account(&owner).base_balance, 100, "rejected debit must not touch the balance");
+
+        board.debit_for_withdrawal(&owner, 100).unwrap();
+        assert_eq!(board.exchange_account(&owner).base_balance, 0);
+    }
+
+    #[test]
+    fn credit_compute_accumulates_across_multiple_calls() {
+        let mut board = TaskBoard::new();
+        let recipient = pubkey();
+        board.credit_compute(&recipient, 10);
+        board.credit_compute(&recipient, 5);
+        assert_eq!(board.exchange_account(&recipient).compute_balance, 15);
     }
 }

@@ -53,6 +53,21 @@ pub struct AppState {
     /// and would go on to call `mark_recipient_paid`/`save_faucet_grant`
     /// anyway.
     pub payout_lock: Mutex<()>,
+    /// The exchange's pooled custody address -- deliberately a *separate*
+    /// key from `operator_private_key`, not a reuse of it, so exchange
+    /// liabilities (money owed back to depositors) never comingle with
+    /// `ensure_operator_can_fund`'s `balance - allocated_bounty() >=
+    /// bounty` math, which has no concept of that. Every confirmed
+    /// exchange deposit is swept here (see `handlers::sweep_exchange_deposit`);
+    /// withdrawals pay back out of it via the same `pay_from` every other
+    /// hub payment already uses.
+    pub exchange_custody_private_key: PrivateKey,
+    pub exchange_custody_public_key: PublicKey,
+    /// Same reasoning as `payout_lock`, scoped to the custody address's
+    /// own UTXO set instead of the operator's -- a different key, a
+    /// different UTXO set, no reason to serialize exchange withdrawals
+    /// against unrelated operator payouts (or vice versa).
+    pub exchange_custody_payout_lock: Mutex<()>,
 }
 
 #[derive(FromArgs)]
@@ -71,13 +86,16 @@ struct Args {
     #[argh(option, default = "String::from(\"./hub_operator.priv.cbor\")")]
     /// path to the operator's private key (generated on first run if missing)
     operator_key_file: String,
+    #[argh(option, default = "String::from(\"./hub_exchange_custody.priv.cbor\")")]
+    /// path to the exchange's pooled custody private key (generated on first run if missing)
+    exchange_custody_key_file: String,
 }
 
-fn load_or_create_operator_key(path: &str) -> Result<PrivateKey> {
+fn load_or_create_key(path: &str) -> Result<PrivateKey> {
     match PrivateKey::load_from_file(path) {
         Ok(key) => Ok(key),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("no operator key found at {path}, generating a new one...");
+            println!("no key found at {path}, generating a new one...");
             let key = PrivateKey::new_key();
             key.save_to_file(path)?;
             Ok(key)
@@ -208,6 +226,13 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
         }
     }
 
+    let unswept: Vec<Uuid> = state.board.read().await.unswept_exchange_deposits();
+    for deposit_id in unswept {
+        if handlers::sweep_exchange_deposit(state, deposit_id).await {
+            println!("sweep: swept exchange deposit {deposit_id} into pooled custody");
+        }
+    }
+
     auth::cleanup_replay_guard();
 }
 
@@ -230,11 +255,16 @@ async fn persist_task_by_id(state: &AppState, task_id: Uuid, context: &str) -> O
 async fn main() -> Result<()> {
     let args: Args = argh::from_env();
 
-    let operator_private_key = load_or_create_operator_key(&args.operator_key_file)?;
+    let operator_private_key = load_or_create_key(&args.operator_key_file)?;
     let operator_public_key = operator_private_key.public_key();
+    let exchange_custody_private_key = load_or_create_key(&args.exchange_custody_key_file)?;
+    let exchange_custody_public_key = exchange_custody_private_key.public_key();
     println!("================================================================");
     println!("hub operator address -- fund this so the hub can pay out tasks/faucet grants:");
     println!("{operator_public_key}");
+    println!("exchange custody address -- watch this for solvency (its on-chain balance");
+    println!("should always be >= the sum of every ExchangeAccount.base_balance):");
+    println!("{exchange_custody_public_key}");
     println!("================================================================");
 
     let store = HubStore::open_or_create(&args.store_file)?;
@@ -251,12 +281,25 @@ async fn main() -> Result<()> {
     for deposit in store.load_all_pending_deposits()? {
         board.restore_pending_deposit(deposit);
     }
+    for (pubkey, account) in store.load_all_exchange_accounts()? {
+        board.restore_exchange_account(pubkey, account);
+    }
+    for order in store.load_all_orders()? {
+        board.restore_order(order);
+    }
+    for trade in store.load_all_trades()? {
+        board.restore_trade(trade);
+    }
     println!(
-        "loaded {} task(s), {} reputation record(s), {} faucet grant(s), {} pending escrow deposit(s) from store",
+        "loaded {} task(s), {} reputation record(s), {} faucet grant(s), {} pending escrow deposit(s), \
+         {} exchange account(s), {} order(s), {} trade(s) from store",
         board.all_tasks().count(),
         board.all_reputation().count(),
         board.all_faucet_grants().count(),
-        board.all_pending_deposits().count()
+        board.all_pending_deposits().count(),
+        board.all_exchange_accounts().count(),
+        board.all_orders().count(),
+        board.all_trades().count(),
     );
 
     let state = Arc::new(AppState {
@@ -266,6 +309,9 @@ async fn main() -> Result<()> {
         operator_private_key,
         operator_public_key,
         payout_lock: Mutex::new(()),
+        exchange_custody_private_key,
+        exchange_custody_public_key,
+        exchange_custody_payout_lock: Mutex::new(()),
     });
 
     tokio::spawn(sweep_loop(state.clone()));
@@ -315,6 +361,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/reputation/:pubkey", get(handlers::get_reputation))
         .route("/leaderboard", get(handlers::leaderboard))
         .route("/llms.txt", get(handlers::llms_txt))
+        .route("/exchange/deposit", post(handlers::create_exchange_deposit))
+        .route("/exchange/deposit/:id/confirm", post(handlers::confirm_exchange_deposit))
+        .route("/exchange/orders", get(handlers::get_order_book).post(handlers::place_order))
+        .route("/exchange/orders/:id/cancel", post(handlers::cancel_order))
+        .route("/exchange/account/:pubkey", get(handlers::get_exchange_account))
+        .route("/exchange/withdraw", post(handlers::withdraw))
+        .route("/exchange/trades", get(handlers::list_trades))
         .layer(cors)
         .with_state(state)
 }
@@ -482,6 +535,8 @@ mod tests {
         let operator_public_key = operator_private_key.public_key();
         let store_path = temp_store_path();
         let store = HubStore::open_or_create(&store_path).unwrap();
+        let exchange_custody_private_key = PrivateKey::new_key();
+        let exchange_custody_public_key = exchange_custody_private_key.public_key();
         let state = Arc::new(AppState {
             board: RwLock::new(TaskBoard::new()),
             store,
@@ -489,6 +544,9 @@ mod tests {
             operator_private_key: operator_private_key.clone(),
             operator_public_key,
             payout_lock: Mutex::new(()),
+            exchange_custody_private_key,
+            exchange_custody_public_key,
+            exchange_custody_payout_lock: Mutex::new(()),
         });
 
         let app = build_router(state.clone());
@@ -2412,5 +2470,331 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(task["status"], "Disputed", "must not have resolved");
+    }
+
+    // ---- Exchange v1 ----
+
+    /// Directly credits `owner`'s exchange ledger balance, bypassing the
+    /// deposit flow entirely -- mirrors `seed_verified_task`'s role for
+    /// task settlement tests: order/withdrawal tests exercise the HTTP
+    /// layer they're actually about without also depending on a
+    /// separate flow (deposit confirmation) each time.
+    async fn seed_exchange_account(state: &AppState, owner: &PublicKey, base_balance: u64, compute_balance: u64) {
+        let mut board = state.board.write().await;
+        board.restore_exchange_account(
+            owner.clone(),
+            board::ExchangeAccount { base_balance, locked_base: 0, compute_balance, locked_compute: 0 },
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_deposit_confirm_credits_ledger_and_sweeps_to_custody() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+
+        let reservation: Value = hub
+            .client
+            .post(format!("{}/exchange/deposit", hub.base_url))
+            .json(&envelope(&agent_key, ()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let escrow_id: Uuid = reservation["escrow_id"].as_str().unwrap().parse().unwrap();
+        let deposit_pubkey = parse_pubkey(reservation["deposit_address"].as_str().unwrap());
+
+        fake_node.fund(deposit_pubkey, 10_000).await;
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/deposit/{escrow_id}/confirm", hub.base_url))
+            .json(&envelope(&agent_key, handlers::ConfirmExchangeDepositPayload { escrow_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let account: Value = resp.json().await.unwrap();
+        assert_eq!(account["base_balance"], 10_000 - 1_000, "credited net of HUB_TRANSACTION_FEE");
+
+        // The inline sweep attempted right after confirmation should have
+        // paid the pooled custody address.
+        let submitted = fake_node.wait_for_submitted_count(1).await;
+        assert_eq!(submitted.len(), 1);
+        let custody_pubkey = hub.state.exchange_custody_public_key.clone();
+        assert!(
+            submitted[0].outputs.iter().any(|o| o.pubkey == custody_pubkey),
+            "the sweep transaction must pay the pooled custody address"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_deposit_confirm_rejects_when_underfunded() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+
+        let reservation: Value = hub
+            .client
+            .post(format!("{}/exchange/deposit", hub.base_url))
+            .json(&envelope(&agent_key, ()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let escrow_id: Uuid = reservation["escrow_id"].as_str().unwrap().parse().unwrap();
+        let deposit_pubkey = parse_pubkey(reservation["deposit_address"].as_str().unwrap());
+        let required = reservation["required_amount"].as_u64().unwrap();
+
+        fake_node.fund(deposit_pubkey, required - 1).await;
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/deposit/{escrow_id}/confirm", hub.base_url))
+            .json(&envelope(&agent_key, handlers::ConfirmExchangeDepositPayload { escrow_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn run_sweep_once_sweeps_confirmed_exchange_deposits_and_is_idempotent_on_rerun() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+
+        let deposit = {
+            let mut board = hub.state.board.write().await;
+            board.reserve_escrow(
+                agent_key.public_key(),
+                1,
+                board::EscrowPurpose::FundExchangeAccount,
+                Utc::now() + chrono::Duration::minutes(30),
+            )
+        };
+        fake_node.fund(deposit.deposit_pubkey.clone(), 10_000).await;
+        hub.state.board.write().await.confirm_exchange_deposit(deposit.id, 10_000, 1_000, Utc::now()).unwrap();
+
+        run_sweep_once(&hub.state, Utc::now()).await;
+        let submitted_after_first = fake_node.wait_for_submitted_count(1).await;
+        assert_eq!(submitted_after_first.len(), 1);
+
+        // Rerunning must not sweep it a second time -- it already dropped
+        // out of unswept_exchange_deposits once Refunded.
+        run_sweep_once(&hub.state, Utc::now()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            fake_node.submitted_transactions().await.len(),
+            1,
+            "must not sweep an already-swept deposit again"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_order_http_full_match_settles_both_sides_ledgers_correctly() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let seller_key = PrivateKey::new_key();
+        let buyer_key = PrivateKey::new_key();
+        seed_exchange_account(&hub.state, &seller_key.public_key(), 0, 50).await;
+        seed_exchange_account(&hub.state, &buyer_key.public_key(), 10_000, 0).await;
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/orders", hub.base_url))
+            .json(&envelope(
+                &seller_key,
+                handlers::PlaceOrderPayload { side: board::Side::Sell, price: 8, quantity: 50 },
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/orders", hub.base_url))
+            .json(&envelope(
+                &buyer_key,
+                handlers::PlaceOrderPayload { side: board::Side::Buy, price: 10, quantity: 50 },
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let order: Value = resp.json().await.unwrap();
+        assert_eq!(order["status"], "filled");
+
+        let seller_account: Value = hub
+            .client
+            .get(format!("{}/exchange/account/{}", hub.base_url, seller_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(seller_account["base_balance"], 400, "50 * 8, the resting maker's price, not the taker's 10");
+
+        let trades: Value =
+            hub.client.get(format!("{}/exchange/trades", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(trades.as_array().unwrap().len(), 1);
+
+        let order_book: Value =
+            hub.client.get(format!("{}/exchange/orders", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        assert!(order_book["bids"].as_array().unwrap().is_empty());
+        assert!(order_book["asks"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn place_order_rejects_insufficient_balance_via_http() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let owner_key = PrivateKey::new_key();
+        seed_exchange_account(&hub.state, &owner_key.public_key(), 100, 0).await;
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/orders", hub.base_url))
+            .json(&envelope(
+                &owner_key,
+                handlers::PlaceOrderPayload { side: board::Side::Buy, price: 10, quantity: 20 },
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_via_http_releases_locked_balance() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let owner_key = PrivateKey::new_key();
+        seed_exchange_account(&hub.state, &owner_key.public_key(), 1_000, 0).await;
+
+        let order: Value = hub
+            .client
+            .post(format!("{}/exchange/orders", hub.base_url))
+            .json(&envelope(
+                &owner_key,
+                handlers::PlaceOrderPayload { side: board::Side::Buy, price: 10, quantity: 50 },
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let order_id: Uuid = order["id"].as_str().unwrap().parse().unwrap();
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/orders/{order_id}/cancel", hub.base_url))
+            .json(&envelope(&owner_key, handlers::CancelOrderPayload { order_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let account: Value = hub
+            .client
+            .get(format!("{}/exchange/account/{}", hub.base_url, owner_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(account["locked_base"], 0);
+    }
+
+    #[tokio::test]
+    async fn withdraw_pays_out_from_the_pooled_custody_address() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let custody_pubkey = hub.state.exchange_custody_public_key.clone();
+        fake_node.fund(custody_pubkey, 100_000).await;
+        let owner_key = PrivateKey::new_key();
+        seed_exchange_account(&hub.state, &owner_key.public_key(), 5_000, 0).await;
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/withdraw", hub.base_url))
+            .json(&envelope(&owner_key, handlers::WithdrawPayload { amount: 2_000 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let account: Value = resp.json().await.unwrap();
+        assert_eq!(account["base_balance"], 3_000);
+
+        let submitted = fake_node.wait_for_submitted_count(1).await;
+        assert_eq!(submitted.len(), 1);
+        assert!(
+            submitted[0].outputs.iter().any(|o| o.pubkey == owner_key.public_key() && o.value == 2_000),
+            "must actually pay the withdrawing agent, out of pooled custody"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_rejects_amount_exceeding_available_balance_via_http() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let owner_key = PrivateKey::new_key();
+        seed_exchange_account(&hub.state, &owner_key.public_key(), 100, 0).await;
+
+        let resp = hub
+            .client
+            .post(format!("{}/exchange/withdraw", hub.base_url))
+            .json(&envelope(&owner_key, handlers::WithdrawPayload { amount: 101 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn compute_minting_hook_credits_compute_balance_on_an_operator_funded_task_payout() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let (task_id, claimant) = seed_verified_task(&hub.state, 500).await;
+        {
+            let mut board = hub.state.board.write().await;
+            board.set_capabilities(task_id, ["compute".to_string()].into_iter().collect()).unwrap();
+        }
+
+        assert!(handlers::try_settle_verified_task(&hub.state, task_id).await);
+
+        let account = hub.state.board.read().await.exchange_account(&claimant);
+        assert_eq!(account.compute_balance, 500, "the settled bounty amount, minted as compute on top of the payout");
+    }
+
+    #[tokio::test]
+    async fn compute_minting_hook_does_not_fire_for_a_task_without_the_compute_capability() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let (task_id, claimant) = seed_verified_task(&hub.state, 500).await;
+        assert!(handlers::try_settle_verified_task(&hub.state, task_id).await);
+
+        let account = hub.state.board.read().await.exchange_account(&claimant);
+        assert_eq!(account.compute_balance, 0, "no compute tag, no compute minted");
     }
 }

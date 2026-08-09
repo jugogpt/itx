@@ -1,6 +1,6 @@
 use tracing::*;
 
-use crate::board::{PendingDeposit, Reputation, Task};
+use crate::board::{ExchangeAccount, Order, PendingDeposit, Reputation, Task, Trade};
 use btclib::crypto::PublicKey;
 use redb::{ReadableTable, TableDefinition};
 use std::path::Path;
@@ -19,6 +19,14 @@ const FAUCET_GRANTS_TABLE: TableDefinition<&[u8], i64> = TableDefinition::new("f
 // `open_or_create` creates on demand -- no version bump needed for a
 // purely-additive table.
 const PENDING_DEPOSITS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pending_deposits");
+// pubkey sec1 bytes -> serialized ExchangeAccount, same shape as
+// REPUTATION_TABLE. uuid bytes -> serialized Order/Trade, same shape as
+// TASKS_TABLE/PENDING_DEPOSITS_TABLE. Purely additive, like
+// PENDING_DEPOSITS_TABLE was -- no SCHEMA_VERSION bump, that's only for
+// breaking changes to an *existing* table's shape.
+const EXCHANGE_ACCOUNTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("exchange_accounts");
+const ORDERS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("orders");
+const TRADES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("trades");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -70,6 +78,9 @@ impl HubStore {
             write_txn.open_table(REPUTATION_TABLE)?;
             write_txn.open_table(FAUCET_GRANTS_TABLE)?;
             write_txn.open_table(PENDING_DEPOSITS_TABLE)?;
+            write_txn.open_table(EXCHANGE_ACCOUNTS_TABLE)?;
+            write_txn.open_table(ORDERS_TABLE)?;
+            write_txn.open_table(TRADES_TABLE)?;
             let mut meta = write_txn.open_table(META_TABLE)?;
 
             let stored_version = match meta.get(SCHEMA_VERSION_KEY)? {
@@ -232,6 +243,110 @@ impl HubStore {
             })
             .collect()
     }
+
+    pub fn save_exchange_account(&self, pubkey: &PublicKey, account: &ExchangeAccount) -> Result<()> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(account, &mut bytes)
+            .map_err(|e| HubStoreError::Serialization(e.to_string()))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(EXCHANGE_ACCOUNTS_TABLE)?;
+            table.insert(pubkey.to_sec1_bytes().as_slice(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Same as `save_exchange_account`, but for several accounts at once
+    /// in a single redb write transaction -- mirrors
+    /// `save_reputation_batch`'s reasoning exactly, for the same reason:
+    /// an escrow-funded task's multi-winner settlement can credit
+    /// several recipients' compute balances in one go.
+    pub fn save_exchange_account_batch(&self, entries: &[(PublicKey, ExchangeAccount)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(EXCHANGE_ACCOUNTS_TABLE)?;
+            for (pubkey, account) in entries {
+                let mut bytes = Vec::new();
+                ciborium::into_writer(account, &mut bytes)
+                    .map_err(|e| HubStoreError::Serialization(e.to_string()))?;
+                table.insert(pubkey.to_sec1_bytes().as_slice(), bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_exchange_accounts(&self) -> Result<Vec<(PublicKey, ExchangeAccount)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(EXCHANGE_ACCOUNTS_TABLE)?;
+        table
+            .iter()?
+            .map(|entry| {
+                let (key, value) = entry?;
+                let pubkey = PublicKey::from_sec1_bytes(key.value())
+                    .map_err(|e| HubStoreError::BadPublicKey(e.to_string()))?;
+                let account = ciborium::from_reader(value.value())
+                    .map_err(|e: ciborium::de::Error<_>| HubStoreError::Serialization(e.to_string()))?;
+                Ok((pubkey, account))
+            })
+            .collect()
+    }
+
+    pub fn save_order(&self, order: &Order) -> Result<()> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(order, &mut bytes)
+            .map_err(|e| HubStoreError::Serialization(e.to_string()))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ORDERS_TABLE)?;
+            table.insert(order.id.as_bytes().as_slice(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_orders(&self) -> Result<Vec<Order>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(ORDERS_TABLE)?;
+        table
+            .iter()?
+            .map(|entry| {
+                let (_, value) = entry?;
+                ciborium::from_reader(value.value())
+                    .map_err(|e: ciborium::de::Error<_>| HubStoreError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
+
+    pub fn save_trade(&self, trade: &Trade) -> Result<()> {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(trade, &mut bytes)
+            .map_err(|e| HubStoreError::Serialization(e.to_string()))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(TRADES_TABLE)?;
+            table.insert(trade.id.as_bytes().as_slice(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all_trades(&self) -> Result<Vec<Trade>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(TRADES_TABLE)?;
+        table
+            .iter()?
+            .map(|entry| {
+                let (_, value) = entry?;
+                ciborium::from_reader(value.value())
+                    .map_err(|e: ciborium::de::Error<_>| HubStoreError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +492,120 @@ mod tests {
         let store = HubStore::open_or_create(&path).unwrap();
         store.save_reputation_batch(&[]).unwrap();
         assert!(store.load_all_reputation().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_an_exchange_account() {
+        let path = temp_db_path("exchange_account_roundtrip");
+        let store = HubStore::open_or_create(&path).unwrap();
+
+        let owner = PrivateKey::new_key().public_key();
+        let account = ExchangeAccount {
+            base_balance: 1_000,
+            locked_base: 200,
+            compute_balance: 50,
+            locked_compute: 10,
+        };
+        store.save_exchange_account(&owner, &account).unwrap();
+
+        let loaded = store.load_all_exchange_accounts().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, owner);
+        assert_eq!(loaded[0].1.base_balance, 1_000);
+        assert_eq!(loaded[0].1.locked_compute, 10);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_exchange_account_batch_writes_every_entry_in_one_transaction() {
+        let path = temp_db_path("exchange_account_batch");
+        let store = HubStore::open_or_create(&path).unwrap();
+
+        let entries: Vec<(PublicKey, ExchangeAccount)> = (0..3)
+            .map(|i| {
+                (
+                    PrivateKey::new_key().public_key(),
+                    ExchangeAccount { base_balance: i * 100, locked_base: 0, compute_balance: i, locked_compute: 0 },
+                )
+            })
+            .collect();
+        store.save_exchange_account_batch(&entries).unwrap();
+
+        let loaded = store.load_all_exchange_accounts().unwrap();
+        assert_eq!(loaded.len(), 3);
+        for (pubkey, account) in &entries {
+            let found = loaded.iter().find(|(k, _)| k == pubkey).unwrap();
+            assert_eq!(found.1.base_balance, account.base_balance);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_exchange_account_batch_of_zero_entries_is_a_harmless_no_op() {
+        let path = temp_db_path("exchange_account_batch_empty");
+        let store = HubStore::open_or_create(&path).unwrap();
+        store.save_exchange_account_batch(&[]).unwrap();
+        assert!(store.load_all_exchange_accounts().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_an_order() {
+        let path = temp_db_path("order_roundtrip");
+        let store = HubStore::open_or_create(&path).unwrap();
+
+        let owner = PrivateKey::new_key().public_key();
+        let order = Order {
+            id: Uuid::new_v4(),
+            owner: owner.clone(),
+            side: crate::board::Side::Buy,
+            price: 10,
+            quantity: 50,
+            filled: 20,
+            status: crate::board::OrderStatus::Open,
+            created_at: Utc::now(),
+        };
+        store.save_order(&order).unwrap();
+
+        let loaded = store.load_all_orders().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, order.id);
+        assert_eq!(loaded[0].owner, owner);
+        assert_eq!(loaded[0].filled, 20);
+        assert_eq!(loaded[0].status, crate::board::OrderStatus::Open);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn round_trips_a_trade() {
+        let path = temp_db_path("trade_roundtrip");
+        let store = HubStore::open_or_create(&path).unwrap();
+
+        let buyer = PrivateKey::new_key().public_key();
+        let seller = PrivateKey::new_key().public_key();
+        let trade = Trade {
+            id: Uuid::new_v4(),
+            buy_order_id: Uuid::new_v4(),
+            sell_order_id: Uuid::new_v4(),
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            price: 8,
+            quantity: 50,
+            executed_at: Utc::now(),
+        };
+        store.save_trade(&trade).unwrap();
+
+        let loaded = store.load_all_trades().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, trade.id);
+        assert_eq!(loaded[0].buyer, buyer);
+        assert_eq!(loaded[0].seller, seller);
+        assert_eq!(loaded[0].quantity, 50);
+
         std::fs::remove_file(&path).ok();
     }
 
