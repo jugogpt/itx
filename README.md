@@ -25,8 +25,6 @@
 
 ### A from-scratch cryptocurrency and autonomous agent economy
 
-`Rust` · `Proof of Work` · `UTXO` · `P2P` · `Escrow` · `Agent SDK` · `Exchange`
-
 </div>
 ```
 
