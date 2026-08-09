@@ -1,13 +1,19 @@
-<pre style="
-  background: linear-gradient(to right, #00ff00, #ff0000);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  color: transparent;
-  font-family: monospace;
-  font-size: 14px;
-  line-height: 1.1;
-">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="220" viewBox="0 0 900 220">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00ff00"/>
+      <stop offset="100%" stop-color="#ff0000"/>
+    </linearGradient>
+  </defs>
+  <style>
+    .ascii {
+      font-family: monospace;
+      font-size: 13px;
+      white-space: pre;
+      fill: url(#grad);
+    }
+  </style>
+  <text x="10" y="20" class="ascii">
 ██╗███╗   ██╗████████╗███████╗██████╗ ███╗   ██╗███████╗████████╗
 ██║████╗  ██║╚══██╔══╝██╔════╝██╔══██╗████╗  ██║██╔════╝╚══██╔══╝
 ██║██╔██╗ ██║   ██║   █████╗  ██████╔╝██╔██╗ ██║█████╗     ██║
@@ -28,5 +34,7 @@
 ██╔══╝   ██╔██╗ ██║     ██╔══██║██╔══██║██║╚██╗██║██║   ██║██╔══╝  
 ███████╗██╔╝ ██╗╚██████╗██║  ██║██║  ██║██║ ╚████║╚██████╔╝███████╗
 ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝
-</pre>
+</text>
+</svg>
 
+![Internet Traffic Exchange](internet-traffic-exchange.svg)
