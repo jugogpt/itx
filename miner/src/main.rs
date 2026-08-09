@@ -72,8 +72,24 @@ fn spawn_mining_thread(
                     mining.store(false, Ordering::Relaxed);
                 }
             }
+        } else {
+            // Genuinely idle (no template yet, or the last one's already
+            // exhausted/submitted): sleep instead of busy-spinning via
+            // `yield_now()`. One OS thread per logical core, all of them
+            // spinning as fast as the scheduler allows, saturates every
+            // core continuously even while doing no useful work -- which
+            // starves this same process's own tokio runtime (the one
+            // driving `run()`'s 5-second template-refresh timer and the
+            // network I/O to actually fetch a new template) of scheduling
+            // time. A tick that's ready but never promptly polled because
+            // no worker thread can get scheduled might as well not have
+            // fired; this is what actually made a fresh mempool
+            // transaction sit unpicked-up for minutes, not just which
+            // request `fetch_and_validate_template` happened to send.
+            // 10ms caps the added latency to notice `mining` flip back to
+            // true at a level that's negligible next to that.
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::yield_now();
     })
 }
 
@@ -157,7 +173,7 @@ impl Miner {
             let receiver_clone = self.mined_block_receiver.clone();
             tokio::select! {
                 _ = template_interval.tick() => {
-                    self.fetch_and_validate_template().await?;
+                    self.fetch_template().await?;
                 }
                 Ok(mined_block) = receiver_clone.recv_async() => {
                     self.submit_block(mined_block).await;
@@ -175,15 +191,26 @@ impl Miner {
         }
     }
 
-    async fn fetch_and_validate_template(&self) -> Result<()> {
-        if !self.mining.load(Ordering::Relaxed) {
-            self.fetch_template().await?;
-        } else {
-            self.validate_template().await?;
-        }
-        Ok(())
-    }
-
+    /// Fetches a genuinely fresh template from the primary node and swaps
+    /// it in, unconditionally -- called on every timer tick regardless of
+    /// whether a mining pass is already in progress. This used to only
+    /// happen while idle (a pass in progress got a cheap `ValidateTemplate`
+    /// tip-match check instead), which meant a transaction relayed to the
+    /// mempool while a pass was already underway had no way to be picked
+    /// up until that pass either found a block or the tip moved out from
+    /// under it -- unbounded in the worst case, and increasingly likely
+    /// to actually bite as retargeting pushes real mining passes toward
+    /// taking a non-trivial amount of time (that's the whole point of
+    /// `IDEAL_BLOCK_TIME`). Refetching every tick bounds that wait to
+    /// this interval instead. It also happens to close a related latent
+    /// issue for free: each mining thread's nonce window is fixed and
+    /// never advances within a single template (see `thread_start_nonce`'s
+    /// own doc comment), so a template that never changed would have
+    /// every thread fruitlessly rescanning the exact same nonces forever
+    /// if no valid one existed in their windows -- a fresh template every
+    /// few seconds (a new timestamp alone changes every thread's hash
+    /// landscape over that same nonce range) means that's no longer a
+    /// permanent stall, just a wasted pass.
     async fn fetch_template(&self) -> Result<()> {
         println!("Fetching new template");
         let message = Message::FetchTemplate(self.public_key.clone());
@@ -207,34 +234,6 @@ impl Miner {
                 Ok(())
             }
             _ => Err(anyhow!("Unexpected message received when fetching template")),
-        }
-    }
-
-    async fn validate_template(&self) -> Result<()> {
-        if let Some(template) = self.current_template.lock().unwrap().clone() {
-            let message = Message::ValidateTemplate(template);
-            let mut stream_lock = self.streams[0].lock().await;
-            message.send_async(&mut *stream_lock).await?;
-            drop(stream_lock);
-
-            let mut stream_lock = self.streams[0].lock().await;
-            match Message::receive_async(&mut *stream_lock).await? {
-                Message::TemplateValidity(valid) => {
-                    drop(stream_lock);
-                    if !valid {
-                        println!("Current template is no longer valid");
-                        self.mining.store(false, Ordering::Relaxed);
-                    } else {
-                        println!("Current template is still valid");
-                    }
-                    Ok(())
-                }
-                _ => Err(anyhow!(
-                    "Unexpected message received when validating template"
-                )),
-            }
-        } else {
-            Ok(())
         }
     }
 
