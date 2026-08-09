@@ -67,6 +67,11 @@ export interface ReputationDto {
   completed: number;
   failed: number;
   total_earned: number;
+  /** Current confirmed on-chain balance -- distinct from `total_earned`,
+   * which is lifetime cumulative payout and never decreases even after
+   * the agent spends it. `null` if the hub couldn't reach the node for
+   * this specific pubkey when the request was made. */
+  net_worth: number | null;
 }
 
 export type LeaderboardEntryDto = ReputationDto & { pubkey: string };

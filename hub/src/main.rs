@@ -763,6 +763,151 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
+    /// A prior version of `llms_txt` documented only `hash_match`/
+    /// `consensus` tasks and operator-only posting -- it went stale as
+    /// Features 1-3 (agent-to-agent posting, disputes, capabilities)
+    /// shipped without anyone updating the one doc an agent actually
+    /// reads to learn the API. This doesn't check the prose itself (too
+    /// brittle), just that every endpoint/kind introduced since the
+    /// original version is at least mentioned somewhere.
+    #[tokio::test]
+    async fn llms_txt_mentions_every_task_kind_and_the_escrow_and_dispute_flows() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let llms = hub
+            .client
+            .get(format!("{}/llms.txt", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        for expected in [
+            "hash_match",
+            "consensus",
+            "disputable",
+            "/tasks/escrow",
+            "/tasks/consensus/escrow",
+            "/tasks/disputable/escrow",
+            "/tasks/escrow/<escrow_id>/confirm",
+            "/dispute/escrow",
+            "/dispute/confirm",
+            "/dispute/resolve",
+            "challenger_wins",
+            "assignee_wins",
+            "capabilities",
+            "?capability=",
+            "/tasks/<id>/cancel",
+        ] {
+            assert!(llms.contains(expected), "llms.txt no longer mentions {expected:?}");
+        }
+    }
+
+    /// `net_worth` (current on-chain balance) and `total_earned`
+    /// (lifetime cumulative payout) are deliberately different numbers --
+    /// this spends some of what it earned, then checks the leaderboard
+    /// reports both, not just one standing in for the other.
+    #[tokio::test]
+    async fn leaderboard_reports_net_worth_separately_from_lifetime_earnings() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+
+        let expected_output = Hash::hash_bytes(b"x");
+        let mut board = hub.state.board.write().await;
+        let task = board.create_task(hub.state.operator_public_key.clone(), "t".to_string(), 500, expected_output);
+        board
+            .claim_task(task.id, agent_key.public_key(), Utc::now() + chrono::Duration::minutes(5))
+            .unwrap();
+        board.submit(task.id, agent_key.public_key(), expected_output).unwrap();
+        board.mark_recipient_paid(task.id, &agent_key.public_key(), 500).unwrap();
+        drop(board);
+
+        // Confirmed on-chain balance is a separate fact from the payout
+        // above -- set it to something that doesn't match `total_earned`,
+        // as if the agent had already spent some of what it earned.
+        fake_node.fund(agent_key.public_key(), 7_000_000).await;
+
+        let leaderboard: Value = hub
+            .client
+            .get(format!("{}/leaderboard", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let entry = leaderboard
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["pubkey"] == agent_key.public_key().to_string())
+            .expect("agent should be on the leaderboard");
+        assert_eq!(entry["total_earned"], 500);
+        assert_eq!(entry["net_worth"], 7_000_000);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_reports_null_net_worth_when_the_node_is_unreachable() {
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key.clone(), dead_address().await).await;
+        let agent_key = PrivateKey::new_key();
+
+        let expected_output = Hash::hash_bytes(b"x");
+        let mut board = hub.state.board.write().await;
+        let task = board.create_task(operator_key.public_key(), "t".to_string(), 500, expected_output);
+        board
+            .claim_task(task.id, agent_key.public_key(), Utc::now() + chrono::Duration::minutes(5))
+            .unwrap();
+        board.submit(task.id, agent_key.public_key(), expected_output).unwrap();
+        board.mark_recipient_paid(task.id, &agent_key.public_key(), 500).unwrap();
+        drop(board);
+
+        let leaderboard: Value = hub
+            .client
+            .get(format!("{}/leaderboard", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let entry = leaderboard
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["pubkey"] == agent_key.public_key().to_string())
+            .expect("agent should still be on the leaderboard even though the node is down");
+        assert_eq!(entry["total_earned"], 500, "reputation is unaffected by the node being unreachable");
+        assert_eq!(entry["net_worth"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn get_reputation_includes_net_worth_alongside_the_single_pubkey_lookup() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        let agent_key = PrivateKey::new_key();
+        fake_node.fund(agent_key.public_key(), 3_500_000).await;
+
+        let reputation: Value = hub
+            .client
+            .get(format!("{}/reputation/{}", hub.base_url, agent_key.public_key()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reputation["completed"], 0, "never did any work, but should still resolve a balance");
+        assert_eq!(reputation["net_worth"], 3_500_000);
+    }
+
     #[tokio::test]
     async fn try_settle_verified_task_fails_gracefully_when_node_unreachable() {
         let operator_key = PrivateKey::new_key();

@@ -23,8 +23,18 @@ construct_uint! {
 pub const INITIAL_REWARD: u64 = 50;
 // halving interval in blocks
 pub const HALVING_INTERVAL: u64 = 210;
-// ideal block time in second
-pub const IDEAL_BLOCK_TIME: u64 = 10;
+// Ideal block time in seconds -- 600 (Bitcoin's own value), not the
+// original 10. At 10s the entire ~21,000-coin hard cap (INITIAL_REWARD *
+// HALVING_INTERVAL, see the reconciliation write-up) mints out in under a
+// day, which leaves no room for the currency to actually function as
+// scarce. 600s stretches that to ~48 days without changing the cap itself
+// (cap depends only on INITIAL_REWARD/HALVING_INTERVAL, not block time) --
+// deliberately not slower than that: several hub TTLs are minute-scale
+// (e.g. handlers::ESCROW_RESERVATION_TTL_MINUTES = 60), and those need
+// several confirmations' worth of margin inside their window, not just
+// one, to keep a normal deposit-then-confirm flow from being timing-
+// sensitive by accident.
+pub const IDEAL_BLOCK_TIME: u64 = 600;
 // minimum target
 pub const MIN_TARGET: U256 = U256([
     0xFFFF_FFFF_FFFF_FFFF,

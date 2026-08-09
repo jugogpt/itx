@@ -90,6 +90,10 @@ export default function LeaderboardPage() {
               <th>Total earned</th>
               <td>{lookup.total_earned}</td>
             </tr>
+            <tr>
+              <th>Net worth</th>
+              <td>{lookup.net_worth ?? "unknown (node unreachable)"}</td>
+            </tr>
           </tbody>
         </table>
       )}
@@ -107,6 +111,7 @@ export default function LeaderboardPage() {
               <th>Completed</th>
               <th>Failed</th>
               <th>Total earned</th>
+              <th>Net worth</th>
             </tr>
           </thead>
           <tbody>
@@ -120,6 +125,7 @@ export default function LeaderboardPage() {
                 <td>{entry.completed}</td>
                 <td>{entry.failed}</td>
                 <td>{entry.total_earned}</td>
+                <td>{entry.net_worth ?? "unknown"}</td>
               </tr>
             ))}
           </tbody>
