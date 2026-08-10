@@ -22,6 +22,7 @@ use store::HubStore;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
 /// Shared state handed to every HTTP handler. `board` changes after
@@ -85,8 +86,11 @@ struct Args {
     /// port to listen on
     port: u16,
     #[argh(option, default = "String::from(\"127.0.0.1:9000\")")]
-    /// address of the blockchain node to talk to
-    node_address: String,
+    /// comma-separated addresses of blockchain nodes to talk to. The first
+    /// is used for every call unless it's unreachable, in which case the
+    /// next one is tried -- see `NodeClient::connect`'s doc comment for
+    /// why this is ordered failover, not load-balancing.
+    node_addresses: String,
     #[argh(option, default = "String::from(\"./hub.redb\")")]
     /// path to the hub's durable store (a redb database file)
     store_file: String,
@@ -147,7 +151,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
         // winner), so any escrow funding it always needs refunding, not
         // settling -- a no-op for an operator-funded task.
         handlers::refund_closed_task_escrow(state, task_id).await;
-        println!("sweep: cancelled understaffed consensus task {task_id} past its join deadline");
+        info!("sweep: cancelled understaffed consensus task {task_id} past its join deadline");
     }
 
     let resolved = {
@@ -173,7 +177,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
                     .collect()
             };
             if let Err(e) = state.store.save_reputation_batch(&entries) {
-                println!(
+                error!(
                     "failed to persist reputation for consensus assignees of task {task_id} after resolution: {e}"
                 );
             }
@@ -185,7 +189,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
                 handlers::refund_closed_task_escrow(state, task_id).await;
             }
         }
-        println!("sweep: resolved consensus task {task_id} past its submission deadline");
+        info!("sweep: resolved consensus task {task_id} past its submission deadline");
     }
 
     let finalized = {
@@ -194,7 +198,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
     };
     for task_id in finalized {
         persist_task_by_id(state, task_id, "unchallenged disputable").await;
-        println!("sweep: finalized unchallenged disputable task {task_id} past its dispute window");
+        info!("sweep: finalized unchallenged disputable task {task_id} past its dispute window");
     }
 
     let overdue_escrows: Vec<PendingDeposit> = {
@@ -204,7 +208,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
     for deposit in overdue_escrows {
         let deposit_id = deposit.id;
         handlers::refund_escrow(state, &deposit).await;
-        println!("sweep: refunded overdue unconfirmed escrow deposit {deposit_id}");
+        info!("sweep: refunded overdue unconfirmed escrow deposit {deposit_id}");
     }
 
     let unpaid: Vec<Uuid> = state
@@ -217,7 +221,7 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
         .collect();
     for task_id in unpaid {
         if handlers::try_settle_verified_task(state, task_id).await {
-            println!("sweep: retried and paid out task {task_id}");
+            warn!("sweep: retried and paid out task {task_id}");
         }
     }
 
@@ -229,14 +233,14 @@ async fn run_sweep_once(state: &Arc<AppState>, now: chrono::DateTime<chrono::Utc
     let unsettled_bonds: Vec<Uuid> = state.board.read().await.tasks_with_unsettled_dispute_bonds();
     for task_id in unsettled_bonds {
         if handlers::settle_dispute_bond(state, task_id).await {
-            println!("sweep: retried and settled dispute bond for task {task_id}");
+            warn!("sweep: retried and settled dispute bond for task {task_id}");
         }
     }
 
     let unswept: Vec<Uuid> = state.board.read().await.unswept_exchange_deposits();
     for deposit_id in unswept {
         if handlers::sweep_exchange_deposit(state, deposit_id).await {
-            println!("sweep: swept exchange deposit {deposit_id} into pooled custody");
+            info!("sweep: swept exchange deposit {deposit_id} into pooled custody");
         }
     }
 
@@ -253,7 +257,7 @@ async fn persist_task_by_id(state: &AppState, task_id: Uuid, context: &str) -> O
     let task = state.board.read().await.get_task(task_id).cloned();
     if let Some(task) = &task {
         if let Err(e) = state.store.save_task(task) {
-            println!("failed to persist {context} task {task_id}: {e}");
+            error!("failed to persist {context} task {task_id}: {e}");
         }
     }
     task
@@ -261,7 +265,16 @@ async fn persist_task_by_id(state: &AppState, task_id: Uuid, context: &str) -> O
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let args: Args = argh::from_env();
+    let node_addresses: Vec<String> = args.node_addresses.split(',').map(|s| s.trim().to_string()).collect();
 
     let operator_private_key = load_or_create_key(&args.operator_key_file)?;
     let operator_public_key = operator_private_key.public_key();
@@ -313,7 +326,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         board: RwLock::new(board),
         store,
-        node: NodeClient::new(args.node_address),
+        node: NodeClient::new(node_addresses),
         operator_private_key,
         operator_public_key,
         payout_lock: Mutex::new(()),
@@ -353,6 +366,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]);
 
     Router::new()
+        .route("/health", get(handlers::health))
         .route("/tasks", get(handlers::list_tasks).post(handlers::create_task))
         .route("/tasks/consensus", post(handlers::create_consensus_task))
         .route("/tasks/escrow", post(handlers::create_task_escrow))
@@ -401,9 +415,14 @@ mod tests {
         std::env::temp_dir().join(format!("itx_hub_maintest_{}.redb", Uuid::new_v4()))
     }
 
+    /// Fixed `AskChainTip` response every `FakeNode` reports -- there's no
+    /// real chain behind it, so this is just a fixed value for `/health`
+    /// tests to assert against.
+    const FAKE_NODE_CHAIN_HEIGHT: u32 = 7;
+
     /// A minimal stand-in for a real node: speaks just enough of the wire
-    /// protocol (handshake, `FetchUTXOs`, `SubmitTransaction`) to drive
-    /// the hub's real `NodeClient` in tests, without a real
+    /// protocol (handshake, `FetchUTXOs`, `SubmitTransaction`, `AskChainTip`)
+    /// to drive the hub's real `NodeClient` in tests, without a real
     /// `Blockchain`/`node` process behind it. Reports exactly one
     /// unmarked UTXO of whatever `fund` has set for a given pubkey
     /// (nothing for any other), and records everything submitted to it.
@@ -471,6 +490,12 @@ mod tests {
                                     submitted.lock().await.push(tx);
                                     // fire-and-forget, matching the real protocol
                                 }
+                                Message::AskChainTip => {
+                                    let tip = Message::ChainTip(FAKE_NODE_CHAIN_HEIGHT, btclib::U256::from(1u64));
+                                    if tip.send_async(&mut socket).await.is_err() {
+                                        return;
+                                    }
+                                }
                                 _ => return,
                             }
                         }
@@ -527,6 +552,32 @@ mod tests {
         // is bound to it again within this test's lifetime.
     }
 
+    /// `NodeClient` must fail over to the next configured address when the
+    /// first is unreachable -- the whole point of giving it more than one
+    /// (see its own doc comment on why this is ordered failover, not
+    /// load-balancing).
+    #[tokio::test]
+    async fn node_client_fails_over_to_the_next_address_when_the_first_is_unreachable() {
+        let agent_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(agent_key.public_key(), 12_345).await;
+        let dead = dead_address().await;
+
+        let client = NodeClient::new(vec![dead, fake_node.addr.clone()]);
+        let balance = client.balance(&agent_key.public_key()).await.unwrap();
+        assert_eq!(balance, 12_345);
+
+        let height = client.chain_tip().await.unwrap();
+        assert_eq!(height, FAKE_NODE_CHAIN_HEIGHT);
+    }
+
+    /// All addresses unreachable must surface as an error, not hang or
+    /// silently report a wrong answer.
+    #[tokio::test]
+    async fn node_client_fails_when_every_address_is_unreachable() {
+        let client = NodeClient::new(vec![dead_address().await, dead_address().await]);
+        assert!(client.chain_tip().await.is_err());
+    }
+
     struct TestHub {
         base_url: String,
         state: Arc<AppState>,
@@ -550,7 +601,7 @@ mod tests {
         let state = Arc::new(AppState {
             board: RwLock::new(TaskBoard::new()),
             store,
-            node: NodeClient::new(node_address),
+            node: NodeClient::new(vec![node_address]),
             operator_private_key: operator_private_key.clone(),
             operator_public_key,
             payout_lock: Mutex::new(()),
@@ -830,6 +881,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn health_reports_ok_and_chain_height_when_a_node_is_reachable() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 0).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let resp = hub.client.get(format!("{}/health", hub.base_url)).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["chain_height"], FAKE_NODE_CHAIN_HEIGHT);
+    }
+
+    #[tokio::test]
+    async fn health_reports_503_when_no_node_is_reachable() {
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key, dead_address().await).await;
+
+        let resp = hub.client.get(format!("{}/health", hub.base_url)).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "degraded");
     }
 
     /// A prior version of `llms_txt` documented only `hash_match`/

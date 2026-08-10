@@ -27,7 +27,7 @@ pub async fn broadcast(message: &Message) {
     for node in nodes {
         if let Some(mut stream) = NODES.get_mut(&node) {
             if message.send_async(&mut *stream).await.is_err() {
-                println!("failed to send message to {}", node);
+                warn!("failed to send message to {}", node);
             }
         }
     }
@@ -143,7 +143,24 @@ pub async fn populate_connections(nodes: &[String]) -> Result<()> {
                         continue;
                     }
                     println!("adding node {}", child_node);
-                    let mut new_stream = TcpStream::connect(&child_node).await?;
+                    // Unlike the top-level configured peer below (whose
+                    // reachability is a precondition this function's own
+                    // caller already treats as fatal), a *discovered* child
+                    // node is just something a peer happened to mention --
+                    // often including our own address, echoed back by
+                    // whichever node already knew about us before we
+                    // restarted, which we can't yet be listening on
+                    // ourselves this early in startup. An unreachable
+                    // discovered node is expected, not exceptional: log and
+                    // move on to the next one, matching the handshake
+                    // failure handling immediately below.
+                    let mut new_stream = match TcpStream::connect(&child_node).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            warn!("failed to connect to discovered node {child_node}: {e}, skipping");
+                            continue;
+                        }
+                    };
                     match btclib::network::perform_handshake_initiator(&mut new_stream).await {
                         Ok(offset) => {
                             if let Some(ip) = addr_ip(&child_node) {
@@ -151,7 +168,7 @@ pub async fn populate_connections(nodes: &[String]) -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            println!("handshake with {} failed: {e}, skipping", child_node);
+                            warn!("handshake with {} failed: {e}, skipping", child_node);
                             continue;
                         }
                     }
@@ -159,7 +176,7 @@ pub async fn populate_connections(nodes: &[String]) -> Result<()> {
                 }
             }
             _ => {
-                println!("unexpected message from {}", node);
+                warn!("unexpected message from {}", node);
             }
         }
         NODES.insert(node.clone(), stream);
@@ -194,7 +211,7 @@ pub async fn find_best_chain_node() -> Result<(String, u32)> {
                 }
             }
             e => {
-                println!("unexpected message from {}: {:?}", node, e);
+                warn!("unexpected message from {}: {:?}", node, e);
             }
         }
     }
@@ -266,7 +283,7 @@ pub async fn download_blockchain(store: &BlockStore, node: &str, target_height: 
                 }
             }
             _ => {
-                println!("unexpected message from {}, aborting sync", node);
+                warn!("unexpected message from {}, aborting sync", node);
                 break;
             }
         }
@@ -382,6 +399,64 @@ mod tests {
         let key = format!("fake-{}", Uuid::new_v4());
         NODES.insert(key.clone(), stream);
         key
+    }
+
+    /// An address guaranteed to have nothing listening on it -- for
+    /// simulating a discovered peer that's unreachable.
+    async fn dead_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
+    }
+
+    /// A fake peer that only speaks enough to answer one `DiscoverNodes`
+    /// with a `NodeList` containing `reported_peer` -- standing in for a
+    /// real node that (like `node2` restarting `node1` remembers it)
+    /// reports back an address the caller can't yet reach.
+    async fn spawn_fake_peer_reporting(reported_peer: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            if btclib::network::perform_handshake_acceptor(&mut socket).await.is_err() {
+                return;
+            }
+            loop {
+                match Message::receive_async(&mut socket).await {
+                    Ok(Message::DiscoverNodes) => {
+                        let reply = Message::NodeList(vec![reported_peer.clone()]);
+                        if reply.send_async(&mut socket).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        });
+        addr
+    }
+
+    /// Regression test for a real crash reproduced live during this
+    /// session's redundancy testing: a discovered peer that happens to be
+    /// unreachable (e.g. our own address, echoed back by a peer that
+    /// remembers us from before a restart, before our own listener is up)
+    /// used to abort the entire `populate_connections` call via `?`,
+    /// which propagates all the way out of `main` and kills the whole
+    /// node process -- turning a harmless "one discovered peer isn't up
+    /// yet" into "the node can never restart." Must now just skip it.
+    #[tokio::test]
+    async fn populate_connections_skips_an_unreachable_discovered_peer_instead_of_failing() {
+        let dead = dead_address().await;
+        let fake_peer = spawn_fake_peer_reporting(dead.clone()).await;
+
+        let result = populate_connections(&[fake_peer.clone()]).await;
+
+        assert!(result.is_ok(), "an unreachable discovered peer must not fail the whole call: {result:?}");
+        assert!(NODES.contains_key(&fake_peer), "the actually-reachable configured peer must still be registered");
+        assert!(!NODES.contains_key(&dead), "the unreachable discovered peer must not be registered");
+
+        NODES.remove(&fake_peer);
     }
 
     #[tokio::test]

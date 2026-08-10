@@ -14,7 +14,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
             }
         }
         Err(e) => {
-            println!("handshake with peer failed: {e}, closing that connection");
+            warn!("handshake with peer failed: {e}, closing that connection");
             strike(peer_ip, true);
             return;
         }
@@ -32,7 +32,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                 return;
             }
             Err(e) => {
-                println!("invalid message from peer: {e}, closing that connection");
+                warn!("invalid message from peer: {e}, closing that connection");
                 strike(peer_ip, true);
                 return;
             }
@@ -42,7 +42,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
         match message {
             UTXOs(_) | Template(_) | ChainTip(_, _) | TemplateValidity(_) | NodeList(_)
             | Blocks(_) | Hello { .. } | HelloAck { .. } => {
-                println!("received neither a miner nor a wallet.");
+                warn!("received neither a miner nor a wallet.");
                 strike(peer_ip, true);
                 return;
             }
@@ -107,7 +107,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                     Ok(()) => {
                         if let Some(store) = crate::BLOCK_STORE.get() {
                             if let Err(e) = crate::util::persist_chain_state(store, &block).await {
-                                println!("failed to persist block: {e}");
+                                error!("failed to persist block: {e}");
                             }
                         }
                     }
@@ -115,7 +115,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                         println!("received block buffered as orphan, waiting for its parent");
                     }
                     Err(e) => {
-                        println!("block rejected: {e}, closing connection");
+                        warn!("block rejected: {e}, closing connection");
                         strike(peer_ip, false);
                         return;
                     }
@@ -161,7 +161,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                     Ok(()) => {
                         if let Some(store) = crate::BLOCK_STORE.get() {
                             if let Err(e) = crate::util::persist_chain_state(store, &block).await {
-                                println!("failed to persist block: {e}");
+                                error!("failed to persist block: {e}");
                             }
                         }
                         println!("block looks good, broadcasting");
@@ -171,7 +171,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                         println!("submitted block references an unknown parent, buffered as orphan");
                     }
                     Err(e) => {
-                        println!("block rejected: {e}, closing connection");
+                        warn!("block rejected: {e}, closing connection");
                         strike(peer_ip, false);
                         return;
                     }
@@ -182,7 +182,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                 println!("submit tx");
                 let mut blockchain = crate::BLOCKCHAIN.write().await;
                 if let Err(e) = blockchain.add_to_mempool(tx.clone()) {
-                    println!("transaction rejected, closing connection: {e}");
+                    warn!("transaction rejected, closing connection: {e}");
                     strike(peer_ip, false);
                     return;
                 }
@@ -196,7 +196,7 @@ pub async fn handle_connection(mut socket: TcpStream) {
                 let block = match blockchain.create_block_template(pubkey) {
                     Ok(block) => block,
                     Err(e) => {
-                        eprintln!("{e}");
+                        error!("failed to create block template: {e}");
                         return;
                     }
                 };

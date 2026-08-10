@@ -9,6 +9,7 @@ use static_init::dynamic;
 use std::sync::OnceLock;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tracing_subscriber::prelude::*;
 
 mod ban;
 mod handler;
@@ -54,6 +55,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let args: Args = argh::from_env();
     let port = args.port;
     let blockchain_file = args.blockchain_file;

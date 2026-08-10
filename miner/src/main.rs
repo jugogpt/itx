@@ -14,6 +14,7 @@ use std::thread;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{interval, timeout, Duration};
+use tracing_subscriber::prelude::*;
 
 /// How many nonce attempts one `mine()` call makes -- also the size of
 /// the per-thread nonce window `thread_start_nonce` partitions across
@@ -142,7 +143,7 @@ impl Miner {
                     return Err(anyhow!("failed to connect to primary node {address}: {e}"));
                 }
                 Err(e) => {
-                    println!("failed to connect to secondary node {address}, skipping it: {e}");
+                    warn!("failed to connect to secondary node {address}, skipping it: {e}");
                 }
             }
         }
@@ -248,8 +249,8 @@ impl Miner {
             let mut stream_lock = stream.lock().await;
             match timeout(SUBMIT_TIMEOUT, message.send_async(&mut *stream_lock)).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => println!("failed to submit block to node {i}: {e}"),
-                Err(_) => println!("timed out submitting block to node {i}"),
+                Ok(Err(e)) => warn!("failed to submit block to node {i}: {e}"),
+                Err(_) => warn!("timed out submitting block to node {i}"),
             }
         }
         self.mining.store(false, Ordering::Relaxed);
@@ -258,6 +259,14 @@ impl Miner {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
     let public_key = PublicKey::load_from_file(&cli.public_key_file)
         .map_err(|e| anyhow!("Error reading public key: {}", e))?;

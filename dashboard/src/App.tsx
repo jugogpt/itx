@@ -23,6 +23,13 @@ export default function App() {
           <Route path="/exchange" element={<ExchangePage />} />
         </Routes>
       </main>
+      <footer>
+        <hr />
+        <p id="disclaimer">
+          Experimental testnet for autonomous agents -- everything here, including the exchange, has no
+          real-world value and is not redeemable for money.
+        </p>
+      </footer>
     </>
   );
 }

@@ -635,6 +635,34 @@ impl From<&Trade> for TradeDto {
 // Handlers
 // ---------------------------------------------------------------------
 
+/// Public, unauthenticated liveness/readiness check for external
+/// monitoring (uptime checks, systemd, a load balancer) -- proves the hub
+/// can actually reach a node, not just that its own process is up.
+/// Deliberately doesn't report which node address answered or the
+/// configured node list itself: that's internal topology with no reason
+/// to be visible to anyone on the internet who happens to hit this route.
+/// That detail goes to the server's own logs instead, via
+/// `NodeClient::connect`'s `warn!` on each failed address.
+#[derive(Serialize)]
+pub struct HealthDto {
+    pub status: &'static str,
+    pub chain_height: u32,
+}
+
+pub async fn health(State(state): State<Arc<AppState>>) -> Response {
+    match state.node.chain_tip().await {
+        Ok(chain_height) => Json(HealthDto { status: "ok", chain_height }).into_response(),
+        Err(e) => {
+            warn!("health check failed: no configured node is reachable: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "degraded", "error": "no configured node is reachable" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Lists open tasks oldest-first (by `created_at`), paginated via
 /// `?offset=&limit=` -- see `ListTasksQuery`. Ordering by creation time
 /// (rather than `TaskBoard`'s internal by-id order) is what makes
@@ -907,7 +935,7 @@ pub async fn confirm_task_escrow(
     // restart before the next sweep tick would see it as still Reserved.
     if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id) {
         if let Err(e) = state.store.save_pending_deposit(deposit) {
-            println!("failed to persist consumed escrow {escrow_id}: {e}");
+            error!("failed to persist consumed escrow {escrow_id}: {e}");
         }
     }
     Ok(Json(TaskDto::from(&task)))
@@ -1014,7 +1042,7 @@ pub async fn confirm_dispute_escrow(
     // restart before the next sweep tick would see it as still Reserved.
     if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id) {
         if let Err(e) = state.store.save_pending_deposit(deposit) {
-            println!("failed to persist consumed dispute-bond escrow {escrow_id}: {e}");
+            error!("failed to persist consumed dispute-bond escrow {escrow_id}: {e}");
         }
     }
     Ok(Json(TaskDto::from(&task)))
@@ -1046,7 +1074,7 @@ pub async fn resolve_dispute(
     // resolve_consensus's "dinged at resolution" convention -- persist it.
     let loser_reputation = state.board.read().await.reputation(&loser);
     if let Err(e) = state.store.save_reputation(&loser, &loser_reputation) {
-        println!("failed to persist dispute-loser reputation for {loser}: {e}");
+        error!("failed to persist dispute-loser reputation for {loser}: {e}");
     }
 
     try_settle_verified_task(&state, task_id).await;
@@ -1450,7 +1478,7 @@ async fn settle_escrow_funded_task(
     )
     .await
     {
-        println!(
+        warn!(
             "escrow settlement for task {task_id} (escrow {}) failed, will retry: {e}",
             deposit.id
         );
@@ -1469,7 +1497,7 @@ async fn settle_escrow_funded_task(
                 }
             }
             Err(e) => {
-                println!(
+                error!(
                     "escrow settlement for task {task_id} succeeded on-chain but mark_recipient_paid failed for {recipient}: {e}"
                 );
                 all_recorded = false;
@@ -1491,14 +1519,14 @@ async fn settle_escrow_funded_task(
     };
     if let Some(final_task) = final_task {
         if let Err(e) = state.store.save_task(&final_task) {
-            println!("failed to persist task {task_id}: {e}");
+            error!("failed to persist task {task_id}: {e}");
         }
     }
     if let Err(e) = state.store.save_reputation_batch(&reputations) {
-        println!("failed to persist reputation after escrow settlement for task {task_id}: {e}");
+        error!("failed to persist reputation after escrow settlement for task {task_id}: {e}");
     }
     if let Err(e) = state.store.save_exchange_account_batch(&exchange_accounts) {
-        println!("failed to persist compute credit after escrow settlement for task {task_id}: {e}");
+        error!("failed to persist compute credit after escrow settlement for task {task_id}: {e}");
     }
     all_recorded
 }
@@ -1530,7 +1558,7 @@ async fn disburse_escrow(state: &AppState, deposit: &PendingDeposit, recipient: 
     let balance = match state.node.balance(&deposit.deposit_pubkey).await {
         Ok(balance) => balance,
         Err(e) => {
-            println!("failed to check balance for escrow {} before disbursing: {e}", deposit.id);
+            error!("failed to check balance for escrow {} before disbursing: {e}", deposit.id);
             return None;
         }
     };
@@ -1548,12 +1576,12 @@ async fn disburse_escrow(state: &AppState, deposit: &PendingDeposit, recipient: 
         )
         .await
         {
-            println!("failed to disburse escrow {} to {}: {e}", deposit.id, recipient);
+            error!("failed to disburse escrow {} to {}: {e}", deposit.id, recipient);
             return None;
         }
     }
     if let Err(e) = state.board.write().await.mark_escrow_refunded(deposit.id) {
-        println!("failed to mark escrow {} refunded: {e}", deposit.id);
+        error!("failed to mark escrow {} refunded: {e}", deposit.id);
         return None;
     }
     Some(net_amount)
@@ -1636,7 +1664,7 @@ pub async fn settle_dispute_bond(state: &AppState, task_id: Uuid) -> bool {
         state.board.write().await.credit_forfeited_bond(&winner, net_amount);
         let reputation = state.board.read().await.reputation(&winner);
         if let Err(e) = state.store.save_reputation(&winner, &reputation) {
-            println!("failed to persist forfeited-bond reputation credit for {winner}: {e}");
+            error!("failed to persist forfeited-bond reputation credit for {winner}: {e}");
         }
     }
     true
@@ -1679,12 +1707,12 @@ async fn settle_one_payout_inner(
     }
 
     if let Err(e) = pay_bounty(state, recipient, amount).await {
-        println!("payout for task {task_id} to {recipient} failed, will retry: {e}");
+        warn!("payout for task {task_id} to {recipient} failed, will retry: {e}");
         return false;
     }
 
     if let Err(e) = state.board.write().await.mark_recipient_paid(task_id, recipient, amount) {
-        println!(
+        error!(
             "payout for task {task_id} to {recipient} succeeded on-chain but mark_recipient_paid failed: {e}"
         );
         return false;
@@ -1698,7 +1726,7 @@ async fn settle_one_payout_inner(
     };
     if let Some(final_task) = &final_task {
         if let Err(e) = state.store.save_task(final_task) {
-            println!("failed to persist task {task_id}: {e}");
+            error!("failed to persist task {task_id}: {e}");
         }
         // A task tagged "compute" pays its winner in the tradeable
         // compute asset, on top of (not instead of) the ordinary bounty
@@ -1713,12 +1741,12 @@ async fn settle_one_payout_inner(
                 board.exchange_account(recipient)
             };
             if let Err(e) = state.store.save_exchange_account(recipient, &account) {
-                println!("failed to persist compute credit for {recipient}: {e}");
+                error!("failed to persist compute credit for {recipient}: {e}");
             }
         }
     }
     if let Err(e) = state.store.save_reputation(recipient, &reputation) {
-        println!("failed to persist reputation for {recipient}: {e}");
+        error!("failed to persist reputation for {recipient}: {e}");
     }
     true
 }
@@ -1791,17 +1819,17 @@ pub async fn confirm_exchange_deposit(
     };
     let account = state.board.read().await.exchange_account(&depositor);
     if let Err(e) = state.store.save_exchange_account(&depositor, &account) {
-        println!("failed to persist exchange account for {depositor}: {e}");
+        error!("failed to persist exchange account for {depositor}: {e}");
     }
     // The now-Consumed deposit's status also needs persisting, or a
     // restart before the next sweep tick would see it as still Reserved.
     if let Some(deposit) = state.board.read().await.get_pending_deposit(escrow_id) {
         if let Err(e) = state.store.save_pending_deposit(deposit) {
-            println!("failed to persist consumed escrow {escrow_id}: {e}");
+            error!("failed to persist consumed escrow {escrow_id}: {e}");
         }
     }
     if sweep_exchange_deposit(&state, escrow_id).await {
-        println!("swept exchange deposit {escrow_id} into pooled custody");
+        info!("swept exchange deposit {escrow_id} into pooled custody");
     }
     Ok(Json(ExchangeAccountDto::from(account)))
 }
@@ -1814,13 +1842,13 @@ pub async fn confirm_exchange_deposit(
 /// balance per fill).
 async fn persist_order_and_related(state: &AppState, order: &Order, trades: &[Trade]) {
     if let Err(e) = state.store.save_order(order) {
-        println!("failed to persist order {}: {e}", order.id);
+        error!("failed to persist order {}: {e}", order.id);
     }
     let mut touched_orders: BTreeSet<Uuid> = BTreeSet::new();
     let mut touched_accounts: BTreeSet<PublicKey> = BTreeSet::new();
     for trade in trades {
         if let Err(e) = state.store.save_trade(trade) {
-            println!("failed to persist trade {}: {e}", trade.id);
+            error!("failed to persist trade {}: {e}", trade.id);
         }
         touched_orders.insert(trade.buy_order_id);
         touched_orders.insert(trade.sell_order_id);
@@ -1833,7 +1861,7 @@ async fn persist_order_and_related(state: &AppState, order: &Order, trades: &[Tr
     for order_id in touched_orders {
         if let Some(resting) = board.get_order(order_id) {
             if let Err(e) = state.store.save_order(resting) {
-                println!("failed to persist resting order {order_id}: {e}");
+                error!("failed to persist resting order {order_id}: {e}");
             }
         }
     }
@@ -1846,7 +1874,7 @@ async fn persist_order_and_related(state: &AppState, order: &Order, trades: &[Tr
         .collect();
     drop(board);
     if let Err(e) = state.store.save_exchange_account_batch(&accounts) {
-        println!("failed to persist exchange account balances after a match: {e}");
+        error!("failed to persist exchange account balances after a match: {e}");
     }
 }
 
@@ -1898,7 +1926,7 @@ async fn credit_taker_fees_to_operator(state: &AppState, trades: &[Trade]) {
     }
     let operator_account = state.board.read().await.exchange_account(&state.operator_public_key);
     if let Err(e) = state.store.save_exchange_account(&state.operator_public_key, &operator_account) {
-        println!("failed to persist operator fee revenue: {e}");
+        error!("failed to persist operator fee revenue: {e}");
     }
 }
 
@@ -1918,11 +1946,11 @@ pub async fn cancel_order(
     let pubkey = envelope.verify()?;
     let order = state.board.write().await.cancel_order(order_id, &pubkey)?;
     if let Err(e) = state.store.save_order(&order) {
-        println!("failed to persist cancelled order {order_id}: {e}");
+        error!("failed to persist cancelled order {order_id}: {e}");
     }
     let account = state.board.read().await.exchange_account(&pubkey);
     if let Err(e) = state.store.save_exchange_account(&pubkey, &account) {
-        println!("failed to persist exchange account for {pubkey} after cancel: {e}");
+        error!("failed to persist exchange account for {pubkey} after cancel: {e}");
     }
     Ok(Json(OrderDto::from(&order)))
 }
@@ -1971,7 +1999,7 @@ pub async fn withdraw(
         state.board.write().await.credit_back_withdrawal(&pubkey, amount);
         let reverted = state.board.read().await.exchange_account(&pubkey);
         if let Err(e) = state.store.save_exchange_account(&pubkey, &reverted) {
-            println!("failed to persist reverted withdrawal balance for {pubkey}: {e}");
+            error!("failed to persist reverted withdrawal balance for {pubkey}: {e}");
         }
         return Err(ApiError::Internal(format!("withdrawal payout failed, please retry: {e}")));
     }
@@ -2017,7 +2045,7 @@ pub async fn faucet_claim(
             // costs at most a rare, harmless double-grant after restart,
             // never a wrongful permanent lockout.
             if let Err(e) = state.store.save_faucet_grant(&pubkey, Utc::now().timestamp()) {
-                println!("failed to persist faucet grant for {pubkey}: {e}");
+                error!("failed to persist faucet grant for {pubkey}: {e}");
             }
             Ok(Json(FaucetResultDto {
                 amount: FAUCET_GRANT_AMOUNT,
@@ -2623,6 +2651,6 @@ async fn persist_other_assignees_reputation(state: &AppState, task: &Task, alrea
             .collect()
     };
     if let Err(e) = state.store.save_reputation_batch(&entries) {
-        println!("failed to persist reputation for consensus assignees of task {} after resolution: {e}", task.id);
+        error!("failed to persist reputation for consensus assignees of task {} after resolution: {e}", task.id);
     }
 }

@@ -2,4 +2,6 @@
 **/*.rs.bk
 .env
 /.claude/
+*.priv.cbor
+*.redb
 

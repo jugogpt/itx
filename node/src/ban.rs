@@ -29,7 +29,7 @@ pub fn load_persisted(store: &btclib::store::BlockStore) {
     let bans = match store.load_bans() {
         Ok(bans) => bans,
         Err(e) => {
-            println!("failed to load persisted bans: {e}");
+            error!("failed to load persisted bans: {e}");
             return;
         }
     };
@@ -96,14 +96,14 @@ pub fn strike(ip: IpAddr, severe: bool) {
 
 fn ban_now(ip: IpAddr) {
     let until = Utc::now() + Duration::hours(BAN_DURATION_HOURS);
-    println!("banning peer {ip} until {until}");
+    warn!("banning peer {ip} until {until}");
     BANNED.insert(ip, until);
     // Best-effort: if this fails (or the store isn't up yet), the ban
     // still applies for the rest of this process's life, it just won't
     // survive a restart.
     if let Some(store) = crate::BLOCK_STORE.get() {
         if let Err(e) = store.save_ban(&ip.to_string(), until.timestamp()) {
-            println!("failed to persist ban for {ip}: {e}");
+            error!("failed to persist ban for {ip}: {e}");
         }
     }
 }

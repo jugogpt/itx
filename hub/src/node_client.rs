@@ -16,24 +16,63 @@ use tokio::net::TcpStream;
 /// recover from a dropped connection. Paying for a fresh handshake per
 /// call is cheap at this scale, and it means a single failed request
 /// never affects any other in-flight one.
+///
+/// Holds an ordered list of node addresses rather than one: `connect()`
+/// always tries `addresses[0]` first and only falls through to the next
+/// on failure. This is deliberately *not* load-balanced/round-robin --
+/// the hub's double-spend safety (`payout_lock`/`exchange_custody_payout_lock`)
+/// assumes every call sees one consistent mempool view, so spreading
+/// normal traffic across two independently-converging node mempools would
+/// reintroduce race risk. With ordered failover, all traffic goes to the
+/// primary in the healthy case (identical behavior to a single-node
+/// setup), and a secondary only takes over during an actual primary
+/// outage.
 #[derive(Clone)]
 pub struct NodeClient {
-    address: String,
+    addresses: Vec<String>,
 }
 
 impl NodeClient {
-    pub fn new(address: String) -> Self {
-        NodeClient { address }
+    pub fn new(addresses: Vec<String>) -> Self {
+        NodeClient { addresses }
     }
 
     async fn connect(&self) -> Result<TcpStream> {
-        let mut stream = TcpStream::connect(&self.address)
+        let mut last_err = None;
+        for address in &self.addresses {
+            match Self::connect_one(address).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    warn!("node at {address} unreachable, trying next: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no node addresses configured")))
+    }
+
+    async fn connect_one(address: &str) -> Result<TcpStream> {
+        let mut stream = TcpStream::connect(address)
             .await
-            .with_context(|| format!("failed to connect to node at {}", self.address))?;
+            .with_context(|| format!("failed to connect to node at {address}"))?;
         btclib::network::perform_handshake_initiator(&mut stream)
             .await
-            .map_err(|e| anyhow::anyhow!("handshake with node at {} failed: {e}", self.address))?;
+            .map_err(|e| anyhow::anyhow!("handshake with node at {address} failed: {e}"))?;
         Ok(stream)
+    }
+
+    /// Current chain height, from whichever configured node answers first
+    /// -- see `connect()`'s doc comment for the failover order. Used by
+    /// `GET /health` to prove the hub can actually reach a node, not just
+    /// that its own process is alive.
+    pub async fn chain_tip(&self) -> Result<u32> {
+        let mut stream = self.connect().await?;
+        let message = Message::AskChainTip;
+        message.send_async(&mut stream).await?;
+        match Message::receive_async(&mut stream).await? {
+            Message::ChainTip(height, _work) => Ok(height),
+            other => anyhow::bail!("unexpected response from node: {other:?}"),
+        }
     }
 
     /// Every UTXO currently belonging to `pubkey`, as reported by the

@@ -43,7 +43,7 @@ pub async fn record_sample(ip: IpAddr, offset: Duration) {
     let applied = match median_offset() {
         None => Duration::zero(),
         Some(median) if median.num_minutes().abs() > MAX_TIME_ADJUSTMENT_MINUTES => {
-            println!(
+            warn!(
                 "peer time offset {median} exceeds the {MAX_TIME_ADJUSTMENT_MINUTES}-minute \
                  safety bound; ignoring network time and trusting this node's own clock. \
                  Check your system clock if this persists."
