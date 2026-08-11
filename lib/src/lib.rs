@@ -21,20 +21,38 @@ construct_uint! {
 
 // initial reward in bitcoin - multiply by 10*S*8 to get satoshis
 pub const INITIAL_REWARD: u64 = 50;
-// halving interval in blocks
-pub const HALVING_INTERVAL: u64 = 210;
-// Ideal block time in seconds -- 600 (Bitcoin's own value), not the
-// original 10. At 10s the entire ~21,000-coin hard cap (INITIAL_REWARD *
-// HALVING_INTERVAL, see the reconciliation write-up) mints out in under a
-// day, which leaves no room for the currency to actually function as
-// scarce. 600s stretches that to ~48 days without changing the cap itself
-// (cap depends only on INITIAL_REWARD/HALVING_INTERVAL, not block time) --
-// deliberately not slower than that: several hub TTLs are minute-scale
-// (e.g. handlers::ESCROW_RESERVATION_TTL_MINUTES = 60), and those need
-// several confirmations' worth of margin inside their window, not just
-// one, to keep a normal deposit-then-confirm flow from being timing-
-// sensitive by accident.
-pub const IDEAL_BLOCK_TIME: u64 = 600;
+// halving interval in blocks -- 7875, not the original 210. Scaled up by
+// the same factor IDEAL_BLOCK_TIME was scaled down by (600s -> 16s), so
+// the ~21,000-coin hard cap (INITIAL_REWARD * HALVING_INTERVAL, see the
+// reconciliation write-up) still takes ~48 days of real time to mint out,
+// unchanged from before -- confirmation speed and supply-exhaustion speed
+// are deliberately decoupled rather than both riding on block time
+// together (previously 210 at 600s/block already gave ~48 days; 210 at
+// 16s/block alone would exhaust the whole cap in a couple of days instead,
+// permanently zeroing mining income far sooner than the project's own
+// economics were designed around).
+pub const HALVING_INTERVAL: u64 = 7875;
+// Ideal block time in seconds -- 16, not 600 (Bitcoin's own value) and not
+// the rounder-looking 15: IDEAL_BLOCK_TIME * DIFFICULTY_UPDATE_INTERVAL
+// needs to be evenly divisible by 4 for `adjust_target`'s clamp-to-1/4
+// bound (an integer division) to land on an exact ratio -- 16*50=800 does,
+// 15*50=750 doesn't, which surfaced as the previously-exact
+// adjust_target_clamps_a_much_faster_than_ideal_window_to_one_quarter test
+// failing by a ~0.27% rounding artifact once this changed from 600 (a
+// clean multiple of 4 at any DIFFICULTY_UPDATE_INTERVAL). Public agents
+// interacting with the hub (deposits, faucet claims, escrow confirmations)
+// feel every second of this directly, so favors fast confirmation over
+// Bitcoin-style security margins, which don't matter the same way here:
+// this is a closed-loop, single-miner testnet economy, not a chain
+// defending real value against a 51% attack. See HALVING_INTERVAL's own
+// comment for how supply exhaustion timing is kept unchanged despite
+// this. Several hub TTLs are minute-scale (e.g.
+// handlers::ESCROW_RESERVATION_TTL_MINUTES = 60) and need several
+// confirmations' worth of margin inside their window, not just one, to
+// keep a normal deposit-then-confirm flow from being timing-sensitive by
+// accident -- 16s still gives 60+ confirmations inside every such window,
+// far more margin than 600s ever did.
+pub const IDEAL_BLOCK_TIME: u64 = 16;
 // minimum target
 pub const MIN_TARGET: U256 = U256([
     0xFFFF_FFFF_FFFF_FFFF,
