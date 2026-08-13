@@ -1,4 +1,11 @@
 from .client import HubClient, HubError
 from .envelope import Agent
+from .identity import load_or_create_agent
 
-__all__ = ["Agent", "HubClient", "HubError"]
+# `mcp_server` is deliberately not imported here -- it depends on the
+# optional `mcp` extra, and importing it unconditionally would break
+# `from itx_agent_sdk import HubClient` for anyone who only installed the
+# base package. Import it directly: `from itx_agent_sdk.mcp_server import
+# build_server`.
+
+__all__ = ["Agent", "HubClient", "HubError", "load_or_create_agent"]

@@ -76,57 +76,6 @@ export interface ReputationDto {
 
 export type LeaderboardEntryDto = ReputationDto & { pubkey: string };
 
-// ---- Exchange v1 ----
-// Mirrors `hub/src/handlers.rs`'s ExchangeAccountDto/OrderDto/
-// OrderBookDto/TradeDto and `hub/src/board.rs`'s Side/OrderStatus, both
-// `#[serde(rename_all = "snake_case")]`. Read only, matching this
-// dashboard's own scope: the hub's CORS policy is GET-only (see
-// `hub/src/main.rs::build_router`), and this app holds no private key to
-// sign a write with, so placing or cancelling an order isn't something
-// this dashboard can do, only observe.
-
-export type Side = "buy" | "sell";
-export type OrderStatus = "open" | "filled" | "cancelled";
-
-export interface ExchangeAccountDto {
-  base_balance: number;
-  locked_base: number;
-  compute_balance: number;
-  locked_compute: number;
-}
-
-export interface OrderDto {
-  id: string;
-  owner: string;
-  side: Side;
-  price: number;
-  quantity: number;
-  filled: number;
-  status: OrderStatus;
-  created_at: string;
-}
-
-export interface OrderBookDto {
-  bids: OrderDto[];
-  asks: OrderDto[];
-}
-
-export interface TradeDto {
-  id: string;
-  buy_order_id: string;
-  sell_order_id: string;
-  buyer: string;
-  seller: string;
-  price: number;
-  quantity: number;
-  executed_at: string;
-  /** Which side placed the order that caused this match -- says what
-   * `taker_fee` is denominated in: compute if "buy", base currency if
-   * "sell". The maker side of every trade pays no fee. */
-  taker_side: Side;
-  taker_fee: number;
-}
-
 const DEFAULT_HUB_URL = "http://127.0.0.1:9100";
 
 export function hubUrl(): string {
@@ -178,25 +127,4 @@ export function getReputation(pubkey: string): Promise<ReputationDto> {
 
 export function getLeaderboard(): Promise<LeaderboardEntryDto[]> {
   return getJson<LeaderboardEntryDto[]>("/leaderboard");
-}
-
-export function getExchangeAccount(pubkey: string): Promise<ExchangeAccountDto> {
-  return getJson<ExchangeAccountDto>(`/exchange/account/${encodeURIComponent(pubkey)}`);
-}
-
-export function getOrderBook(): Promise<OrderBookDto> {
-  return getJson<OrderBookDto>("/exchange/orders");
-}
-
-export interface ListTradesParams {
-  offset?: number;
-  limit?: number;
-}
-
-export function listTrades(params: ListTradesParams = {}): Promise<TradeDto[]> {
-  const query = new URLSearchParams();
-  if (params.offset) query.set("offset", String(params.offset));
-  if (params.limit) query.set("limit", String(params.limit));
-  const qs = query.toString();
-  return getJson<TradeDto[]>(`/exchange/trades${qs ? `?${qs}` : ""}`);
 }

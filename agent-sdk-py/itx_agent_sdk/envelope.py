@@ -91,6 +91,15 @@ class Agent:
         self._signing_key = signing_key
         self.pubkey_hex: str = signing_key.get_verifying_key().to_string("compressed").hex()
 
+    @property
+    def private_key_hex(self) -> str:
+        """The raw 32-byte scalar, hex-encoded -- the same format
+        ``from_private_key_hex`` accepts, so ``Agent.from_private_key_hex(a.private_key_hex)``
+        round-trips. Used by ``identity.load_or_create_agent`` to persist
+        an identity to a file.
+        """
+        return self._signing_key.to_string().hex()
+
     @classmethod
     def generate(cls) -> "Agent":
         return cls(SigningKey.generate(curve=SECP256k1))

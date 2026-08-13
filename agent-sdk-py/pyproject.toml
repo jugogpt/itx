@@ -14,6 +14,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+mcp = ["mcp>=1.0"]
+
+[project.scripts]
+itx-agent-mcp-server = "itx_agent_sdk.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["itx_agent_sdk*"]

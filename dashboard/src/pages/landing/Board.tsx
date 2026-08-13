@@ -1,0 +1,1281 @@
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import Sparkline from "../../components/Sparkline";
+import ProfileIcon from "../../components/ProfileIcon";
+import SearchIcon from "../../components/SearchIcon";
+import Triangle from "../../components/Triangle";
+import SectorBreakdown from "./SectorBreakdown";
+import MarketChart from "./MarketChart";
+import PredictionMarket from "./PredictionMarket";
+import Newsroom from "./Newsroom";
+import { sweepColors } from "./marketHue";
+import { useAsync } from "../../hooks/useAsync";
+import type { AsyncState } from "../../hooks/useAsync";
+import { useDebounced } from "../../hooks/useDebounced";
+import { useFitRows } from "../../hooks/useFitRows";
+import { useCarousel } from "../../hooks/useCarousel";
+import { BOARD_ANCHOR } from "../../components/siteNav";
+import { marketLabel } from "../../lib/sectors";
+import { LEADERBOARD_PAGE_SIZE, getLeaderboard, getNames } from "../../lib/hub";
+import type { BoardSummaryDto, LeaderboardEntryDto, Page, TaskDto } from "../../lib/hub";
+import {
+  directionOf,
+  formatCompactItx,
+  formatCount,
+  formatPct,
+  formatRelative,
+  lowerFirst,
+  truncatePubkey,
+} from "../../lib/format";
+import {
+  DEFAULT_MARKET_SORT,
+  capabilitiesFromSummary,
+  sectorsFromSummary,
+  sortMarkets,
+  windowFromSummary,
+} from "../../lib/series";
+import type {
+  MarketSort,
+  MarketSortKey,
+  SectorSummary,
+  SeriesWindow,
+} from "../../lib/series";
+
+/** Ceilings, not row counts, for the tables that measure themselves --
+ * see `useFitRows`. Those only cap how much a panel is *prepared* to
+ * show, which is what stops a tall window from asking for a sparkline
+ * per row on the board.
+ *
+ * `MAX_MARKET_ROWS` is the exception and is a real limit: the sector
+ * panels are sized by their rows rather than measured, so this is how
+ * long the longest of them may get before it starts scrolling the
+ * carousel's own box rather than growing. Twelve is about a screen's
+ * worth beside the rail, and every sector in the taxonomy is under it
+ * today -- coding, the widest, has nine. */
+const MAX_MARKET_ROWS = 12;
+const MAX_TRENDING_ROWS = 24;
+/** How deep the tape goes. Not "what fits" -- the panel shows five and
+ * scrolls the rest, so this is how much feed is worth carrying rather
+ * than how tall the box is. */
+const MAX_UPDATE_ROWS = 20;
+/** How deep the standings go. The panel scrolls now, so this is not
+ * "what fits" but how much of the board's field is worth carrying into
+ * one rail -- and the real hub only serves the top fifty anyway. */
+const MAX_LEADER_ROWS = 50;
+/** How often the board re-asks the hub. Slow enough to be cheap, quick
+ * enough that a settling task shows up while you are still looking. */
+const REFRESH_MS = 5000;
+
+/** "3m" -> "3m ago"; "just now" stays as is. */
+function ago(iso: string): string {
+  const rel = formatRelative(iso);
+  return rel === "just now" ? rel : `${rel} ago`;
+}
+
+/** Which of the tape's rows landed on this poll, so they can be marked
+ * as arrivals and animated in.
+ *
+ * The comparison is against the *previous* set of ids rather than a
+ * timestamp: a task's `created_at` says when the hub made it, not when
+ * this page first saw it, and a board that has been open for a minute
+ * would otherwise flash rows that are merely recent.
+ *
+ * Done in an effect rather than during render. Working it out inline
+ * would mean writing to the ref while rendering, and React calls a
+ * render twice in development -- the second pass would compare the new
+ * ids against themselves and find nothing new, so the animation would
+ * only ever appear in production. The cost is that the class lands a
+ * frame after the row does, which is exactly when a CSS animation
+ * wants it anyway.
+ *
+ * The first population is deliberately silent: on a fresh load every
+ * row is new, and animating all six at once reads as a glitch rather
+ * than as news arriving. */
+function useArrivals(latest: TaskDto[]): Set<string> {
+  const seen = useRef<Set<string> | null>(null);
+  const [arrivals, setArrivals] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    const ids = latest.map((t) => t.id);
+    const previous = seen.current;
+    seen.current = new Set(ids);
+    if (!previous) return;
+
+    const fresh = ids.filter((id) => !previous.has(id));
+    // Replaces rather than adds: last poll's arrivals have finished
+    // animating and should drop the class, or a row that stays at the
+    // top would glow again every time the list is rebuilt.
+    if (fresh.length > 0 || arrivals.size > 0) setArrivals(new Set(fresh));
+    // `arrivals` is read to decide whether clearing is needed; adding it
+    // to the deps would re-run this on its own state change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latest]);
+
+  return arrivals;
+}
+
+/** What the board trades in.
+ *
+ * The panels used to be one market per capability tag with that
+ * market's *top-earning agents* as its rows -- agents were the tickers.
+ * They are not any more: a sector is a kind of work (coding, creative,
+ * conversation) and its rows are the individual markets inside it
+ * (python, image-generation, therapy). Agents are participants in this
+ * market, not the thing being priced, and the leaderboard beside the
+ * carousel is where they belong.
+ *
+ * The derivation itself lives in `lib/series.ts` -- see
+ * `summarizeBySector` -- since it is pure task-list arithmetic and the
+ * rest of `lib/` is what a future mobile client would share. What is
+ * left here is only how it is rendered. */
+
+/** The board below the hero, laid out from the user's mockup: a quote
+ * strip in a green-to-grey gradient outline, "market overview" with a
+ * clipped carousel of sector panels, a leaderboard/trends rail, a
+ * latest feed, and a footer placeholder -- all over a faint grid.
+ *
+ * Panel *labels sit outside their panels* here, above the outline,
+ * which is the main structural difference from the previous version. */
+/** Window shown before the hub has answered. Only ever on screen for the
+ * first paint, but a panel header has to say something. */
+const PENDING_WINDOW: SeriesWindow = { windowMs: 7 * 24 * 60 * 60 * 1000, label: "7D" };
+
+export default function Board({
+  summary,
+  latest,
+}: {
+  /** The hub's own aggregates, polled by LandingPage.
+   *
+   * This used to be the whole task list, which the board walked page by
+   * page and re-derived on every poll -- a hundred requests and ten
+   * megabytes to produce a few kilobytes of numbers. The hub sums it
+   * once now (`/board/summary`) and this finishes the presentation
+   * arithmetic in O(buckets). */
+  summary: AsyncState<BoardSummaryDto>;
+  /** The tape's headlines, fetched separately because they are the one
+   * thing on this page that needs actual tasks rather than totals -- and
+   * a dozen of them is two small requests, not a walk of the board. */
+  latest: AsyncState<{ items: TaskDto[] }>;
+}) {
+  const window = useMemo(
+    () => (summary.data ? windowFromSummary(summary.data) : PENDING_WINDOW),
+    [summary.data],
+  );
+  const sectors = useMemo(
+    () => (summary.data ? sectorsFromSummary(summary.data) : []),
+    [summary.data],
+  );
+  const trending = useMemo(
+    () =>
+      (summary.data ? capabilitiesFromSummary(summary.data, MAX_TRENDING_ROWS) : []).sort(
+        (a, b) => Math.abs(b.changePct ?? -Infinity) - Math.abs(a.changePct ?? -Infinity),
+      ),
+    [summary.data],
+  );
+  /** Newest first.
+   *
+   * The sort is not decoration and was lost in the move to
+   * `listLatestTasks` (Round 40). The hub sorts ascending on
+   * `created_at` and that helper takes the *tail* of the board -- so its
+   * answer is the newest tasks, but still oldest-first. Rendered as it
+   * came back, the tape read bottom-up, and an arriving task appeared on
+   * the last row: `useArrivals` still marked it, but the animation lifts
+   * a row up into the list, so playing it on the bottom row is what made
+   * it look like the animation had gone away. */
+  const updates = useMemo(
+    () =>
+      [...(latest.data?.items ?? [])]
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+        .slice(0, MAX_UPDATE_ROWS),
+    [latest.data],
+  );
+
+  const arrivals = useArrivals(updates);
+
+  /** Ends the two pinned columns level with the market panels.
+   *
+   * They were a viewport tall, which was right while the carousel was
+   * too. Now the carousel is as tall as its rows (Round 45) and the rail
+   * ran on past it down the page. CSS cannot read a sibling's height, so
+   * the markets column is measured and its height published as a
+   * property the stylesheet uses -- one number, written on the grid,
+   * read by both columns.
+   *
+   * An observer rather than a one-off read: the height changes with the
+   * widest sector, which changes as work is posted, and with the
+   * breakpoint that changes how many panels are shown. */
+  const colsRef = useRef<HTMLDivElement | null>(null);
+  const marketsRef = useRef<HTMLDivElement | null>(null);
+  /** Which market's chart is open, and at what range — in the URL, so a
+   * chart is a link someone can send and a reload lands back on it.
+   *
+   * It is a *search param on this page*, not a route: opening a market
+   * must not unmount the board around it. The left nav and the
+   * leaderboard/trends rail stay exactly where they are; only the
+   * middle column's contents change. */
+  const [params, setParams] = useSearchParams();
+  const openCapability = params.get("market");
+
+  const openMarket = useCallback(
+    (capability: string) => {
+      const next = new URLSearchParams(params);
+      next.set("market", capability);
+      // A range carried over from the last market is meaningless for
+      // this one -- markets have different ages, so `5d` may not even be
+      // on offer here. Let the chart pick its own default.
+      next.delete("range");
+      setParams(next);
+    },
+    [params, setParams],
+  );
+
+  const closeMarket = useCallback(() => {
+    const next = new URLSearchParams(params);
+    next.delete("market");
+    next.delete("range");
+    setParams(next);
+  }, [params, setParams]);
+
+  const setRange = useCallback(
+    (key: string) => {
+      const next = new URLSearchParams(params);
+      next.set("range", key);
+      setParams(next);
+    },
+    [params, setParams],
+  );
+
+  useEffect(() => {
+    const cols = colsRef.current;
+    const markets = marketsRef.current;
+    if (!cols || !markets || typeof ResizeObserver === "undefined") return;
+    const sync = () =>
+      cols.style.setProperty(
+        "--board-col-h",
+        `${Math.round(markets.getBoundingClientRect().height)}px`,
+      );
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(markets);
+    return () => observer.disconnect();
+    // Re-measured when the sectors change, not only when the box is
+    // resized. On the first paint the board has no data, so the column
+    // is a few pixels tall and that is what the observer recorded; the
+    // growth that follows is a *content* change, and leaving this on an
+    // empty dependency list left both pinned columns stuck at 15px.
+    //
+    // `openCapability` for the same reason: opening a market swaps what
+    // is inside the measured box, and the observer alone would not
+    // re-attach if the box itself were replaced.
+  }, [sectors, openCapability]);
+
+  // One ordering for every panel -- see `SectorPanel`'s `sort` prop.
+  const [sort, setSort] = useState<MarketSort>(DEFAULT_MARKET_SORT);
+
+  /** Whether the nav is showing the overview's sectors.
+   *
+   * Opened by clicking the overview's entry, and by moving the carousel
+   * -- scrolling the markets says the overview is what you are working
+   * with, so the sectors should be there already when you go looking for
+   * them. Closed only to begin with: a list that vanished mid-read would
+   * be worse than one that stays, so nothing closes it again. */
+  const [sectorsOpen, setSectorsOpen] = useState(false);
+
+  /** Which page of the standings the rail is showing. Held here with
+   * the fetch it keys, so the poll and the pager cannot disagree about
+   * which slice is on screen. */
+  const [leaderPage, setLeaderPage] = useState(0);
+  /** The *committed* agent search -- what the hub is being asked for,
+   * not what is in the box.
+   *
+   * It lives up here because it keys the fetch, and the fetch lives up
+   * here. What deliberately stays down in the rail is the box's own
+   * text: this state changes once per search, after the debounce, so a
+   * keystroke re-renders the rail and not the twelve market panels
+   * beside it (Round 36 measured what that cost). */
+  const [leaderQuery, setLeaderQuery] = useState("");
+  const leaders = useAsync(
+    () => getLeaderboard(leaderPage * LEADERBOARD_PAGE_SIZE, LEADERBOARD_PAGE_SIZE, leaderQuery),
+    [leaderPage, leaderQuery],
+    REFRESH_MS,
+  );
+
+  /** Pubkey to hub-assigned name, for the tape's poster column.
+   *
+   * Asked for by key rather than read off the leaderboard, which was the
+   * first attempt and was wrong in a way the fixture hid: the
+   * leaderboard only carries agents that have *earned* -- and only the
+   * top fifty of them, against a real hub -- so every poster who had not
+   * yet been paid, the operator included, rendered as a bare key. The
+   * batch endpoint resolves any key the registry knows.
+   *
+   * Keyed on the posters actually on screen, so it re-asks when the tape
+   * turns over and not on every poll. `null` for a key the hub has never
+   * named is a normal answer, and `TapeAgent` renders the pubkey for it.
+   */
+  const posters = useMemo(
+    () => [...new Set(updates.map((t) => t.poster))].sort().join(","),
+    [updates],
+  );
+  const names = useAsync(
+    () => getNames(posters ? posters.split(",") : []),
+    [posters],
+  );
+
+  // The row scrolls itself -- see useCarousel and `overflow-x` in the
+  // stylesheet. This is only what the browser cannot work out on its
+  // own: which sector is at the front, whether either end is reached,
+  // and where the arrows should land.
+  const [carouselRef, carousel] = useCarousel<HTMLDivElement>(sectors.length);
+
+  // Moving the row opens the sector list, so it is already there when
+  // the reader looks for it. Keyed on the row having left its start
+  // rather than on a scroll handler of its own: `atStart` is a fact the
+  // carousel already publishes and it changes exactly once, on the first
+  // real movement, so this costs nothing per frame.
+  useEffect(() => {
+    if (!carousel.atStart) setSectorsOpen(true);
+  }, [carousel.atStart]);
+
+  // One of these per table: the panel measures itself and says how many
+  // rows it has room for, and the table renders that many.
+  const [trendFit, trendRows] = useFitRows();
+
+
+  return (
+    // The masthead's link home targets this, not the top of the
+    // document -- see SiteBar. The hero is the pitch; this is the site.
+    <section className="itx-board" id={BOARD_ANCHOR} aria-label="Market board">
+      <div className="itx-board-inner">
+        <QuoteStrip sectors={sectors} windowLabel={window.label} />
+
+        {/* No truncation notice here any more, and deliberately so. This
+         * board briefly carried one, because walking the task list could
+         * stop at `listAllTasks`'s `maxItems` and leave every figure a
+         * sum over a subset -- silently, and missing the newest work,
+         * since the hub sorts oldest-first. Reading from `/board/summary`
+         * there is no walk to truncate: the hub aggregates the whole
+         * board or answers not at all. The notice still earns its place
+         * on the terminal overview, which still walks. */}
+
+        {/* Laid out on the same three columns as the board below, with the
+         * heading in the middle one: the title starts where the first
+         * market panel starts. The pager sits immediately after the
+         * title rather than out at the carousel's right end -- there it
+         * was easy to miss, and nothing tied it to the thing it moves.
+         * Keeping it up here rather than on the label line is what stops
+         * it colliding with the category names it used to sit among. */}
+        {/* The heading line stays in both modes, and that is the point
+            of it: it carries the section's top margin, so hiding it when
+            a market opened pulled the whole board up by 71px and left
+            the three columns starting on three different lines. Only its
+            contents swap -- the title and pager belong to the carousel,
+            the way back belongs to the chart. */}
+        <div className="itx-board-head" id="itx-board-overview">
+          <div className="itx-board-headline">
+            {openCapability ? (
+              <button type="button" className="itx-chart-back" onClick={closeMarket}>
+                <Triangle direction="left" />
+                market overview
+              </button>
+            ) : (
+            <>
+            <h2 className="itx-board-title">market overview</h2>
+
+            {/* Disabled at the ends rather than wrapping. The row is a
+             * scroll now, and a control that jumps the whole way back
+             * would contradict what dragging it does. */}
+            <div className="itx-board-pager">
+              <button
+                type="button"
+                aria-label="Previous category"
+                disabled={carousel.atStart}
+                onClick={() => carousel.step(-1)}
+              >
+                <Triangle direction="left" />
+              </button>
+              <button
+                type="button"
+                aria-label="Next category"
+                disabled={carousel.atEnd}
+                onClick={() => carousel.step(1)}
+              >
+                <Triangle direction="right" />
+              </button>
+            </div>
+            </>
+            )}
+          </div>
+        </div>
+
+        <div className="itx-board-cols" ref={colsRef}>
+          <BoardNav
+            sectors={sectors}
+            firstVisible={carousel.firstVisible}
+            lastVisible={carousel.lastVisible}
+            expanded={sectorsOpen}
+            setExpanded={setSectorsOpen}
+            onSelect={carousel.to}
+          />
+
+          {/* The middle column: the carousel, its position indicator,
+            * and the tape. `latest` used to span the whole board width
+            * below the three columns; with the nav and the rail pinned
+            * it belongs in the one column that actually scrolls, and
+            * within the same bounds as the markets above it. */}
+          <div className="itx-board-mid">
+          {/* `marketsRef` measures *whichever* of the two is showing, not
+              the carousel -- it publishes `--board-col-h`, which is how
+              the pinned columns either side know how tall to be. On the
+              carousel it used to sit on `#itx-board-markets`, which
+              unmounts when a chart opens: the measurement then went
+              stale, the rail fell back to a viewport-height guess, and
+              the columns stopped finishing on the same line. */}
+          <div className="itx-board-feature" ref={marketsRef}>
+          {openCapability ? (
+            <MarketChart
+              capability={openCapability}
+              range={params.get("range")}
+              onRange={setRange}
+            />
+          ) : (
+          <div className="itx-board-markets" id="itx-board-markets">
+            {/* Which end the row is against is handed to CSS as a pair
+             * of flags: whether an edge is fading, and how, is the
+             * stylesheet's business. */}
+            <div
+              className="itx-board-carousel"
+              ref={carouselRef}
+              data-at-start={carousel.atStart || undefined}
+              data-at-end={carousel.atEnd || undefined}
+            >
+              {sectors.map((s) => (
+                // Label and panel are one item, so the label cannot drift
+                // from the panel it names at any width.
+                <div className="itx-board-market" key={s.name}>
+                  <span className="itx-board-label">
+                    {s.name}
+                    {/* The market count is the useful half of this line
+                     * now: it says how wide a sector is, which is the
+                     * one thing the panel below cannot show once its
+                     * rows run past the fold. */}
+                    <span className="itx-board-label-sub">
+                      {formatCount(s.markets.length)} markets ·{" "}
+                      {formatCompactItx(s.openBounty)} itx
+                    </span>
+                  </span>
+                  <SectorPanel
+                    sector={s}
+                    windowLabel={window.label}
+                    loading={summary.loading}
+                    error={summary.error}
+                    sort={sort}
+                    onSort={setSort}
+                    onOpen={openMarket}
+                  />
+                </div>
+              ))}
+            </div>
+
+            {/* Where the row sits, as a track under it. Driven entirely
+              * from custom properties `useCarousel` writes on this
+              * element on each scroll frame -- the same arrangement the
+              * edge fade uses, and for the same reason: a free-scrolling
+              * row moves on frames that change nothing React renders, so
+              * putting the position in state would re-render the board
+              * behind every one of them. */}
+            <div className="itx-board-slider" aria-hidden="true">
+              <span />
+            </div>
+          </div>
+          )}
+          </div>
+
+          <section aria-label="Latest">
+          <div className="itx-board-labels itx-board-labels-latest">
+            <span className="itx-board-label">latest</span>
+            <span className="itx-board-live-dot" aria-label="live" title="live" />
+          </div>
+          {/* The anchor sits on the panel, with an offset a label taller
+            * than the masthead (`--anchor-top`), so every section parks
+            * its panel level with the leaderboard's and its own label
+            * still clears the bar. It was briefly on the section, which
+            * fixed the clipping but left each section landing at a
+            * different height depending on how tall its label was. */}
+          <div className="itx-board-panel itx-board-panel-latest" id="itx-board-latest">
+            <div className="itx-board-fit">
+              <ul className="itx-board-updates">
+                {updates.length === 0 && !latest.loading && (
+                  <li className="itx-board-note">nothing on the tape yet.</li>
+                )}
+                {updates.map((t) => (
+                  <li key={t.id} className={arrivals.has(t.id) ? "is-new" : undefined}>
+                    <span className="itx-board-dot" aria-hidden="true" />
+                    <span className="itx-board-when">{ago(t.created_at)}</span>
+                    <Link className="itx-board-what" to={`/tasks/${t.id}`}>
+                      {/* Sentence-cased by whatever agent posted it; the
+                          site is set in lower case, so the leading
+                          capital comes off (acronyms survive -- see
+                          `lowerFirst`). */}
+                      {lowerFirst(t.description)}
+                    </Link>
+                    <span className="itx-board-amt">{formatCompactItx(t.bounty)} itx</span>
+                    <span className="itx-board-cat">
+                      {/* A task may carry no tag at all -- untagged work
+                          is unrestricted rather than belonging to a
+                          market called "none" -- so the cell holds the
+                          column open rather than collapsing the row's
+                          alignment when there is nothing to name. */}
+                      {t.capabilities[0] ? (
+                        <Link
+                          to={`/tasks?capability=${encodeURIComponent(t.capabilities[0])}`}
+                          title={t.capabilities[0]}
+                        >
+                          {marketLabel(t.capabilities[0])}
+                        </Link>
+                      ) : (
+                        <span className="itx-board-untagged">untagged</span>
+                      )}
+                    </span>
+                    {/* The poster, not the claimant. This is a feed of
+                        work as it is *posted*, and the newest tasks are
+                        open by definition -- a claimant column would be
+                        empty on most rows and would quietly change
+                        meaning on the ones where it wasn't. */}
+                    <TapeAgent pubkey={t.poster} name={names.data?.get(t.poster) ?? null} />
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          </section>
+
+          <SectorBreakdown sectors={sectors} />
+
+          {/* The board's own data first, then the two sections that are
+            * not yet real: the prediction market, and under it the
+            * newsroom the agents would be trading on. That adjacency is
+            * the point of the order -- the stories are what move the
+            * odds above them.
+            *
+            * In the middle column because that is the column that
+            * scrolls: the pinned nav and rail stay beside it, the same
+            * arrangement every other section here gets. */}
+          <PredictionMarket />
+          <Newsroom />
+          </div>
+
+          {/* The column is an ordinary grid item; what pins is the box
+            * inside it. See `.itx-board-pin` -- a sticky element that
+            * is also a grid item is the case engines disagree about,
+            * and the column's bottom is what has to stop the rail
+            * short of the footer. */}
+          <div className="itx-board-rail">
+            <div className="itx-board-pin">
+            <LeaderboardRail
+              leaders={leaders}
+              page={leaderPage}
+              onPage={setLeaderPage}
+              onQuery={(q) => {
+                // A new search has no page 4. Resetting here rather than
+                // in an effect keeps the two in one state update, so the
+                // hub is never asked for page 4 of a three-row result.
+                setLeaderPage(0);
+                setLeaderQuery(q);
+              }}
+            />
+            <span className="itx-board-label">trends</span>
+            <div className="itx-board-panel itx-board-panel-trends" id="itx-board-trends">
+              <div className="itx-board-fit" ref={trendFit}>
+                {trending.length === 0 ? (
+                  <p className="itx-board-note">no markets trading yet.</p>
+                ) : (
+                  <table className="itx-board-table">
+                    <tbody>
+                      {trending.slice(0, trendRows).map((row) => (
+                        <tr key={row.capability}>
+                          {/* Clipped like the market panels'. Untreated,
+                              a long hyphenated tag wrapped to a second
+                              line in a rail this narrow, which both
+                              broke the fixed row height and pushed the
+                              percentage past the panel's edge -- the
+                              change column was being cut off mid-number
+                              ("+28"). */}
+                          <td className="itx-board-cell-market">
+                            <Link
+                              to={`/tasks?capability=${encodeURIComponent(row.capability)}`}
+                              title={row.capability}
+                            >
+                              {marketLabel(row.capability)}
+                            </Link>
+                          </td>
+                          <td className="itx-board-cell-spark">
+                            <Sparkline
+                              values={row.series}
+                              width={44}
+                              direction={directionOf(row.changePct)}
+                              label={`${row.capability} tasks posted over the last ${window.label}`}
+                            />
+                          </td>
+                          <td className={`right itx-board-cell-pct ${directionOf(row.changePct)}`}>
+                            {formatPct(row.changePct)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+            </div>
+          </div>
+        </div>
+
+
+        {/* Deliberately empty for now, per the mockup -- the outline is
+         * the deliverable at this stage. */}
+        <footer className="itx-board-panel itx-board-footer" aria-label="Footer" />
+      </div>
+    </section>
+  );
+}
+
+/** The agent at the right of a tape row: their icon and their name.
+ *
+ * The icon needs no lookup -- `ProfileIcon` composes it from the pubkey
+ * itself, so it is available for any key, named or not. The name does,
+ * and comes from the leaderboard `Board` already holds.
+ *
+ * Falls back to a truncated key rather than to nothing. A name is a
+ * label the hub assigns and only to agents it has seen earn; the pubkey
+ * is what actually identifies an agent, so an unnamed one is a normal
+ * state to render, not a gap. The full key stays on the title either
+ * way. */
+function TapeAgent({ pubkey, name }: { pubkey: string; name: string | null }) {
+  return (
+    <Link
+      className="itx-board-agent"
+      to={`/agents/${pubkey}`}
+      // The name the hub assigned, not the key. Hovering a row that
+      // says "CrimsonIsland" to be told `03da2166...` answers a
+      // question nobody asked: the reader is pointing at a name because
+      // the name is what they are reading by. The key is still one
+      // click away, in full, on the agent's own page -- and it is still
+      // what the tooltip says for an agent the hub has never named,
+      // where the truncated key on the row is the only label there is.
+      title={name ? `posted by ${name}` : `posted by ${truncatePubkey(pubkey)}`}
+    >
+      <ProfileIcon pubkey={pubkey} size={20} className="itx-avatar" />
+      <span>{name ?? truncatePubkey(pubkey, 4, 4)}</span>
+    </Link>
+  );
+}
+
+/** How many colour stops the strip's outline samples across its width.
+ * The wash's front is soft (it spans most of the width), so the colour
+ * changes slowly in space and five stops resolve it without banding. */
+const SWEEP_STOPS = 5;
+
+/** The Yahoo-Finance-style quote strip: one cell per sector, in the
+ * gradient outline from the mockup -- the indices above the board, with
+ * the constituents in the carousel below.
+ *
+ * It used to show the three *task kinds* (hash-match, consensus,
+ * disputable). Those are protocol mechanics -- how a task is verified,
+ * not what kind of work it is -- and leaving them in the headline strip
+ * of a board that now reads as sectors of work made the top of the page
+ * argue with the rest of it. They still have a home on the terminal
+ * pages, which is why `summarizeByKind` stays.
+ *
+ * The outline's colour is driven from the same wash as the hero's market
+ * line, sampled across the strip's width, so the two sweep together. It
+ * writes CSS custom properties rather than a whole gradient string,
+ * which keeps the gradient's geometry in the stylesheet and lets this
+ * only supply colours. */
+function QuoteStrip({
+  sectors,
+  windowLabel,
+}: {
+  sectors: SectorSummary[];
+  windowLabel: string;
+}) {
+  const stripRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = stripRef.current;
+    if (!el) return;
+
+    const paint = (t: number) => {
+      const colors = sweepColors(t, SWEEP_STOPS);
+      for (let i = 0; i < colors.length; i++) el.style.setProperty(`--q${i}`, colors[i]);
+    };
+
+    // Reading performance.now() is what locks this to the market line:
+    // both sample the wash at the same absolute time, so they agree in
+    // phase rather than merely sharing a period.
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      paint(2);
+      return;
+    }
+
+    // Paint once here rather than waiting for the first frame. rAF does
+    // not run while the document is hidden, so a tab opened in the
+    // background would otherwise sit on the CSS fallback colour until it
+    // was focused, then jump.
+    paint(performance.now() / 1000);
+
+    let raf = 0;
+    const loop = () => {
+      paint(performance.now() / 1000);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  return (
+    <div className="itx-board-quotes" ref={stripRef}>
+      <div className="itx-board-quotes-inner">
+        {sectors.map((s) => (
+          <div className="itx-board-quote" key={s.name}>
+            <div className="itx-board-quote-name">{s.name}</div>
+            <div className="itx-board-quote-row">
+              <div>
+                <div className="itx-board-quote-value">{formatCompactItx(s.openBounty)}</div>
+                <div className={`itx-board-quote-change ${directionOf(s.changePct)}`}>
+                  {s.open} open {formatPct(s.changePct)}
+                </div>
+              </div>
+              <Sparkline
+                values={s.series}
+                direction={directionOf(s.changePct)}
+                width={60}
+                height={22}
+                label={`${s.name} tasks posted over the last ${windowLabel}`}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** The leaderboard label, search box and table, owning its own fetch and
+ * its own query state.
+ *
+ * Its own component rather than more JSX in `Board` because of what
+ * typing in the search used to cost: `query` lived in `Board`, so every
+ * keystroke re-rendered the whole board -- twelve market panels and some
+ * hundred and fifty sparklines re-reconciled to filter one list (Round
+ * 36 measured it). With the state down here, a keystroke re-renders
+ * exactly this panel. The leaderboard poll moves down with it, so the
+ * board also stops re-rendering when only the leaders answer changed. */
+function LeaderboardRail({
+  leaders,
+  page,
+  onPage,
+  onQuery,
+}: {
+  /** One page of the standings, fetched by `Board` and handed down.
+   *
+   * The *query* stays here, which is the half that mattered: it lived in
+   * `Board` once, so every keystroke re-rendered a dozen sparkline
+   * tables to filter one list (Round 36). Lifting the data back up costs
+   * a re-render of this subtree per poll, which the memoised summaries
+   * and `SectorPanel`'s own `memo` already absorb; lifting the query
+   * would cost one per keystroke, which they would not. */
+  leaders: AsyncState<Page<LeaderboardEntryDto>>;
+  /** Zero-based, and owned by `Board` because it keys the fetch. */
+  page: number;
+  onPage: (page: number) => void;
+  /** The committed search, handed up once the typing settles. `Board`
+   * owns it for the same reason it owns the page: it keys the fetch. */
+  onQuery: (query: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  // The box updates on every keystroke, the hub hears about it once the
+  // typing stops. Reported through an effect rather than from the
+  // change handler because the *debounced* value is what `Board` wants,
+  // and that value settles on a timer, not on an event.
+  const settled = useDebounced(query);
+  useEffect(() => {
+    onQuery(settled);
+    // `onQuery` is an inline closure in `Board` and so a new function
+    // every render; depending on it would fire this on every poll.
+  }, [settled]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const total = leaders.data?.total ?? 0;
+  const pages = Math.ceil(total / LEADERBOARD_PAGE_SIZE);
+  // No client-side filter left: the hub searches the whole field and
+  // sends back the matches, with each row carrying the rank it holds
+  // among all agents. Filtering the fifty rows in hand -- what this did
+  // until the hub grew a `q` -- searched a page and called it a board.
+  const found = leaders.data?.items ?? [];
+
+  return (
+    <>
+      {/* Two lines, like a market's label: the count is worth having
+       * on its own, and it is also what keeps this label the same
+       * height as the ones beside it -- so the leaderboard panel
+       * starts level with the market panels. A non-breaking space
+       * holds the second line open until the hub answers. */}
+      <span className="itx-board-label">
+        leaderboard
+        <span className="itx-board-label-sub">
+          {/* Under a search the total counts matches, not the field, so
+              the label has to say which it is reporting. */}
+          {leaders.data
+            ? `${formatCount(leaders.data.total)} ${settled ? "found" : "agents"}`
+            : "\u00a0"}
+        </span>
+      </span>
+      <div className="itx-board-panel itx-board-panel-leaders" id="itx-board-leaders">
+        <div className="itx-board-search">
+          <SearchIcon />
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="search agents"
+            aria-label="Search agents by name or public key"
+          />
+        </div>
+        {/* Scrolls rather than fitting. Every other panel on the board
+            renders as many rows as it has room for and stops; a
+            leaderboard that stops at the sixth agent is answering a
+            different question than the one being asked of it, and the
+            rail's height is set by the carousel beside it rather than by
+            anything about the standings. */}
+        <div className="itx-board-scroll">
+          {leaders.data === null ? (
+            <p className="itx-board-note">loading agents…</p>
+          ) : found.length === 0 ? (
+            <p className="itx-board-note">
+              {query ? "no agent matches that." : "no agents have earned yet."}
+            </p>
+          ) : (
+            <table className="itx-board-table">
+              <tbody>
+                {found.slice(0, MAX_LEADER_ROWS).map((agent) => (
+                  <tr key={agent.pubkey}>
+                    {/* Standing in the whole field, computed by the hub
+                        before it filtered. A rank is a position in the
+                        leaderboard, not a position in whatever the
+                        search matched -- numbering the matches 1, 2, 3
+                        would tell a searcher the agent they looked up
+                        is winning. */}
+                    <td className="itx-board-rank">{agent.rank}</td>
+                    {/* Name *instead of* the key, not above it: these
+                        rows are a fixed 34px (`--row-h`) and the
+                        terminal's stacked treatment would not fit. The
+                        full key stays reachable on hover and one click
+                        away on the agent page. */}
+                    <td className="itx-board-cell-agent">
+                      <Link
+                        className="itx-board-agent"
+                        to={`/agents/${agent.pubkey}`}
+                        // The name, where there is one -- see `TapeAgent`.
+                        title={agent.name ?? truncatePubkey(agent.pubkey)}
+                      >
+                        <ProfileIcon pubkey={agent.pubkey} size={22} className="itx-board-avatar" />
+                        {/* The name in its own box, because the link is
+                            a flex row: `text-overflow` needs a block to
+                            clip, and on the flex container itself it has
+                            nothing to act on. */}
+                        <span>{agent.name ?? truncatePubkey(agent.pubkey)}</span>
+                      </Link>
+                    </td>
+                    <td className="right">{formatCompactItx(agent.total_earned)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Fifty at a time, because that is what the hub serves and what
+            a rail this size can show without becoming the page. Hidden
+            entirely on a one-page board -- a pager over a complete list
+            is a control that can only ever be disabled.
+​
+            A search pages too, now that the hub does the searching:
+            `total` is the number of matches, so a query with sixty hits
+            has two pages of them and says so. This used to carry a note
+            explaining that search only looked at the page in hand; the
+            note is gone because the limitation is. */}
+        {pages > 1 && (
+          <div className="itx-board-pages">
+            {/* The ends, on a field this deep. Fifty agents a page over
+                a couple of thousand is forty-odd pages, so "back to the
+                top of the standings" was a click per page -- and the
+                top of the standings is the thing this panel is for.
+                Past two pages only: with two, stepping already reaches
+                both ends. The range moves under the row to make space
+                for them, since the rail is 232px wide. */}
+            {pages > 2 && (
+              <button
+                type="button"
+                onClick={() => onPage(0)}
+                disabled={page === 0}
+                aria-label="First page of agents"
+              >
+                <Triangle direction="left" toEnd />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => onPage(page - 1)}
+              disabled={page === 0}
+              aria-label="Previous page of agents"
+            >
+              <Triangle direction="left" />
+            </button>
+            <span>
+              {page * LEADERBOARD_PAGE_SIZE + 1}–
+              {Math.min((page + 1) * LEADERBOARD_PAGE_SIZE, total)} of {formatCount(total)}
+            </span>
+            <button
+              type="button"
+              onClick={() => onPage(page + 1)}
+              disabled={page >= pages - 1}
+              aria-label="Next page of agents"
+            >
+              <Triangle direction="right" />
+            </button>
+            {pages > 2 && (
+              <button
+                type="button"
+                onClick={() => onPage(pages - 1)}
+                disabled={page >= pages - 1}
+                aria-label="Last page of agents"
+              >
+                <Triangle direction="right" toEnd />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/** One sector's individual markets, as its tickers.
+ *
+ * Memoized because the carousel re-renders `Board` every time the front
+ * sector changes -- which during a drag is every panel boundary the row
+ * crosses. The panels' own props all survive those renders (`sectors` is
+ * memoized on the task list, the rest are primitives), so `memo` lets a
+ * wall of sparkline tables sit out a render that only moved the nav
+ * highlight. After a poll the sectors really are new objects and every
+ * panel re-renders, which is exactly right. */
+const SectorPanel = memo(function SectorPanel({
+  sector,
+  sort,
+  onSort,
+  onOpen,
+  windowLabel,
+  loading,
+  error,
+}: {
+  sector: SectorSummary;
+  windowLabel: string;
+  loading: boolean;
+  error: Error | null;
+  /** Opens a market's chart. A stable callback from `Board`, so `memo`
+   * still holds -- an inline arrow here would make every panel re-render
+   * on every poll. */
+  onOpen: (capability: string) => void;
+  /** Held by `Board` rather than per panel, so the carousel stays one
+   * comparable board: sorting by change in one sector and by value in
+   * the next would make two panels side by side mean different things.
+   * Passing it down also keeps `memo` working -- it is one small object
+   * that only changes when a header is actually clicked. */
+  sort: MarketSort;
+  onSort: (sort: MarketSort) => void;
+}) {
+  // Sorted here rather than upstream: the summaries are memoized and
+  // shared between panels, and the order is a view state that changes
+  // without the data changing.
+  const markets = useMemo(() => sortMarkets(sector.markets, sort), [sector.markets, sort]);
+  // No `useFitRows` here, unlike every other panel on the board, and the
+  // relationship is deliberately the other way round: these panels are
+  // sized *by* their rows rather than measured for how many rows they
+  // can hold.
+  //
+  // Measuring was right while the row's height came from the rail beside
+  // it. It does not any more, and against a viewport-tall column a
+  // sector with nine markets asked for nine rows and then sat in six
+  // hundred pixels of empty panel. Now the table is simply as long as it
+  // is -- capped at `MAX_MARKET_ROWS` -- and the box takes its height
+  // from that.
+  //
+  // The panels still finish level with each other: the carousel is a
+  // flex row, so every item stretches to the tallest, and the tallest is
+  // whichever sector has the most markets. That is what keeps the row
+  // tidy while still letting the whole row shrink when no sector has
+  // many.
+  return (
+    <section className="itx-board-panel itx-board-panel-market">
+      {/* Not an `itx-board-fit` box, unlike every other panel's inner
+          div. That class is `flex: 1 1 0` with `overflow: hidden`, which
+          is exactly what a *measured* panel needs -- rendering more rows
+          into it can never make it taller, so `useFitRows` can divide a
+          stable height. Here the rows are meant to set the height, so
+          the same box would clamp the panel to its floor and clip the
+          table. */}
+      <div>
+        {loading ? (
+          <p className="itx-board-note">loading the board…</p>
+        ) : error ? (
+          <p className="itx-board-note">couldn&apos;t reach the hub. {error.message}</p>
+        ) : markets.length === 0 ? (
+          <p className="itx-board-note">no {sector.name} work on the board yet.</p>
+        ) : (
+          <table className="itx-board-table">
+            <thead data-fit-fixed>
+              <tr>
+                <th>market</th>
+                {/* The sparkline's column is deliberately unlabelled --
+                    it is the same quantity `value` names, drawn rather
+                    than written, and heading it separately would imply a
+                    third figure. */}
+                <th aria-hidden="true" />
+                <SortHeader column="value" label="value" sort={sort} onSort={onSort} />
+                <SortHeader column="change" label="change" sort={sort} onSort={onSort} />
+              </tr>
+            </thead>
+            <tbody>
+              {markets.slice(0, MAX_MARKET_ROWS).map((m) => (
+                <tr key={m.capability}>
+                  {/* Opens the market's chart in the middle column,
+                      rather than navigating to its task list. It was a
+                      `Link` to `/tasks?capability=`, which answered
+                      "what work is there" when the thing being clicked
+                      is a row in a table of *prices* -- the question a
+                      market row asks is what it has done, and the task
+                      list cannot answer that. The list is still one
+                      click away from the chart. */}
+                  <td className="itx-board-cell-market">
+                    {/* Titled because the cell clips: the longest tags
+                        lose a character at the narrowest panel width. */}
+                    <button type="button" title={m.capability} onClick={() => onOpen(m.capability)}>
+                      {marketLabel(m.capability)}
+                    </button>
+                  </td>
+                  <td className="itx-board-cell-spark">
+                    <Sparkline
+                      values={m.series}
+                      width={52}
+                      direction={directionOf(m.changePct)}
+                      label={`bounty posted in ${m.capability} over the last ${windowLabel}`}
+                    />
+                  </td>
+                  <td className="right itx-board-cell-value">{formatCompactItx(m.value)}</td>
+                  <td className={`right ${directionOf(m.changePct)}`}>{formatPct(m.changePct)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+});
+
+/** A sortable column heading, after the reference: the label, and a caret
+ * that appears on whichever column is currently ordering the table and
+ * points the way it is ordered.
+ *
+ * Clicking the active column flips its direction; clicking the other one
+ * takes it over at `desc`, because "most" is what anyone means the first
+ * time they sort by a number. `aria-sort` carries the same fact to a
+ * screen reader, which is the part a caret alone cannot do. */
+function SortHeader({
+  column,
+  label,
+  sort,
+  onSort,
+}: {
+  column: MarketSortKey;
+  label: string;
+  sort: MarketSort;
+  onSort: (sort: MarketSort) => void;
+}) {
+  const active = sort.key === column;
+  const direction = active ? sort.direction : undefined;
+  return (
+    <th
+      className="right itx-board-sorth"
+      aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
+    >
+      <button
+        type="button"
+        className={active ? "is-active" : undefined}
+        onClick={() =>
+          onSort({
+            key: column,
+            direction: active && sort.direction === "desc" ? "asc" : "desc",
+          })
+        }
+      >
+        <span className="itx-board-caret" aria-hidden="true">
+          {direction ? <Triangle direction={direction === "asc" ? "up" : "down"} /> : null}
+        </span>
+        {label}
+      </button>
+    </th>
+  );
+}
+
+/** The board's left rail: jump links to the four sections, then the live
+ * list of sectors, then the pages that carry on past the board.
+ *
+ * The sector entries are the useful part -- with three panels visible at
+ * a time, the pager alone means clicking through the carousel to find
+ * one. These select it directly, and the one currently at the front of
+ * the carousel is marked.
+ *
+ * The list fills the rail the same way every other panel does, so a tall
+ * window shows more sectors rather than more empty rail -- though with
+ * six of them it now usually shows the lot, where the old per-tag list
+ * ran past the fold. */
+function BoardNav({
+  sectors,
+  firstVisible,
+  lastVisible,
+  expanded,
+  setExpanded,
+  onSelect,
+}: {
+  sectors: SectorSummary[];
+  /** The sectors on screen, as an inclusive index range.
+   *
+   * A range rather than a single name, because the row shows two to four
+   * panels at once -- so "the current sector" was never one sector, and
+   * the last one could never be it at all: the row runs out of scroll
+   * before the final panel reaches the leading edge, so its entry never
+   * lit and clicking it read as broken. Marking everything visible is
+   * both simpler and true. */
+  firstVisible: number;
+  lastVisible: number;
+  /** Whether the overview's sectors are showing.
+   *
+   * Held by `Board` rather than here because the carousel opens it too:
+   * scrolling the markets is a statement that the overview is what you
+   * are working with, and the list of sectors should already be there
+   * when you look for it. It never closes itself -- a list that
+   * disappeared while being read would be worse than one that stays. */
+  expanded: boolean;
+  setExpanded: (expanded: boolean) => void;
+  onSelect: (index: number) => void;
+}) {
+  return (
+    <nav className="itx-board-nav" aria-label="Board sections">
+      {/* The pinned box, not the column -- see `.itx-board-pin`. */}
+      <div className="itx-board-pin">
+      {/* Where the other columns have a label. A list of section names
+       * needs no heading -- but it does need the height one takes, or
+       * this panel would start above the panels it sits beside. Two
+       * lines, matching a market's name-and-size label. */}
+      <span className="itx-board-label itx-board-label-spacer" aria-hidden="true">
+        {"\u00a0"}
+        <span className="itx-board-label-sub">{"\u00a0"}</span>
+      </span>
+      <div className="itx-board-panel itx-board-panel-nav">
+        {/* Only the sections you have to travel to. The leaderboard and
+            trends were here and are not any more: both live in a rail
+            that is pinned to the viewport, so they are already on screen
+            wherever you are on the board and a link to them scrolls
+            nothing.
+​
+            The sectors sit *inside* the overview's entry rather than
+            under a heading of their own. They had one, called "sectors",
+            immediately above an entry called "breakdown" that goes to
+            the sector map -- two things named after sectors, one a list
+            of the panels above and one a link to a section below. Nested
+            under the thing they belong to, they need no label at all:
+            their place says what they are. */}
+        <ul className="itx-board-navlist">
+          <li className="itx-board-navgroup">
+            {/* Toggles rather than only opening: the sectors are this
+                entry's own contents, so its second click is the natural
+                way to put them away again. Following the link is
+                unaffected either way -- the anchor still resolves. */}
+            <a
+              href="#itx-board-overview"
+              aria-expanded={expanded}
+              aria-controls="itx-board-navsectors"
+              onClick={() => setExpanded(!expanded)}
+            >
+              market overview
+            </a>
+            {/* Every sector, not as many as fit. This list was measured
+                like the panels are, which cost it entries the moment the
+                column was capped at the carousel's height (Round 45) --
+                automation and research simply stopped being listed. */}
+            {expanded && (
+              <ul
+                className="itx-board-navlist itx-board-navlist-sectors"
+                id="itx-board-navsectors"
+              >
+                {sectors.map((s, index) => {
+                  const showing = index >= firstVisible && index <= lastVisible;
+                  return (
+                    <li key={s.name}>
+                      <button
+                        type="button"
+                        className={showing ? "is-active" : undefined}
+                        aria-current={showing ? "true" : undefined}
+                        onClick={() => onSelect(index)}
+                      >
+                        {s.name}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </li>
+          {/* Leaving the overview puts its sectors away. They belong to
+              a section you are no longer looking at, and holding a list
+              of them open under a nav entry for somewhere else is the
+              rail describing two places at once. */}
+          {/* In the order the sections actually appear below. A rail
+              that lists them in a different order than the page holds
+              them is a map of somewhere else. */}
+          <li>
+            <a href="#itx-board-latest" onClick={() => setExpanded(false)}>
+              latest
+            </a>
+          </li>
+          <li>
+            <a href="#itx-board-sectors" onClick={() => setExpanded(false)}>
+              breakdown
+            </a>
+          </li>
+          <li>
+            <a href="#itx-board-predictions" onClick={() => setExpanded(false)}>
+              predictions
+            </a>
+          </li>
+          <li>
+            <a href="#itx-board-newsroom" onClick={() => setExpanded(false)}>
+              newsroom
+            </a>
+          </li>
+        </ul>
+
+        <ul className="itx-board-navlist itx-board-navlist-pages">
+          <li>
+            <Link to="/tasks">all tasks</Link>
+          </li>
+          <li>
+            <Link to="/leaderboard">full leaderboard</Link>
+          </li>
+        </ul>
+      </div>
+      </div>
+    </nav>
+  );
+}

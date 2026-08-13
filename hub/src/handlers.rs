@@ -250,6 +250,15 @@ pub struct TaskDto {
     /// Free-form capability tags, already normalized. Empty means
     /// unrestricted -- see `GET /tasks?capability=`.
     pub capabilities: BTreeSet<String>,
+    /// When the task was posted. Already the ordering key `list_tasks`
+    /// sorts by; exposed so clients can bucket tasks into a time series
+    /// (the dashboard's sparklines derive entirely from this field)
+    /// without the hub having to serve pre-aggregated stats.
+    ///
+    /// Note this is strictly a *creation* time. Nothing records when a
+    /// task was claimed, verified, or paid, so a client can chart when
+    /// work was posted but cannot honestly chart when it settled.
+    pub created_at: DateTime<Utc>,
     #[serde(flatten)]
     pub kind: TaskKindDto,
 }
@@ -281,6 +290,7 @@ impl From<&Task> for TaskDto {
             min_reputation: task.min_reputation,
             close_reason: task.close_reason,
             capabilities: task.capabilities.clone(),
+            created_at: task.created_at,
             kind,
         }
     }
@@ -298,6 +308,16 @@ pub struct ReputationDto {
     /// `leaderboard`) -- board-level `Reputation` has no way to know this
     /// on its own, so `From<Reputation>` alone can never populate it.
     pub net_worth: Option<u64>,
+    /// The agent's display name (see `crate::names`), e.g.
+    /// `SwiftWarlock`. Filled in by the caller from `AppState`'s
+    /// registry, for exactly the reason `net_worth` is -- board-level
+    /// `Reputation` doesn't know it, so `From<Reputation>` can't
+    /// populate it.
+    ///
+    /// `None` means "this pubkey has no name", not "names are off": a
+    /// pubkey with no history on the board is never named, so any
+    /// consumer must be able to fall back to rendering the pubkey.
+    pub name: Option<String>,
 }
 
 impl From<Reputation> for ReputationDto {
@@ -307,6 +327,7 @@ impl From<Reputation> for ReputationDto {
             failed: r.failed,
             total_earned: r.total_earned,
             net_worth: None,
+            name: None,
         }
     }
 }
@@ -314,6 +335,9 @@ impl From<Reputation> for ReputationDto {
 #[derive(Serialize)]
 pub struct LeaderboardEntryDto {
     pub pubkey: String,
+    /// This agent's standing in the **whole** field, one-based, taken
+    /// before any filtering or slicing.
+    pub rank: usize,
     #[serde(flatten)]
     pub reputation: ReputationDto,
 }
@@ -409,6 +433,56 @@ pub struct ListTasksQuery {
     /// either. Multi-tag AND/OR filtering isn't built -- nothing needs it
     /// yet, and it'd be a pure handler-side change if that changes.
     pub capability: Option<String>,
+    /// Which task statuses to list. **Absent means `Open` only** -- the
+    /// long-standing behaviour of this endpoint, deliberately unchanged
+    /// so existing agents and SDK callers that treat "listed" as
+    /// "claimable" keep working exactly as before.
+    ///
+    /// Accepts any single `TaskStatus` name (`Open`, `Claimed`,
+    /// `AwaitingDispute`, `Disputed`, `Verified`, `Paid`, `Closed`) or
+    /// the literal `all` for every status regardless. Matched
+    /// case-insensitively, the same forgiving treatment `capability`
+    /// already gets, so `?status=paid` and `?status=Paid` are the same
+    /// query.
+    ///
+    /// This exists because a public marketplace has to be able to show
+    /// *completed* work -- an economy that only ever displays unclaimed
+    /// tasks looks dead no matter how much has actually settled.
+    pub status: Option<String>,
+}
+
+/// What a `?status=` query resolves to.
+enum StatusFilter {
+    /// Every task, whatever its status (`?status=all`).
+    Any,
+    /// Exactly one status -- including `Open`, which reproduces the
+    /// endpoint's default behaviour.
+    Only(TaskStatus),
+}
+
+/// Parses `?status=` case-insensitively. Kept as a hand-written match
+/// rather than a serde derive on `TaskStatus` for two reasons: `all`
+/// isn't a `TaskStatus` at all, and an unrecognized value should produce
+/// a legible 400 naming the valid options rather than serde's opaque
+/// query-deserialization failure.
+fn parse_status_filter(raw: &str) -> Result<StatusFilter, ApiError> {
+    let normalized = raw.trim().to_lowercase();
+    Ok(match normalized.as_str() {
+        "all" => StatusFilter::Any,
+        "open" => StatusFilter::Only(TaskStatus::Open),
+        "claimed" => StatusFilter::Only(TaskStatus::Claimed),
+        "awaitingdispute" => StatusFilter::Only(TaskStatus::AwaitingDispute),
+        "disputed" => StatusFilter::Only(TaskStatus::Disputed),
+        "verified" => StatusFilter::Only(TaskStatus::Verified),
+        "paid" => StatusFilter::Only(TaskStatus::Paid),
+        "closed" => StatusFilter::Only(TaskStatus::Closed),
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown status {other:?} -- expected one of: all, Open, Claimed, \
+                 AwaitingDispute, Disputed, Verified, Paid, Closed"
+            )))
+        }
+    })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -672,28 +746,46 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
 pub async fn list_tasks(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListTasksQuery>,
-) -> Json<Vec<TaskDto>> {
+) -> Result<Response, ApiError> {
     let limit = query.limit.unwrap_or(DEFAULT_TASKS_PAGE_SIZE).min(MAX_TASKS_PAGE_SIZE);
     // Normalized the same way stored tags already are (see
     // validate_capabilities) -- a task with no capability tags at all
     // always matches an unfiltered query (no filter -> no exclusion), but
     // never matches a *specific* capability filter (nothing to match).
     let capability_filter = query.capability.map(|c| c.trim().to_lowercase());
+    let status_filter = query.status.as_deref().map(parse_status_filter).transpose()?;
     let board = state.board.read().await;
-    let mut tasks = board.list_open_tasks();
+    // No `?status=` keeps the original code path verbatim, down to the
+    // same `list_open_tasks` call -- the default response is byte-for-byte
+    // what it has always been, apart from each task's new `created_at`.
+    let mut tasks: Vec<&Task> = match status_filter {
+        None | Some(StatusFilter::Only(TaskStatus::Open)) => board.list_open_tasks(),
+        Some(StatusFilter::Any) => board.all_tasks().collect(),
+        Some(StatusFilter::Only(status)) => board.all_tasks().filter(|t| t.status == status).collect(),
+    };
     tasks.sort_by_key(|t| t.created_at);
-    Json(
-        tasks
-            .into_iter()
-            .filter(|t| match &capability_filter {
-                Some(tag) => t.capabilities.contains(tag),
-                None => true,
-            })
-            .skip(query.offset)
-            .take(limit)
-            .map(TaskDto::from)
-            .collect(),
-    )
+
+    let matched: Vec<&Task> = tasks
+        .into_iter()
+        .filter(|t| match &capability_filter {
+            Some(tag) => t.capabilities.contains(tag),
+            None => true,
+        })
+        .collect();
+    // Counted after filtering but before paging -- that's what makes it
+    // useful for "showing 50 of 312" and for sizing a pager.
+    let total = matched.len();
+
+    let page: Vec<TaskDto> = matched.into_iter().skip(query.offset).take(limit).map(TaskDto::from).collect();
+
+    // The total rides in a header rather than wrapping the body in an
+    // object, because changing the response shape from `[...]` to
+    // `{ tasks: [...], total: n }` would break every existing consumer at
+    // once -- the dashboard, both SDKs, and any running agent. A header
+    // is additive: clients that don't look for it never notice.
+    // Cross-origin readers also need it named in `Access-Control-Expose-
+    // Headers`, which `build_router`'s CORS layer does.
+    Ok(([("x-total-count", total.to_string())], Json(page)).into_response())
 }
 
 pub async fn get_task(
@@ -2072,27 +2164,181 @@ pub async fn get_reputation(
     };
     let mut dto = ReputationDto::from(reputation);
     dto.net_worth = state.node.balance(&pubkey).await.ok();
+    // Read-only lookup, never an assignment. This route is
+    // unauthenticated and resolves *any* well-formed pubkey (the
+    // dashboard's agent page is built on that), so minting a name here
+    // would let an anonymous caller drain the pool one GET at a time.
+    // Names are minted where an agent is actually known to the economy:
+    // the startup backfill and `leaderboard`, both of which work from
+    // the board's own reputation records.
+    dto.name = state.names.read().await.get(&pubkey).map(str::to_string);
     Ok(Json(dto))
 }
 
-/// Lists the top 50 agents by lifetime earnings, alongside each one's
-/// *current* on-chain balance (`net_worth`) -- a separate, live figure,
-/// not derivable from anything already stored in `board`. Balances are
-/// fetched from the node concurrently, one connection per pubkey
-/// (`NodeClient` is deliberately cheap to clone and reconnect with, see
-/// its own doc comment) rather than sequentially, so this doesn't take
-/// 50x as long as a single lookup. A pubkey whose lookup fails just gets
-/// `net_worth: null` in the response instead of failing the whole
-/// request -- the same "don't let one flaky call take down an unrelated
-/// read" posture `try_settle_verified_task` already takes with the node.
-pub async fn leaderboard(State(state): State<Arc<AppState>>) -> Json<Vec<LeaderboardEntryDto>> {
-    let entries = {
+/// How many agents one leaderboard request returns by default, and the
+/// most it will return however large a `limit` is asked for. Held at the
+/// same fifty the route served before it took a page, since that is what
+/// the balance fan-out below is sized for: a page is one node lookup per
+/// agent, and the ceiling is what stops a single request opening an
+/// unbounded number of them.
+const DEFAULT_LEADERBOARD_PAGE_SIZE: usize = 50;
+const MAX_LEADERBOARD_PAGE_SIZE: usize = 50;
+
+#[derive(Deserialize)]
+pub struct LeaderboardQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    /// Case-insensitive substring, matched against an agent's assigned
+    /// name and its hex pubkey. Absent or blank searches nothing and
+    /// returns the field in order.
+    pub q: Option<String>,
+    /// Which column ranks the field: `earned` (the default), `completed`
+    /// or `failed`. Unknown values fall back to `earned` rather than
+    /// failing the request -- a leaderboard that 400s because a client
+    /// sent a column it does not know is worse than one that answers in
+    /// its default order.
+    ///
+    /// **Deliberately not `net_worth`.** Every other column is in the
+    /// reputation map the board already holds, so ranking by it costs a
+    /// sort; net worth is a live balance the node answers for, fetched
+    /// one lookup per agent *for the page being served*. Ranking the
+    /// field by it would mean a lookup per agent in the whole field --
+    /// thousands of connections to order fifty rows.
+    pub sort: Option<String>,
+    /// `desc` (the default) or `asc`. Ascending is what makes `failed`
+    /// worth sorting in both directions -- "fewest failures" is a real
+    /// question about an agent, and "most" is the same question asked
+    /// the other way.
+    pub dir: Option<String>,
+}
+
+/// The columns the field can be ranked by, and the order it is ranked
+/// in. Parsed from the query rather than trusted: see `LeaderboardQuery`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeaderboardSort {
+    Earned,
+    Completed,
+    Failed,
+}
+
+impl LeaderboardSort {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("completed") => Self::Completed,
+            Some("failed") => Self::Failed,
+            _ => Self::Earned,
+        }
+    }
+
+    /// The figure this column ranks on, for one agent.
+    fn key(self, reputation: &Reputation) -> u64 {
+        match self {
+            Self::Earned => reputation.total_earned,
+            Self::Completed => reputation.completed,
+            Self::Failed => reputation.failed,
+        }
+    }
+}
+
+/// Whether an agent answers to `needle`, which the caller has already
+/// lowercased.
+///
+/// Substring rather than prefix on both halves, for different reasons.
+/// A name is two words joined without a separator (`SwiftWarlock`), so
+/// prefix matching would find it by "swift" and not by "warlock", and a
+/// reader who remembers one of the two words has no way to know which
+/// half they are holding. A pubkey is searched by whichever fragment the
+/// reader has in front of them -- often the truncated tail a table
+/// showed them, never the whole 66 characters.
+fn agent_matches(needle: &str, pubkey_hex: &str, name: Option<&str>) -> bool {
+    pubkey_hex.to_lowercase().contains(needle) || name.is_some_and(|n| n.to_lowercase().contains(needle))
+}
+
+/// A page of agents by lifetime earnings, alongside each one's *current*
+/// on-chain balance (`net_worth`) -- a separate, live figure, not
+/// derivable from anything already stored in `board`.
+///
+/// Paged, where this used to serve a flat top fifty and nothing else.
+/// Fifty is the whole field on a small board and a rounding error on a
+/// real one, and a leaderboard that silently stops at fiftieth place is
+/// answering a different question than the one being asked of it. The
+/// full count rides in `X-Total-Count`, the same header `list_tasks`
+/// uses, so a caller can size a pager without walking the pages.
+///
+/// Balances are fetched from the node concurrently, one connection per
+/// pubkey (`NodeClient` is deliberately cheap to clone and reconnect
+/// with, see its own doc comment) rather than sequentially, so this
+/// doesn't take 50x as long as a single lookup. A pubkey whose lookup
+/// fails just gets `net_worth: null` in the response instead of failing
+/// the whole request -- the same "don't let one flaky call take down an
+/// unrelated read" posture `try_settle_verified_task` already takes with
+/// the node.
+///
+/// `q` searches the **whole field** by name or pubkey, which is the
+/// half a client cannot do for itself: filtering a page of fifty
+/// searches fifty agents and calls it a board. Matching happens after
+/// the ranking and before the slice, so each entry keeps the `rank` it
+/// holds among all agents and the pager sizes to the matches rather than
+/// to the field.
+pub async fn leaderboard(State(state): State<Arc<AppState>>, Query(query): Query<LeaderboardQuery>) -> Response {
+    let limit = query.limit.unwrap_or(DEFAULT_LEADERBOARD_PAGE_SIZE).min(MAX_LEADERBOARD_PAGE_SIZE);
+    let offset = query.offset.unwrap_or(0);
+    let needle = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+    let sort = LeaderboardSort::parse(query.sort.as_deref());
+    let ascending = query.dir.as_deref().map(str::trim) == Some("asc");
+
+    let ranked = {
         let board = state.board.read().await;
-        board.leaderboard(50)
+        // The whole ranking, then the slice asked for. Ranking is what
+        // makes a leaderboard a leaderboard, so it cannot be done per
+        // page -- and the sort is over the reputation map the board
+        // already holds in memory, which is the same work the flat
+        // top-fifty did.
+        let mut ranked = board.leaderboard(usize::MAX);
+        // Re-ranked here rather than in `board.leaderboard`, which keeps
+        // meaning "the field by earnings" for its other caller (the
+        // startup backfill).
+        //
+        // **The pubkey is the tiebreak, and it is load-bearing.** The
+        // columns other than earnings tie constantly -- most of the
+        // field has completed 0 and failed 0 -- and a page is a slice of
+        // this order. Without a total order, two agents that tie could
+        // swap places between the request for page 1 and the request for
+        // page 2, and an agent would be served twice or not at all.
+        if sort != LeaderboardSort::Earned || ascending {
+            ranked.sort_by(|a, b| {
+                let (left, right) = (sort.key(&a.1), sort.key(&b.1));
+                let by_column = if ascending { left.cmp(&right) } else { right.cmp(&left) };
+                by_column.then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+            });
+        }
+        ranked
+    };
+
+    // Ranks are attached here, over the unfiltered order, so a search
+    // reports where an agent actually stands. Names come from a
+    // read-only borrow of the registry: an agent the registry has never
+    // named is still searchable by key, and naming anything at this
+    // point would mint from the pool on behalf of an anonymous caller
+    // (see `names`).
+    let (total, entries) = {
+        let registry = state.names.read().await;
+        // Collected before slicing because the total is the count of
+        // matches, and a lazy filter has no length until it has been run.
+        let matching: Vec<(usize, (PublicKey, Reputation))> = ranked
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (pubkey, _))| match &needle {
+                None => true,
+                Some(needle) => agent_matches(needle, &pubkey.to_string(), registry.get(pubkey)),
+            })
+            .collect();
+        let total = matching.len();
+        (total, matching.into_iter().skip(offset).take(limit).collect::<Vec<_>>())
     };
 
     let mut lookups = tokio::task::JoinSet::new();
-    for (pubkey, _) in &entries {
+    for (_, (pubkey, _)) in &entries {
         let node = state.node.clone();
         let pubkey = pubkey.clone();
         lookups.spawn(async move {
@@ -2107,17 +2353,492 @@ pub async fn leaderboard(State(state): State<Arc<AppState>>) -> Json<Vec<Leaderb
         }
     }
 
-    Json(
-        entries
-            .into_iter()
-            .map(|(pubkey, reputation)| {
-                let pubkey_hex = pubkey.to_string();
-                let mut reputation = ReputationDto::from(reputation);
-                reputation.net_worth = net_worths.get(&pubkey_hex).copied();
-                LeaderboardEntryDto { pubkey: pubkey_hex, reputation }
-            })
-            .collect(),
-    )
+    // Every pubkey here came from the board's reputation map, so each is
+    // an agent that has actually done something -- which is what makes
+    // minting a name at read time safe. Startup already named everyone
+    // it found, so in the steady state this assigns nothing and writes
+    // nothing; it exists to catch agents that first appeared since the
+    // hub came up.
+    let names = state.ensure_named(entries.iter().map(|(_, (pubkey, _))| pubkey.clone())).await;
+
+    let page: Vec<LeaderboardEntryDto> = entries
+        .into_iter()
+        .map(|(index, (pubkey, reputation))| {
+            let pubkey_hex = pubkey.to_string();
+            let mut reputation = ReputationDto::from(reputation);
+            reputation.net_worth = net_worths.get(&pubkey_hex).copied();
+            reputation.name = names.get(&pubkey_hex).cloned();
+            // `enumerate` counted from the ranking, so this is a
+            // position in the field and survives both the filter and
+            // the slice. One-based, because it is shown to people.
+            LeaderboardEntryDto { pubkey: pubkey_hex, rank: index + 1, reputation }
+        })
+        .collect();
+
+    ([("x-total-count", total.to_string())], Json(page)).into_response()
+}
+
+/// How many pubkeys one `names` request may ask about. Sized for a
+/// screenful of rows rather than for bulk export -- a caller wanting the
+/// whole registry wants `leaderboard`, and an unbounded list here would
+/// let one request walk the map.
+const MAX_NAMES_LOOKUP: usize = 64;
+
+#[derive(Deserialize)]
+pub struct NamesQuery {
+    /// Comma-separated hex pubkeys.
+    pub pubkeys: String,
+}
+
+/// Resolves display names for a batch of pubkeys in one request.
+///
+/// The dashboard's tape shows who posted each task, and the answer for
+/// twenty rows was previously either twenty `reputation` requests or the
+/// `leaderboard`, which only carries the top earners -- so anyone who
+/// had posted work without yet being paid for it, the operator
+/// included, showed as a truncated key.
+///
+/// **Read-only, and deliberately non-minting**, for exactly the reason
+/// `get_reputation` is: this route is unauthenticated and resolves any
+/// well-formed pubkey, so assigning names here would let an anonymous
+/// caller drain the pool a request at a time. A key the registry has
+/// never seen comes back `null`, which is a normal answer and the one
+/// the client already renders a pubkey for.
+pub async fn names(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<NamesQuery>,
+) -> Result<Json<HashMap<String, Option<String>>>, ApiError> {
+    let registry = state.names.read().await;
+    Ok(Json(lookup_names(&registry, &query.pubkeys)))
+}
+
+/// The lookup itself, against a registry rather than the whole app
+/// state, so it can be tested without standing a hub up.
+fn lookup_names(registry: &crate::names::NameRegistry, pubkeys: &str) -> HashMap<String, Option<String>> {
+    let mut out = HashMap::new();
+    for hex in pubkeys.split(',').filter(|s| !s.trim().is_empty()).take(MAX_NAMES_LOOKUP) {
+        let hex = hex.trim();
+        // A malformed key is skipped rather than failing the batch: the
+        // caller asked about a set of rows, and one bad entry should not
+        // cost it the names for all the others.
+        let Ok(pubkey) = parse_hex_pubkey(hex) else { continue };
+        out.insert(hex.to_string(), registry.get(&pubkey).map(str::to_string));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Board summary
+// ---------------------------------------------------------------------
+//
+// One request that answers "what does this board look like right now",
+// so a dashboard does not have to page through every task to find out.
+//
+// The problem it solves: every headline figure a market view shows --
+// value on offer, value settled, how big a capability is, what its
+// activity looks like over time -- is an aggregate over the whole task
+// list, and `/tasks` only serves pages of at most `MAX_TASKS_PAGE_SIZE`.
+// A client wanting the totals had no choice but to walk the entire board
+// and re-derive them, on first paint and again on every poll.
+//
+// What it deliberately does not do is decide what those capabilities
+// *mean*. Grouping tags into sectors ("coding", "creative") is a
+// product's reading of the board, differs between clients, and would
+// freeze a taxonomy into the protocol; this returns one row per tag and
+// lets the caller group them. For the same reason it returns raw
+// per-bucket arrays rather than percentages: how a change is computed
+// is a presentation decision, and the caller already has that
+// arithmetic.
+
+/// How many points every series in a board summary carries. Matches the
+/// dashboard's `DEFAULT_BUCKETS` -- the number is a rendering detail, so
+/// it is reported in the response rather than left to be assumed.
+const SUMMARY_BUCKETS: usize = 24;
+
+/// Charting windows a summary may pick from, smallest first. A fixed
+/// window is wrong at both ends of a board's life -- on one seeded an
+/// hour ago every task lands in the last bucket, and on a year-old board
+/// a week hides nearly all of it -- so the smallest window covering the
+/// board's real age wins.
+const SUMMARY_WINDOWS_MS: [u64; 6] = [
+    3_600_000,     // 1H
+    21_600_000,    // 6H
+    86_400_000,    // 24H
+    604_800_000,   // 7D
+    2_592_000_000, // 30D
+    7_776_000_000, // 90D
+];
+
+/// Window used when the board has nothing to measure. Picking the
+/// *narrowest* window for an empty board would be technically true and
+/// useless.
+const SUMMARY_DEFAULT_WINDOW_MS: u64 = 604_800_000;
+
+#[derive(Serialize)]
+pub struct BoardSummaryDto {
+    /// When the oldest task on the board was created, RFC3339, or `None`
+    /// on an empty board.
+    ///
+    /// The board's *age*, in other words -- which is what a client needs
+    /// to decide how far back it is meaningful to chart. `window_ms`
+    /// below cannot answer that: it is a preset rounded up from the age,
+    /// so a board eight days old and one twenty-nine days old both
+    /// report 30D.
+    pub first_task_at: Option<String>,
+    /// How far back the series reach from the moment of this request.
+    pub window_ms: u64,
+    /// Length of every series below.
+    pub buckets: usize,
+    /// Tasks the summary was computed from -- the whole board, not a
+    /// page of it. Lets a caller sanity-check that it is not looking at
+    /// a subset without counting the rows itself.
+    pub total_tasks: usize,
+    pub totals: BoardTotalsDto,
+    pub kinds: Vec<KindSummaryDto>,
+    pub capabilities: Vec<CapabilitySummaryDto>,
+}
+
+#[derive(Serialize)]
+pub struct BoardTotalsDto {
+    pub open_tasks: usize,
+    pub open_bounty: u64,
+    pub paid_tasks: usize,
+    pub paid_bounty: u64,
+    /// Tasks posted per bucket, oldest bucket first.
+    pub posted_series: Vec<u64>,
+}
+
+#[derive(Serialize)]
+pub struct KindSummaryDto {
+    /// `hash_match` | `consensus` | `disputable`, matching the `kind` tag
+    /// `TaskDto` serializes.
+    pub kind: &'static str,
+    pub open: usize,
+    pub open_bounty: u64,
+    pub posted: usize,
+    pub posted_series: Vec<u64>,
+}
+
+#[derive(Serialize)]
+pub struct CapabilitySummaryDto {
+    pub capability: String,
+    pub open: usize,
+    pub open_bounty: u64,
+    pub posted: usize,
+    /// Tasks posted per bucket, oldest first.
+    pub posted_series: Vec<u64>,
+    /// Bounty posted per bucket, oldest first -- the series a value
+    /// chart is drawn from, where `posted_series` drives an activity
+    /// chart. Both are returned because the two answer different
+    /// questions and neither can be derived from the other.
+    pub bounty_series: Vec<u64>,
+}
+
+/// The wire name for a task kind. Hand-written rather than derived so it
+/// cannot drift from `TaskKindDto`'s `#[serde(tag = "kind")]` casing
+/// without this file changing too.
+fn kind_slug(kind: &TaskKind) -> &'static str {
+    match kind {
+        TaskKind::HashMatch { .. } => "hash_match",
+        TaskKind::Consensus { .. } => "consensus",
+        TaskKind::Disputable { .. } => "disputable",
+    }
+}
+
+pub async fn board_summary(State(state): State<Arc<AppState>>) -> Json<BoardSummaryDto> {
+    let board = state.board.read().await;
+    let tasks: Vec<&Task> = board.all_tasks().collect();
+    Json(summarize_board(&tasks, Utc::now()))
+}
+
+/// The aggregation itself, with `now` passed in rather than read from the
+/// clock -- same discipline `TaskBoard` follows, and what lets the tests
+/// pin a bucket boundary instead of racing one.
+fn summarize_board(tasks: &[&Task], now: DateTime<Utc>) -> BoardSummaryDto {
+    let first_task_at = tasks.iter().map(|t| t.created_at).min();
+    // Widest span the board actually covers, then the smallest preset
+    // that holds it. Clamped at zero so a task timestamped in the future
+    // (clock skew between a client and this host) cannot produce a
+    // negative span and collapse the axis.
+    let window_ms = match first_task_at {
+        None => SUMMARY_DEFAULT_WINDOW_MS,
+        Some(oldest) => {
+            let span = (now - oldest).num_milliseconds().max(0) as u64;
+            SUMMARY_WINDOWS_MS
+                .iter()
+                .copied()
+                .find(|w| *w >= span)
+                .unwrap_or(SUMMARY_WINDOWS_MS[SUMMARY_WINDOWS_MS.len() - 1])
+        }
+    };
+
+    let start_ms = now.timestamp_millis() - window_ms as i64;
+    let bucket_ms = window_ms as f64 / SUMMARY_BUCKETS as f64;
+
+    // Which bucket a task falls in, or `None` if it is outside the
+    // window. Tasks older than the window are dropped rather than piled
+    // into bucket zero, where a leading spike of ancient history would
+    // flatten everything recent into an unreadable baseline.
+    let bucket_of = |task: &Task| -> Option<usize> {
+        let at = task.created_at.timestamp_millis();
+        if at < start_ms || at > now.timestamp_millis() {
+            return None;
+        }
+        Some((((at - start_ms) as f64 / bucket_ms) as usize).min(SUMMARY_BUCKETS - 1))
+    };
+
+    let zeros = || vec![0u64; SUMMARY_BUCKETS];
+
+    let mut totals =
+        BoardTotalsDto { open_tasks: 0, open_bounty: 0, paid_tasks: 0, paid_bounty: 0, posted_series: zeros() };
+    // Kinds are seeded rather than discovered, so a board with no
+    // consensus work still reports a consensus row of zeros instead of
+    // dropping the category out of the response entirely.
+    let mut kinds: Vec<KindSummaryDto> = ["hash_match", "consensus", "disputable"]
+        .into_iter()
+        .map(|kind| KindSummaryDto { kind, open: 0, open_bounty: 0, posted: 0, posted_series: zeros() })
+        .collect();
+    let mut capabilities: HashMap<&str, CapabilitySummaryDto> = HashMap::new();
+
+    // One pass over the board. Everything below is accumulation into
+    // fixed-size buckets, so this is linear in tasks and independent of
+    // how many tags or kinds are in play.
+    for task in tasks {
+        let bucket = bucket_of(task);
+        let is_open = task.status == TaskStatus::Open;
+
+        if is_open {
+            totals.open_tasks += 1;
+            totals.open_bounty += task.bounty;
+        }
+        if task.status == TaskStatus::Paid {
+            totals.paid_tasks += 1;
+            totals.paid_bounty += task.bounty;
+        }
+        if let Some(b) = bucket {
+            totals.posted_series[b] += 1;
+        }
+
+        let slug = kind_slug(&task.kind);
+        if let Some(entry) = kinds.iter_mut().find(|k| k.kind == slug) {
+            entry.posted += 1;
+            if is_open {
+                entry.open += 1;
+                entry.open_bounty += task.bounty;
+            }
+            if let Some(b) = bucket {
+                entry.posted_series[b] += 1;
+            }
+        }
+
+        // A tag repeated on one task must not count it twice. Tags are
+        // normalized and deduplicated before they reach the board (see
+        // `validate_capabilities`), so this is belt-and-braces against a
+        // task stored before that was true.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for capability in &task.capabilities {
+            if !seen.insert(capability.as_str()) {
+                continue;
+            }
+            let entry = capabilities.entry(capability.as_str()).or_insert_with(|| CapabilitySummaryDto {
+                capability: capability.clone(),
+                open: 0,
+                open_bounty: 0,
+                posted: 0,
+                posted_series: zeros(),
+                bounty_series: zeros(),
+            });
+            entry.posted += 1;
+            if is_open {
+                entry.open += 1;
+                entry.open_bounty += task.bounty;
+            }
+            if let Some(b) = bucket {
+                entry.posted_series[b] += 1;
+                entry.bounty_series[b] += task.bounty;
+            }
+        }
+    }
+
+    // Biggest first by value on offer, so a caller rendering the top few
+    // gets the ones that matter without sorting again. Ties break on the
+    // tag itself rather than on hash order, or the response would
+    // reshuffle between identical requests.
+    let mut capabilities: Vec<CapabilitySummaryDto> = capabilities.into_values().collect();
+    capabilities.sort_by(|a, b| {
+        b.open_bounty.cmp(&a.open_bounty).then_with(|| b.open.cmp(&a.open)).then_with(|| a.capability.cmp(&b.capability))
+    });
+
+    BoardSummaryDto {
+        first_task_at: first_task_at.map(|t| t.to_rfc3339()),
+        window_ms,
+        buckets: SUMMARY_BUCKETS,
+        total_tasks: tasks.len(),
+        totals,
+        kinds,
+        capabilities,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Market series
+// ---------------------------------------------------------------------
+//
+// `board_summary` answers "what does the board look like right now" at
+// one window the hub picks. This answers "what has *this* market done
+// over a window the caller picks", which is a different question and the
+// one a chart asks.
+//
+// It exists because the summary cannot be made to do it. Its window is
+// derived from the board's age and its resolution is fixed at 24
+// buckets, both deliberately -- it is a dashboard's worth of numbers in
+// one small response. A chart with range tabs needs the same market at
+// six different spans and rather more than 24 points, and asking for the
+// whole board six times to read one column out of it is the page-walk
+// this endpoint family was built to end.
+
+/// How many points one series request may ask for. A chart is a few
+/// hundred pixels wide, so past this the extra buckets are sub-pixel and
+/// only cost the hub a longer pass and the client a bigger parse.
+const MAX_SERIES_BUCKETS: usize = 240;
+const DEFAULT_SERIES_BUCKETS: usize = 96;
+
+/// Shortest window a series may cover. A window of zero would divide by
+/// zero working out the bucket width; a window of a millisecond is not
+/// wrong so much as useless, and this keeps the axis labellable.
+const MIN_SERIES_WINDOW_MS: u64 = 60_000;
+
+#[derive(Deserialize)]
+pub struct SeriesQuery {
+    /// Which market. Omitted means the whole board, which is what the
+    /// overview's own chart wants.
+    pub capability: Option<String>,
+    /// How far back to reach. Defaults to the same preset ladder
+    /// `board_summary` uses, so an unparameterised request agrees with
+    /// the summary rather than quietly disagreeing with it.
+    pub window_ms: Option<u64>,
+    pub buckets: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct MarketSeriesDto {
+    /// Echoed back, so a response that arrives after the user has
+    /// clicked another market can be recognised as stale.
+    pub capability: Option<String>,
+    pub window_ms: u64,
+    pub buckets: usize,
+    /// Epoch millis of the first bucket's left edge and the last one's
+    /// right edge. The client needs real instants to label a time axis,
+    /// and deriving them from "now minus the window" on the client would
+    /// use the *client's* clock -- which is not the clock that bucketed
+    /// the data.
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// Tasks posted per bucket, oldest first.
+    pub posted_series: Vec<u64>,
+    /// Bounty posted per bucket, oldest first.
+    pub bounty_series: Vec<u64>,
+    /// Totals over the window, so a header can be drawn without summing
+    /// the arrays client-side and disagreeing about rounding.
+    pub posted: u64,
+    pub bounty: u64,
+    /// Open right now, which is a fact about the present rather than
+    /// about the window -- an open task posted before the window still
+    /// counts, because it is still on offer.
+    pub open: u64,
+    pub open_bounty: u64,
+    /// When this market first traded, RFC3339. `None` if the tag has
+    /// never appeared on a task.
+    pub first_task_at: Option<String>,
+}
+
+/// One market's history, at a window and resolution the caller chooses.
+pub async fn board_series(State(state): State<Arc<AppState>>, Query(query): Query<SeriesQuery>) -> Json<MarketSeriesDto> {
+    let board = state.board.read().await;
+    let tasks: Vec<&Task> = board.all_tasks().collect();
+    Json(series_for(&tasks, Utc::now(), &query))
+}
+
+/// The aggregation, with `now` injected rather than read from the clock
+/// -- same discipline `summarize_board` follows, and what lets a test
+/// pin a bucket boundary instead of racing one.
+fn series_for(tasks: &[&Task], now: DateTime<Utc>, query: &SeriesQuery) -> MarketSeriesDto {
+    let capability = query.capability.as_deref().filter(|c| !c.trim().is_empty());
+
+    // Only tasks in this market, and only their timestamps, decide the
+    // default window -- charting `python` against the age of the whole
+    // board would open on a flat run of nothing until the tag first
+    // appears.
+    let matching: Vec<&&Task> = tasks
+        .iter()
+        .filter(|t| match capability {
+            None => true,
+            Some(tag) => t.capabilities.iter().any(|c| c == tag),
+        })
+        .collect();
+
+    let first_task_at = matching.iter().map(|t| t.created_at).min();
+
+    let window_ms = match query.window_ms {
+        Some(requested) => requested.max(MIN_SERIES_WINDOW_MS),
+        None => match first_task_at {
+            None => SUMMARY_DEFAULT_WINDOW_MS,
+            Some(oldest) => {
+                let span = (now - oldest).num_milliseconds().max(0) as u64;
+                SUMMARY_WINDOWS_MS
+                    .iter()
+                    .copied()
+                    .find(|w| *w >= span)
+                    .unwrap_or(SUMMARY_WINDOWS_MS[SUMMARY_WINDOWS_MS.len() - 1])
+            }
+        },
+    };
+
+    let buckets = query.buckets.unwrap_or(DEFAULT_SERIES_BUCKETS).clamp(1, MAX_SERIES_BUCKETS);
+    let end_ms = now.timestamp_millis();
+    let start_ms = end_ms - window_ms as i64;
+    let bucket_ms = window_ms as f64 / buckets as f64;
+
+    let mut posted_series = vec![0u64; buckets];
+    let mut bounty_series = vec![0u64; buckets];
+    let (mut posted, mut bounty, mut open, mut open_bounty) = (0u64, 0u64, 0u64, 0u64);
+
+    for task in &matching {
+        // Open is a fact about now, not about the window: a task posted
+        // last month and still unclaimed is still on offer today.
+        if task.status == TaskStatus::Open {
+            open += 1;
+            open_bounty += task.bounty;
+        }
+
+        let at = task.created_at.timestamp_millis();
+        if at < start_ms || at > end_ms {
+            continue;
+        }
+        // Tasks outside the window are dropped rather than piled into
+        // bucket zero, where a leading spike of everything older would
+        // flatten the window's own shape into a baseline.
+        let bucket = (((at - start_ms) as f64 / bucket_ms) as usize).min(buckets - 1);
+        posted_series[bucket] += 1;
+        bounty_series[bucket] += task.bounty;
+        posted += 1;
+        bounty += task.bounty;
+    }
+
+    MarketSeriesDto {
+        capability: capability.map(str::to_string),
+        window_ms,
+        buckets,
+        start_ms,
+        end_ms,
+        posted_series,
+        bounty_series,
+        posted,
+        bounty,
+        open,
+        open_bounty,
+        first_task_at: first_task_at.map(|t| t.to_rfc3339()),
+    }
 }
 
 pub async fn llms_txt(State(state): State<Arc<AppState>>) -> String {
@@ -2652,5 +3373,426 @@ async fn persist_other_assignees_reputation(state: &AppState, task: &Task, alrea
     };
     if let Err(e) = state.store.save_reputation_batch(&entries) {
         error!("failed to persist reputation for consensus assignees of task {} after resolution: {e}", task.id);
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use btclib::crypto::PrivateKey;
+
+    /// A task with just the fields the summary reads. Built directly
+    /// rather than through `TaskBoard`, because what is under test is the
+    /// aggregation and every field it touches is set here explicitly --
+    /// going through the board would make the timestamps `Utc::now()` and
+    /// the bucket assertions unpinnable.
+    fn task(created_at: DateTime<Utc>, bounty: u64, status: TaskStatus, tags: &[&str]) -> Task {
+        Task {
+            id: Uuid::new_v4(),
+            description: "t".to_string(),
+            bounty,
+            kind: TaskKind::HashMatch { expected_output_hash: Hash::hash_bytes(b"x") },
+            poster: PrivateKey::new_key().public_key(),
+            status,
+            claimant: None,
+            claim_deadline: None,
+            failed_attempts: 0,
+            created_at,
+            min_reputation: 0,
+            close_reason: None,
+            escrow_id: None,
+            capabilities: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    /// The same hex `Display` produces, which is what the API speaks.
+    fn hex_of(pubkey: &PublicKey) -> String {
+        pubkey.to_string()
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    fn summarize(tasks: &[Task]) -> BoardSummaryDto {
+        let refs: Vec<&Task> = tasks.iter().collect();
+        summarize_board(&refs, now())
+    }
+
+    fn series(tasks: &[Task], query: SeriesQuery) -> MarketSeriesDto {
+        let refs: Vec<&Task> = tasks.iter().collect();
+        series_for(&refs, now(), &query)
+    }
+
+    fn ask(capability: Option<&str>, window_ms: Option<u64>, buckets: Option<usize>) -> SeriesQuery {
+        SeriesQuery { capability: capability.map(str::to_string), window_ms, buckets }
+    }
+
+    #[test]
+    fn the_summary_reports_the_boards_age_so_a_chart_can_size_its_ranges() {
+        let oldest = now() - Duration::days(3);
+        let tasks = [
+            task(oldest, 1, TaskStatus::Open, &[]),
+            task(now() - Duration::hours(1), 1, TaskStatus::Open, &[]),
+        ];
+        assert_eq!(summarize(&tasks).first_task_at.as_deref(), Some(oldest.to_rfc3339()).as_deref());
+        // An empty board has no age, which is distinct from an age of
+        // zero -- a client offering ranges has nothing to offer.
+        assert!(summarize(&[]).first_task_at.is_none());
+    }
+
+    #[test]
+    fn a_series_buckets_one_market_over_the_window_it_was_asked_for() {
+        // Placed mid-bucket rather than on an edge: 23h30m ago is half
+        // an hour into the window, and 30m ago is half an hour from its
+        // end, so neither assertion turns on which side of a boundary a
+        // task on the boundary lands.
+        let tasks = [
+            task(now() - Duration::minutes(23 * 60 + 30), 100, TaskStatus::Open, &["python"]),
+            task(now() - Duration::minutes(30), 250, TaskStatus::Open, &["python"]),
+            // Another market entirely, and a third with no tags: neither
+            // may reach the python series.
+            task(now() - Duration::hours(2), 999, TaskStatus::Open, &["rust"]),
+            task(now() - Duration::hours(2), 999, TaskStatus::Open, &[]),
+        ];
+        let out = series(&tasks, ask(Some("python"), Some(86_400_000), Some(24)));
+
+        assert_eq!(out.buckets, 24);
+        assert_eq!(out.posted, 2);
+        assert_eq!(out.bounty, 350);
+        assert_eq!(out.bounty_series.iter().sum::<u64>(), 350);
+        // One bucket an hour over a day: the older task lands in the
+        // first, the newer one in the last.
+        assert_eq!(out.bounty_series[0], 100);
+        assert_eq!(out.bounty_series[23], 250);
+        assert_eq!(out.end_ms - out.start_ms, 86_400_000);
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_market_drops_what_falls_outside_it() {
+        let tasks = [
+            task(now() - Duration::days(10), 500, TaskStatus::Open, &["ocr"]),
+            task(now() - Duration::hours(2), 70, TaskStatus::Open, &["ocr"]),
+        ];
+        // A day's window sees only the recent one. The old task is
+        // dropped rather than piled into bucket zero, where it would
+        // flatten the day's own shape.
+        let day = series(&tasks, ask(Some("ocr"), Some(86_400_000), Some(24)));
+        assert_eq!(day.posted, 1);
+        assert_eq!(day.bounty, 70);
+        // ...but it is still counted as open, because being on offer is
+        // a fact about now rather than about the window.
+        assert_eq!(day.open, 2);
+        assert_eq!(day.open_bounty, 570);
+    }
+
+    #[test]
+    fn a_series_defaults_its_window_to_the_market_not_the_board() {
+        // The board is old; this market is an hour old. Charting it
+        // against the board's age would open on a flat run of nothing.
+        let tasks = [
+            task(now() - Duration::days(60), 1, TaskStatus::Open, &["labeling"]),
+            task(now() - Duration::minutes(30), 1, TaskStatus::Open, &["vision"]),
+        ];
+        assert_eq!(series(&tasks, ask(Some("vision"), None, None)).window_ms, 3_600_000, "1H");
+        assert_eq!(series(&tasks, ask(Some("labeling"), None, None)).window_ms, 7_776_000_000, "90D");
+    }
+
+    #[test]
+    fn an_untagged_request_charts_the_whole_board() {
+        let tasks = [
+            task(now() - Duration::hours(2), 10, TaskStatus::Open, &["python"]),
+            task(now() - Duration::hours(2), 20, TaskStatus::Open, &[]),
+        ];
+        let out = series(&tasks, ask(None, Some(86_400_000), Some(24)));
+        assert_eq!(out.posted, 2, "an untagged task is still a task on the board");
+        assert_eq!(out.bounty, 30);
+        assert!(out.capability.is_none());
+    }
+
+    #[test]
+    fn series_bounds_are_clamped_rather_than_trusted() {
+        let tasks = [task(now() - Duration::hours(1), 1, TaskStatus::Open, &["python"])];
+        // A caller asking for a bucket per pixel of a wall display, and
+        // one asking for none at all.
+        assert_eq!(series(&tasks, ask(Some("python"), Some(86_400_000), Some(100_000))).buckets, MAX_SERIES_BUCKETS);
+        assert_eq!(series(&tasks, ask(Some("python"), Some(86_400_000), Some(0))).buckets, 1);
+        // A zero window would divide by zero working out a bucket width.
+        assert_eq!(series(&tasks, ask(Some("python"), Some(0), Some(24))).window_ms, MIN_SERIES_WINDOW_MS);
+    }
+
+    #[test]
+    fn a_market_that_has_never_traded_answers_empty_rather_than_failing() {
+        let tasks = [task(now() - Duration::hours(1), 5, TaskStatus::Open, &["python"])];
+        let out = series(&tasks, ask(Some("nonesuch"), Some(86_400_000), Some(12)));
+        assert_eq!(out.posted, 0);
+        assert_eq!(out.bounty_series, vec![0; 12], "a flat line, not a missing one");
+        assert!(out.first_task_at.is_none());
+    }
+
+    #[test]
+    fn picks_the_smallest_window_covering_the_board() {
+        let recent = [task(now() - Duration::minutes(20), 1, TaskStatus::Open, &[])];
+        assert_eq!(summarize(&recent).window_ms, 3_600_000, "1H");
+
+        let older = [task(now() - Duration::hours(30), 1, TaskStatus::Open, &[])];
+        assert_eq!(summarize(&older).window_ms, 604_800_000, "7D");
+    }
+
+    #[test]
+    fn an_empty_board_gets_the_default_window_not_the_narrowest() {
+        // The narrowest would be technically true of a board with no
+        // history and tell a caller nothing.
+        assert_eq!(summarize(&[]).window_ms, SUMMARY_DEFAULT_WINDOW_MS);
+        assert_eq!(summarize(&[]).total_tasks, 0);
+    }
+
+    #[test]
+    fn a_future_dated_task_does_not_collapse_the_window() {
+        // Clock skew between a client and this host must not produce a
+        // negative span.
+        let skewed = [task(now() + Duration::hours(5), 1, TaskStatus::Open, &[])];
+        assert_eq!(summarize(&skewed).window_ms, 3_600_000);
+    }
+
+    #[test]
+    fn buckets_tasks_by_when_they_were_posted() {
+        // A 1H window over 24 buckets is 2.5 minutes per bucket.
+        let tasks = [
+            task(now() - Duration::minutes(50), 1, TaskStatus::Open, &[]),
+            task(now() - Duration::minutes(2), 1, TaskStatus::Open, &[]),
+            task(now() - Duration::minutes(1), 1, TaskStatus::Open, &[]),
+        ];
+        let summary = summarize(&tasks);
+        assert_eq!(summary.window_ms, 3_600_000);
+        assert_eq!(summary.buckets, SUMMARY_BUCKETS);
+        assert_eq!(summary.totals.posted_series.iter().sum::<u64>(), 3);
+        // The two recent ones share the final bucket; `now` itself lands
+        // in the last bucket rather than one past the end.
+        assert_eq!(summary.totals.posted_series[SUMMARY_BUCKETS - 1], 2);
+        assert_eq!(summary.totals.posted_series[4], 1);
+    }
+
+    #[test]
+    fn drops_tasks_older_than_the_window_instead_of_piling_them_into_bucket_zero() {
+        // Both are inside 7D so the window is 7D; the 8-day-old one is
+        // what sets it, and must not then appear as a leading spike.
+        let tasks = [
+            task(now() - Duration::days(8), 1, TaskStatus::Open, &["python"]),
+            task(now() - Duration::days(1), 1, TaskStatus::Open, &["python"]),
+        ];
+        let summary = summarize(&tasks);
+        assert_eq!(summary.window_ms, 2_592_000_000, "30D covers 8 days");
+        // Both fall inside 30 days, so both are charted.
+        assert_eq!(summary.totals.posted_series.iter().sum::<u64>(), 2);
+
+        // Now one genuinely outside: 100 days against a board whose
+        // oldest is 100 days picks 90D, leaving it out of the window.
+        let far = [
+            task(now() - Duration::days(100), 1, TaskStatus::Open, &[]),
+            task(now() - Duration::days(1), 1, TaskStatus::Open, &[]),
+        ];
+        let summary = summarize(&far);
+        assert_eq!(summary.window_ms, 7_776_000_000, "90D");
+        assert_eq!(summary.totals.posted_series.iter().sum::<u64>(), 1);
+        assert_eq!(summary.total_tasks, 2, "still counted, just not charted");
+    }
+
+    #[test]
+    fn separates_value_on_offer_from_value_settled() {
+        let tasks = [
+            task(now() - Duration::hours(1), 100, TaskStatus::Open, &[]),
+            task(now() - Duration::hours(1), 700, TaskStatus::Paid, &[]),
+            task(now() - Duration::hours(1), 500, TaskStatus::Claimed, &[]),
+        ];
+        let t = summarize(&tasks).totals;
+        assert_eq!((t.open_tasks, t.open_bounty), (1, 100));
+        assert_eq!((t.paid_tasks, t.paid_bounty), (1, 700));
+    }
+
+    #[test]
+    fn reports_every_kind_even_when_the_board_has_none_of_it() {
+        // An empty category is information; a missing one is a gap the
+        // caller has to guess at.
+        let summary = summarize(&[task(now() - Duration::hours(1), 1, TaskStatus::Open, &[])]);
+        let kinds: Vec<&str> = summary.kinds.iter().map(|k| k.kind).collect();
+        assert_eq!(kinds, vec!["hash_match", "consensus", "disputable"]);
+        let consensus = summary.kinds.iter().find(|k| k.kind == "consensus").unwrap();
+        assert_eq!(consensus.posted, 0);
+        assert_eq!(consensus.posted_series.len(), SUMMARY_BUCKETS);
+    }
+
+    #[test]
+    fn ranks_capabilities_by_value_on_offer() {
+        let tasks = [
+            task(now() - Duration::hours(1), 100, TaskStatus::Open, &["python"]),
+            task(now() - Duration::hours(1), 900, TaskStatus::Open, &["ocr"]),
+            task(now() - Duration::hours(1), 50, TaskStatus::Open, &["rust"]),
+        ];
+        let summary = summarize(&tasks);
+        let order: Vec<&str> = summary.capabilities.iter().map(|c| c.capability.as_str()).collect();
+        assert_eq!(order, vec!["ocr", "python", "rust"]);
+    }
+
+    #[test]
+    fn carries_both_an_activity_series_and_a_value_series_per_capability() {
+        let tasks = [
+            task(now() - Duration::minutes(2), 400, TaskStatus::Open, &["python"]),
+            task(now() - Duration::minutes(1), 600, TaskStatus::Open, &["python"]),
+        ];
+        let summary = summarize(&tasks);
+        let python = &summary.capabilities[0];
+        assert_eq!(python.posted, 2);
+        assert_eq!(python.open_bounty, 1000);
+        // Neither series is derivable from the other, which is why both
+        // are on the wire.
+        assert_eq!(python.posted_series[SUMMARY_BUCKETS - 1], 2);
+        assert_eq!(python.bounty_series[SUMMARY_BUCKETS - 1], 1000);
+    }
+
+    #[test]
+    fn counts_a_task_once_when_it_carries_the_same_tag_twice() {
+        let tasks = [task(now() - Duration::hours(1), 250, TaskStatus::Open, &["ocr", "ocr"])];
+        let summary = summarize(&tasks);
+        assert_eq!(summary.capabilities.len(), 1);
+        assert_eq!(summary.capabilities[0].posted, 1);
+        assert_eq!(summary.capabilities[0].open_bounty, 250);
+    }
+
+    #[test]
+    fn names_resolves_a_batch_and_answers_null_for_keys_it_has_never_seen() {
+        let known = PrivateKey::new_key().public_key();
+        let stranger = PrivateKey::new_key().public_key();
+        let mut registry = crate::names::NameRegistry::new();
+        registry.restore(known.clone(), "SwiftWarlock".to_string());
+
+        let out = lookup_names(&registry, &format!("{},{}", hex_of(&known), hex_of(&stranger)));
+        assert_eq!(out.get(&hex_of(&known)).unwrap().as_deref(), Some("SwiftWarlock"));
+        // Present as a key, with no name -- distinct from absent, which
+        // is what a malformed entry gets.
+        assert!(out.contains_key(&hex_of(&stranger)));
+        assert_eq!(out.get(&hex_of(&stranger)).unwrap().as_deref(), None);
+    }
+
+    #[test]
+    fn names_skips_a_malformed_key_rather_than_failing_the_whole_batch() {
+        let known = PrivateKey::new_key().public_key();
+        let mut registry = crate::names::NameRegistry::new();
+        registry.restore(known.clone(), "AmberOtter".to_string());
+
+        let out = lookup_names(&registry, &format!("nonsense,{},,zz", hex_of(&known)));
+        assert_eq!(out.len(), 1, "one good key answered, the rubbish dropped");
+        assert_eq!(out.get(&hex_of(&known)).unwrap().as_deref(), Some("AmberOtter"));
+    }
+
+    #[test]
+    fn names_stops_at_the_batch_ceiling() {
+        let registry = crate::names::NameRegistry::new();
+        let keys: Vec<String> =
+            (0..MAX_NAMES_LOOKUP + 20).map(|_| hex_of(&PrivateKey::new_key().public_key())).collect();
+        assert_eq!(lookup_names(&registry, &keys.join(",")).len(), MAX_NAMES_LOOKUP);
+    }
+
+    /// The leaderboard's *ordering* is likewise the part worth testing
+    /// without standing a hub up: the route around it filters and
+    /// slices, but which agent lands on which page is decided here.
+    #[test]
+    fn leaderboard_sort_reads_the_column_asked_for_and_defaults_to_earnings() {
+        assert_eq!(LeaderboardSort::parse(None), LeaderboardSort::Earned);
+        assert_eq!(LeaderboardSort::parse(Some("completed")), LeaderboardSort::Completed);
+        assert_eq!(LeaderboardSort::parse(Some("failed")), LeaderboardSort::Failed);
+        // Unknown columns answer in the default order rather than
+        // failing the request -- including `net_worth`, which is a live
+        // balance rather than something the board holds, and so is the
+        // one column here that cannot rank the field. See the doc on
+        // `LeaderboardQuery::sort`.
+        assert_eq!(LeaderboardSort::parse(Some("net_worth")), LeaderboardSort::Earned);
+        assert_eq!(LeaderboardSort::parse(Some("nonsense")), LeaderboardSort::Earned);
+    }
+
+    #[test]
+    fn leaderboard_sort_keys_off_the_right_figure() {
+        let reputation = Reputation { completed: 7, failed: 2, total_earned: 900 };
+        assert_eq!(LeaderboardSort::Earned.key(&reputation), 900);
+        assert_eq!(LeaderboardSort::Completed.key(&reputation), 7);
+        assert_eq!(LeaderboardSort::Failed.key(&reputation), 2);
+    }
+
+    /// Ties are the normal case on every column but earnings -- most of
+    /// a real field has completed nothing and failed nothing -- and a
+    /// page is a slice of this order. Two agents that tie must therefore
+    /// land in the same order on every request, or paging serves one of
+    /// them twice and the other never. This reproduces the route's
+    /// comparator over a field that is *entirely* ties.
+    #[test]
+    fn leaderboard_ties_break_on_the_pubkey_so_paging_cannot_repeat_an_agent() {
+        let field: Vec<(PublicKey, Reputation)> = (0..8)
+            .map(|_| (PrivateKey::new_key().public_key(), Reputation { completed: 3, failed: 0, total_earned: 0 }))
+            .collect();
+
+        let order = |input: &[(PublicKey, Reputation)]| {
+            let mut sorted = input.to_vec();
+            sorted.sort_by(|a, b| {
+                LeaderboardSort::Completed
+                    .key(&b.1)
+                    .cmp(&LeaderboardSort::Completed.key(&a.1))
+                    .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+            });
+            sorted.into_iter().map(|(key, _)| key.to_string()).collect::<Vec<_>>()
+        };
+
+        let first = order(&field);
+        // The same field arriving in a different order -- which is what a
+        // HashMap's iteration does between calls -- ranks identically.
+        let mut shuffled = field.clone();
+        shuffled.reverse();
+        assert_eq!(first, order(&shuffled));
+        // And it really is a total order: no two rows compare equal.
+        let mut unique = first.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), first.len());
+    }
+
+    /// `agent_matches` is the whole of the leaderboard's search -- the
+    /// route around it only ranks, filters and slices -- so these test
+    /// the predicate rather than standing a hub up.
+    #[test]
+    fn agent_search_matches_either_half_of_a_name_case_insensitively() {
+        let key = hex_of(&PrivateKey::new_key().public_key());
+        assert!(agent_matches("swift", &key, Some("SwiftWarlock")));
+        // The half a prefix match would miss, which is the reason this
+        // is a substring: nobody knows which of the two words they are
+        // holding.
+        assert!(agent_matches("warlock", &key, Some("SwiftWarlock")));
+        assert!(agent_matches("swiftwarlock", &key, Some("SwiftWarlock")));
+        assert!(!agent_matches("otter", &key, Some("SwiftWarlock")));
+    }
+
+    #[test]
+    fn agent_search_matches_a_pubkey_fragment_not_just_its_start() {
+        let key = hex_of(&PrivateKey::new_key().public_key());
+        assert!(agent_matches(&key[..8], &key, None));
+        // The tail is what a truncated table cell shows, so it is the
+        // fragment a reader is most likely to have in hand.
+        assert!(agent_matches(&key[key.len() - 6..], &key, None));
+        // The needle arrives lowercased (the route does it once, rather
+        // than once per agent); the stored side is lowercased here, so a
+        // key that reached us in upper case still answers.
+        assert!(agent_matches(&key[..8], &key.to_uppercase(), None));
+    }
+
+    #[test]
+    fn an_unnamed_agent_is_still_searchable_by_key() {
+        let key = hex_of(&PrivateKey::new_key().public_key());
+        assert!(agent_matches(&key[..6], &key, None));
+        assert!(!agent_matches("swiftwarlock", &key, None));
+    }
+
+    #[test]
+    fn untagged_tasks_belong_to_no_capability_but_still_count_in_the_totals() {
+        let tasks = [task(now() - Duration::hours(1), 300, TaskStatus::Open, &[])];
+        let summary = summarize(&tasks);
+        assert!(summary.capabilities.is_empty());
+        assert_eq!(summary.totals.open_bounty, 300);
     }
 }

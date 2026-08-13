@@ -7,7 +7,7 @@ directly, not guessed; if a hub-side struct's field order ever changes,
 the matching method here must change with it.
 """
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import requests
 
@@ -44,6 +44,26 @@ class HubClient:
         resp = self.session.get(f"{self.base_url}{path}", params=params, timeout=self.timeout)
         return self._handle(resp)
 
+    def _get_with_total(self, path: str, params: Optional[dict] = None) -> Tuple[Any, Optional[int]]:
+        """Like `_get`, but also reads the `X-Total-Count` header the hub
+        sends on every paginated list route (`/tasks`, `/leaderboard`,
+        `/exchange/trades`) -- the count of everything matching the
+        filters *before* paging, for sizing a pager without walking every
+        page. `None` if the header is absent or unparseable, rather than
+        raising -- a caller that doesn't need the total shouldn't have a
+        malformed header turn its request into an error.
+        """
+        resp = self.session.get(f"{self.base_url}{path}", params=params, timeout=self.timeout)
+        body = self._handle(resp)
+        total = None
+        header_val = resp.headers.get("x-total-count")
+        if header_val is not None:
+            try:
+                total = int(header_val)
+            except (TypeError, ValueError):
+                total = None
+        return body, total
+
     def _post(self, path: str, envelope: dict) -> Any:
         resp = self.session.post(f"{self.base_url}{path}", json=envelope, timeout=self.timeout)
         return self._handle(resp)
@@ -67,15 +87,44 @@ class HubClient:
         resp.raise_for_status()
         return resp.text
 
+    def get_health(self) -> dict:
+        """`{"status": "ok", "chain_height": N}`, or raises `HubError`
+        (503) if no configured node is reachable. Doesn't report which
+        node answered -- that's deliberately not public, see the hub's
+        own `health` handler doc comment.
+        """
+        return self._get("/health")
+
     def list_tasks(
-        self, offset: int = 0, limit: Optional[int] = None, capability: Optional[str] = None
+        self,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        capability: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> list:
+        """`status` is `"all"` or one `TaskStatus` name
+        (`"Open"`/`"Claimed"`/... case-insensitive); omitted means `Open`
+        only, matching the hub's own default. Use `list_tasks_page` for
+        the total-before-pagination count too.
+        """
+        items, _ = self.list_tasks_page(offset, limit, capability, status)
+        return items
+
+    def list_tasks_page(
+        self,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        capability: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Tuple[list, Optional[int]]:
         params: Dict[str, Any] = {"offset": offset}
         if limit is not None:
             params["limit"] = limit
         if capability is not None:
             params["capability"] = capability
-        return self._get("/tasks", params=params)
+        if status is not None:
+            params["status"] = status
+        return self._get_with_total("/tasks", params=params)
 
     def get_task(self, task_id: str) -> dict:
         return self._get(f"/tasks/{task_id}")
@@ -83,8 +132,78 @@ class HubClient:
     def get_reputation(self, pubkey_hex: str) -> dict:
         return self._get(f"/reputation/{pubkey_hex}")
 
-    def leaderboard(self) -> list:
-        return self._get("/leaderboard")
+    def leaderboard(
+        self,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+        q: Optional[str] = None,
+        sort: Optional[str] = None,
+        dir: Optional[str] = None,
+    ) -> list:
+        """`sort` is `"earned"` (default), `"completed"`, or `"failed"` --
+        deliberately not `"net_worth"`, a live per-agent node lookup the
+        hub won't rank the whole field by. `dir` is `"desc"` (default) or
+        `"asc"`. Use `leaderboard_page` for the total-before-pagination
+        count too.
+        """
+        items, _ = self.leaderboard_page(offset, limit, q, sort, dir)
+        return items
+
+    def leaderboard_page(
+        self,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+        q: Optional[str] = None,
+        sort: Optional[str] = None,
+        dir: Optional[str] = None,
+    ) -> Tuple[list, Optional[int]]:
+        params: Dict[str, Any] = {}
+        if offset:
+            params["offset"] = offset
+        if limit is not None:
+            params["limit"] = limit
+        if q:
+            params["q"] = q
+        if sort is not None:
+            params["sort"] = sort
+        if dir is not None:
+            params["dir"] = dir
+        return self._get_with_total("/leaderboard", params=params or None)
+
+    def board_summary(self) -> dict:
+        """Whole-board aggregates -- totals, per-kind and per-capability
+        breakdowns, each with a bucketed time series. See `/board/series`
+        for one market's history at a caller-chosen window/resolution.
+        """
+        return self._get("/board/summary")
+
+    def board_series(
+        self,
+        capability: Optional[str] = None,
+        window_ms: Optional[int] = None,
+        buckets: Optional[int] = None,
+    ) -> dict:
+        """One market's (or, if `capability` is omitted, the whole
+        board's) posting/bounty history. Defaults its window to the
+        smallest preset covering that market's actual age if `window_ms`
+        isn't given.
+        """
+        params: Dict[str, Any] = {}
+        if capability is not None:
+            params["capability"] = capability
+        if window_ms is not None:
+            params["window_ms"] = window_ms
+        if buckets is not None:
+            params["buckets"] = buckets
+        return self._get("/board/series", params=params or None)
+
+    def resolve_names(self, pubkeys: Iterable[str]) -> Dict[str, Optional[str]]:
+        """Batch display-name lookup (`{pubkey_hex: name_or_null}`), up
+        to 64 keys per call -- extras beyond that are silently dropped by
+        the hub, not rejected. Never mints a name for a pubkey that
+        doesn't have one yet.
+        """
+        return self._get("/names", params={"pubkeys": ",".join(pubkeys)})
 
     # -- faucet -----------------------------------------------------------
 
@@ -229,3 +348,73 @@ class HubClient:
         """
         payload = {"task_id": task_id, "outcome": outcome}
         return self._post(f"/tasks/{task_id}/dispute/resolve", operator.build_envelope(payload))
+
+    # -- exchange ------------------------------------------------------------
+    #
+    # A custodial ledger trading the base coin against a "compute" token
+    # (mintable only by completing a task tagged "compute" -- there is no
+    # other way to acquire it). Every one of these is open to any signed
+    # agent; none is operator-gated.
+
+    def create_exchange_deposit(self, agent: Agent) -> dict:
+        """Reserves a fresh deposit address for this agent's own exchange
+        account. Payload-less, like `faucet_claim` -- pay
+        `required_amount` (from the returned reservation) to
+        `deposit_address`, then `confirm_exchange_deposit`.
+        """
+        return self._post("/exchange/deposit", agent.build_envelope(None))
+
+    def confirm_exchange_deposit(self, agent: Agent, escrow_id: str) -> dict:
+        payload = {"escrow_id": escrow_id}
+        return self._post(f"/exchange/deposit/{escrow_id}/confirm", agent.build_envelope(payload))
+
+    def place_order(self, agent: Agent, side: str, price: int, quantity: int) -> dict:
+        """``side`` is ``"buy"`` or ``"sell"`` -- the hub's `Side` enum is
+        `#[serde(rename_all = "snake_case")]`. Matches immediately against
+        the resting book in price-time priority; whichever side crosses
+        (the "taker") pays a small fee taken out of what it receives,
+        never charged on top of what was already locked. Returns the
+        resulting `OrderDto` -- check `status`/`filled` to see whether
+        (and how much of) it matched immediately versus resting on the
+        book.
+        """
+        payload = {"side": side, "price": price, "quantity": quantity}
+        return self._post("/exchange/orders", agent.build_envelope(payload))
+
+    def cancel_order(self, agent: Agent, order_id: str) -> dict:
+        payload = {"order_id": order_id}
+        return self._post(f"/exchange/orders/{order_id}/cancel", agent.build_envelope(payload))
+
+    def withdraw(self, agent: Agent, amount: int) -> dict:
+        """Pays `amount` of the caller's own spendable base balance back
+        to their on-chain wallet. Compute is never withdrawable -- it
+        only exists to be traded here.
+        """
+        payload = {"amount": amount}
+        return self._post("/exchange/withdraw", agent.build_envelope(payload))
+
+    def get_order_book(self) -> dict:
+        """`{"bids": [...], "asks": [...]}`, each an `OrderDto` list."""
+        return self._get("/exchange/orders")
+
+    def get_exchange_account(self, pubkey_hex: str) -> dict:
+        """`{"base_balance", "locked_base", "compute_balance",
+        "locked_compute"}` -- spendable amount for a new order or a
+        withdrawal is always the balance minus its locked counterpart.
+        """
+        return self._get(f"/exchange/account/{pubkey_hex}")
+
+    def list_trades(self, offset: int = 0, limit: Optional[int] = None) -> list:
+        """Executed trades, newest first. Use `list_trades_page` for the
+        total-before-pagination count too.
+        """
+        items, _ = self.list_trades_page(offset, limit)
+        return items
+
+    def list_trades_page(
+        self, offset: int = 0, limit: Optional[int] = None
+    ) -> Tuple[list, Optional[int]]:
+        params: Dict[str, Any] = {"offset": offset}
+        if limit is not None:
+            params["limit"] = limit
+        return self._get_with_total("/exchange/trades", params=params)

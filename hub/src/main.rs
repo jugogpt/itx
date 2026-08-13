@@ -3,24 +3,27 @@ use tracing::*;
 mod auth;
 mod board;
 mod handlers;
+mod names;
 mod node_client;
 mod rate_limit;
 mod store;
 
 use anyhow::Result;
 use argh::FromArgs;
-use axum::http::Method;
+use axum::http::{HeaderName, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use board::{PendingDeposit, Reputation, Task, TaskBoard, TaskStatus};
 use btclib::crypto::{PrivateKey, PublicKey};
 use btclib::util::Saveable;
+use names::NameRegistry;
 use node_client::NodeClient;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use store::HubStore;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::prelude::*;
 use uuid::Uuid;
@@ -76,6 +79,61 @@ pub struct AppState {
     /// `rate_limit::RateLimitTable`'s own doc comment for why this can't
     /// be a global static.
     pub rate_limits: rate_limit::RateLimitTable,
+    /// Display names for agents (see `names`). Its own lock rather than
+    /// a field on `board`: the registry is presentation, the board is
+    /// the economy, and a read of the leaderboard should not have to
+    /// take a write lock on the board just to mint a name for an agent
+    /// that turned up since the last request.
+    pub names: RwLock<NameRegistry>,
+}
+
+impl AppState {
+    /// Names every agent in `pubkeys` that doesn't already have one, and
+    /// persists whatever is new.
+    ///
+    /// The write lock is held only for the assignment itself and dropped
+    /// before the store is touched, so a slow fsync never blocks a
+    /// concurrent reader. That ordering means a crash between the two
+    /// can lose a just-minted name -- which costs nothing, because the
+    /// agent is simply renamed on the next request. That is the opposite
+    /// of `PendingDeposit`'s persist-before-you-hand-it-out rule, and
+    /// for the opposite reason: nothing is irrecoverable here.
+    ///
+    /// Returns the resolved names. A pubkey missing from the map means
+    /// the pool is exhausted; callers render the pubkey alone rather
+    /// than failing the request.
+    async fn ensure_named(
+        &self,
+        pubkeys: impl IntoIterator<Item = PublicKey>,
+    ) -> std::collections::HashMap<String, String> {
+        let mut resolved = std::collections::HashMap::new();
+        let mut fresh: Vec<(PublicKey, String)> = Vec::new();
+        {
+            let mut names = self.names.write().await;
+            for pubkey in pubkeys {
+                let Some((name, is_new)) = names.assign(&pubkey) else {
+                    warn!("agent name pool is exhausted; {pubkey} stays unnamed");
+                    continue;
+                };
+                if is_new {
+                    fresh.push((pubkey.clone(), name.clone()));
+                }
+                resolved.insert(pubkey.to_string(), name);
+            }
+        }
+        if !fresh.is_empty() {
+            if let Err(e) = self.store.save_agent_name_batch(&fresh) {
+                // Non-fatal on purpose: the names are already live in
+                // memory and correct for this response. The cost of a
+                // failed write is that they're re-minted after a
+                // restart, which is a cosmetic regression, not a lost
+                // record -- so it should not turn a read request into an
+                // error page.
+                error!("failed to persist {} new agent name(s): {e}", fresh.len());
+            }
+        }
+        resolved
+    }
 }
 
 #[derive(FromArgs)]
@@ -323,6 +381,33 @@ async fn main() -> Result<()> {
         board.all_trades().count(),
     );
 
+    let mut names = NameRegistry::new();
+    for (pubkey, name) in store.load_all_agent_names()? {
+        names.restore(pubkey, name);
+    }
+    // Backfill: every agent the board already knows about but that
+    // predates this registry gets named now, in one transaction, rather
+    // than trickling in as each one happens to be requested. Idempotent,
+    // so a hub that has already been through this does no writes here.
+    let unnamed: Vec<PublicKey> = board
+        .all_reputation()
+        .map(|(pubkey, _)| pubkey.clone())
+        .filter(|pubkey| names.get(pubkey).is_none())
+        .collect();
+    let backfilled: Vec<(PublicKey, String)> = unnamed
+        .into_iter()
+        .filter_map(|pubkey| names.assign(&pubkey).map(|(name, _)| (pubkey, name)))
+        .collect();
+    if !backfilled.is_empty() {
+        store.save_agent_name_batch(&backfilled)?;
+    }
+    println!(
+        "{} agent name(s) known ({} newly assigned), {} still available",
+        names.len(),
+        backfilled.len(),
+        names.remaining()
+    );
+
     let state = Arc::new(AppState {
         board: RwLock::new(board),
         store,
@@ -334,6 +419,7 @@ async fn main() -> Result<()> {
         exchange_custody_public_key,
         exchange_custody_payout_lock: Mutex::new(()),
         rate_limits: rate_limit::new_table(),
+        names: RwLock::new(names),
     });
 
     tokio::spawn(sweep_loop(state.clone()));
@@ -363,7 +449,16 @@ fn build_router(state: Arc<AppState>) -> Router {
     // page-borrowed browser session could forge anyway. Added for the
     // dashboard (`dashboard/`), which talks to the hub from a different
     // origin (its own dev server / static host) via plain `fetch()`.
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]);
+    // `expose_headers` is what lets a cross-origin `fetch()` actually read
+    // `X-Total-Count` off a `/tasks` or `/leaderboard` response. Without it
+    // the header is still sent and still visible in devtools, but the
+    // browser hides it from JavaScript -- a silent failure that looks like
+    // the hub never set it. Response headers are not exposed cross-origin
+    // by default; only a short safelist is.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET])
+        .expose_headers([HeaderName::from_static("x-total-count")]);
 
     Router::new()
         .route("/health", get(handlers::health))
@@ -383,6 +478,20 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/faucet", post(handlers::faucet_claim))
         .route("/reputation/:pubkey", get(handlers::get_reputation))
         .route("/leaderboard", get(handlers::leaderboard))
+        // One request for the whole board's aggregates, so a dashboard
+        // does not have to page through every task to compute them (see
+        // `board_summary`). Read-only and unauthenticated, like the rest
+        // of the board's read surface.
+        .route("/board/summary", get(handlers::board_summary))
+        // One market's history at a window and resolution the caller
+        // picks -- what a chart with range tabs needs, and what the
+        // summary's fixed window and 24 buckets deliberately cannot
+        // serve. See `handlers::board_series`.
+        .route("/board/series", get(handlers::board_series))
+        // Batch display-name lookup, so a list of rows costs one request
+        // rather than one per row. Read-only and never mints a name --
+        // see `handlers::names`.
+        .route("/names", get(handlers::names))
         .route("/llms.txt", get(handlers::llms_txt))
         .route("/exchange/deposit", post(handlers::create_exchange_deposit))
         .route("/exchange/deposit/:id/confirm", post(handlers::confirm_exchange_deposit))
@@ -393,6 +502,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/exchange/trades", get(handlers::list_trades))
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(state.clone(), rate_limit::middleware))
+        // Gzip for any client that asks (every browser does). The task
+        // list is repeated field names and 66-character hex keys -- the
+        // best case for gzip. Outermost, so it compresses the response
+        // after every inner layer (including the rate limiter's own
+        // responses) has finished shaping it.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
@@ -609,6 +724,7 @@ mod tests {
             exchange_custody_public_key,
             exchange_custody_payout_lock: Mutex::new(()),
             rate_limits: rate_limit::new_table(),
+            names: RwLock::new(NameRegistry::new()),
         });
 
         let app = build_router(state.clone());
@@ -1002,6 +1118,149 @@ mod tests {
 
         let status = hub.client.get(format!("{}/llms.txt", hub.base_url)).send().await.unwrap().status();
         assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS, "one past the limit must be rejected");
+    }
+
+    /// The dashboard polls the full task list on a timer, and that JSON
+    /// gzips well -- so the compression layer is load-bearing for the
+    /// site's latency, not an optimization detail. reqwest here has no
+    /// `gzip` feature, which is exactly what the test needs: nothing
+    /// auto-sends `Accept-Encoding` or strips `Content-Encoding` before
+    /// the assertion can see it. `/llms.txt` is the target because it is
+    /// reliably larger than the layer's minimum-size threshold on a
+    /// fresh hub, where `/tasks` is a 2-byte `[]`.
+    #[tokio::test]
+    async fn responses_gzip_when_asked_and_stay_identity_when_not() {
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key, dead_address().await).await;
+
+        let compressed = hub
+            .client
+            .get(format!("{}/llms.txt", hub.base_url))
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(compressed.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            compressed.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+        );
+
+        // A client that never asked must get the bytes as they are --
+        // the SDK's agents and curl without flags both read this API.
+        let identity = hub.client.get(format!("{}/llms.txt", hub.base_url)).send().await.unwrap();
+        assert_eq!(identity.status(), reqwest::StatusCode::OK);
+        assert!(identity.headers().get("content-encoding").is_none());
+        assert!(identity.text().await.unwrap().contains("hash_match"));
+    }
+
+    /// Gives `agent` a paid, completed task so it earns a reputation
+    /// record -- which is what makes it an agent the naming registry is
+    /// willing to name.
+    async fn seed_completed_task_for(hub: &TestHub, agent: &PublicKey, bounty: u64) {
+        let expected_output = Hash::hash_bytes(b"x");
+        let mut board = hub.state.board.write().await;
+        let task = board.create_task(hub.state.operator_public_key.clone(), "t".to_string(), bounty, expected_output);
+        board.claim_task(task.id, agent.clone(), Utc::now() + chrono::Duration::minutes(5)).unwrap();
+        board.submit(task.id, agent.clone(), expected_output).unwrap();
+        board.mark_recipient_paid(task.id, agent, bounty).unwrap();
+    }
+
+    #[tokio::test]
+    async fn leaderboard_names_every_agent_uniquely_and_stably() {
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key, dead_address().await).await;
+
+        let agents: Vec<PublicKey> = (0..5).map(|_| PrivateKey::new_key().public_key()).collect();
+        for (i, agent) in agents.iter().enumerate() {
+            seed_completed_task_for(&hub, agent, 100 + i as u64).await;
+        }
+
+        let fetch = || async {
+            hub.client.get(format!("{}/leaderboard", hub.base_url)).send().await.unwrap().json::<Value>().await.unwrap()
+        };
+
+        let first: Value = fetch().await;
+        let entries = first.as_array().unwrap();
+        assert_eq!(entries.len(), agents.len());
+
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries {
+            let name = entry["name"].as_str().expect("every agent gets a name");
+            assert!(
+                name.chars().count() <= names::MAX_NAME_LEN,
+                "{name} is longer than the {} character cap",
+                names::MAX_NAME_LEN
+            );
+            assert!(name.chars().all(|c| c.is_ascii_alphabetic()));
+            assert!(name.chars().next().unwrap().is_ascii_uppercase(), "{name} should be CamelCase");
+            assert!(seen.insert(name.to_string()), "{name} was assigned twice");
+        }
+
+        // A second request must return the same names -- a leaderboard
+        // whose agents were renamed between two page loads would be
+        // worse than one with no names at all.
+        let second: Value = fetch().await;
+        for (before, after) in entries.iter().zip(second.as_array().unwrap()) {
+            assert_eq!(before["pubkey"], after["pubkey"]);
+            assert_eq!(before["name"], after["name"]);
+        }
+
+        // and they're durable: the same names came back out of the store
+        let stored = hub.state.store.load_all_agent_names().unwrap();
+        assert_eq!(stored.len(), agents.len());
+        for (pubkey, name) in stored {
+            let entry = entries
+                .iter()
+                .find(|e| e["pubkey"] == pubkey.to_string())
+                .expect("a persisted name for an agent that isn't on the board");
+            assert_eq!(entry["name"], name);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_reputation_reports_a_name_but_never_mints_one() {
+        let operator_key = PrivateKey::new_key();
+        let hub = spawn_hub(operator_key, dead_address().await).await;
+
+        // A pubkey with no history on the board. The route resolves it
+        // (any pubkey does) but must not spend a name on it -- this is
+        // an unauthenticated GET, so minting here would let anyone drain
+        // the pool one request at a time.
+        let stranger = PrivateKey::new_key().public_key();
+        let dto: Value = hub
+            .client
+            .get(format!("{}/reputation/{stranger}", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(dto["completed"], 0);
+        assert_eq!(dto["name"], Value::Null, "a stranger must not be named");
+        assert!(hub.state.names.read().await.is_empty());
+        assert!(hub.state.store.load_all_agent_names().unwrap().is_empty());
+
+        // An agent that has actually worked gets named by /leaderboard,
+        // and /reputation then reports that same name.
+        let agent = PrivateKey::new_key().public_key();
+        seed_completed_task_for(&hub, &agent, 500).await;
+        let leaderboard: Value =
+            hub.client.get(format!("{}/leaderboard", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        let assigned = leaderboard.as_array().unwrap()[0]["name"].clone();
+        assert!(assigned.is_string());
+
+        let dto: Value = hub
+            .client
+            .get(format!("{}/reputation/{agent}", hub.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(dto["name"], assigned);
     }
 
     /// `net_worth` (current on-chain balance) and `total_earned`
@@ -1681,6 +1940,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(default_page.len(), 5, "well under the default page size");
+    }
+
+    /// Seeds one task per status the dashboard cares about, driving the
+    /// board directly so each one lands in a known terminal state without
+    /// going through a full HTTP lifecycle for every single status.
+    async fn seed_one_task_per_status(state: &AppState) {
+        let mut board = state.board.write().await;
+        // Open: created and left alone.
+        board.create_task(state.operator_public_key.clone(), "open".into(), 10, Hash::hash_bytes(b"a"));
+        // Claimed: claimed but never submitted.
+        let claimed = board.create_task(state.operator_public_key.clone(), "claimed".into(), 10, Hash::hash_bytes(b"b"));
+        board
+            .claim_task(claimed.id, PrivateKey::new_key().public_key(), Utc::now() + chrono::Duration::minutes(5))
+            .unwrap();
+        // Paid: claimed, correct answer, payout recorded.
+        let expected = Hash::hash_bytes(b"c");
+        let agent = PrivateKey::new_key().public_key();
+        let paid = board.create_task(state.operator_public_key.clone(), "paid".into(), 10, expected);
+        board.claim_task(paid.id, agent.clone(), Utc::now() + chrono::Duration::minutes(5)).unwrap();
+        board.submit(paid.id, agent.clone(), expected).unwrap();
+        board.mark_recipient_paid(paid.id, &agent, 10).unwrap();
+    }
+
+    /// The default (no `?status=`) must keep meaning exactly what it has
+    /// always meant -- `Open` tasks only. Agents and both SDKs treat a
+    /// listed task as a claimable one, so widening this by default would
+    /// hand them work that's already finished.
+    #[tokio::test]
+    async fn listing_without_a_status_filter_still_returns_only_open_tasks() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        seed_one_task_per_status(&hub.state).await;
+
+        let listed: Vec<Value> = hub.client.get(format!("{}/tasks", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(listed.len(), 1, "three tasks exist but only one is Open");
+        assert_eq!(listed[0]["status"], "Open");
+    }
+
+    #[tokio::test]
+    async fn status_filter_selects_a_single_status_and_all_returns_everything() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        seed_one_task_per_status(&hub.state).await;
+
+        let paid: Vec<Value> =
+            hub.client.get(format!("{}/tasks?status=Paid", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(paid.len(), 1);
+        assert_eq!(paid[0]["status"], "Paid");
+
+        // Case-insensitive, the same forgiving treatment `?capability=`
+        // already gets.
+        let lowercase: Vec<Value> =
+            hub.client.get(format!("{}/tasks?status=paid", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(lowercase.len(), 1, "?status=paid and ?status=Paid are the same query");
+
+        let all: Vec<Value> =
+            hub.client.get(format!("{}/tasks?status=all", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(all.len(), 3, "every status, which is what the public board shows");
+    }
+
+    #[tokio::test]
+    async fn unknown_status_is_a_legible_400_rather_than_a_serde_failure() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let resp = hub.client.get(format!("{}/tasks?status=banana", hub.base_url)).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = resp.json().await.unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("banana"), "the error should name what was rejected: {error}");
+        assert!(error.contains("Paid"), "and list the valid options: {error}");
+    }
+
+    /// The total counts everything matching the filters *before* paging --
+    /// that's what makes it usable for "showing 2 of 3" and for sizing a
+    /// pager.
+    #[tokio::test]
+    async fn total_count_header_reports_matches_before_pagination() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+        seed_one_task_per_status(&hub.state).await;
+
+        let resp = hub.client.get(format!("{}/tasks?status=all&limit=2", hub.base_url)).send().await.unwrap();
+        assert_eq!(resp.headers().get("x-total-count").unwrap(), "3");
+        let page: Vec<Value> = resp.json().await.unwrap();
+        assert_eq!(page.len(), 2, "the page itself is still capped by limit");
+
+        // And it tracks the filter, not the whole board.
+        let resp = hub.client.get(format!("{}/tasks?status=Paid", hub.base_url)).send().await.unwrap();
+        assert_eq!(resp.headers().get("x-total-count").unwrap(), "1");
+    }
+
+    /// `created_at` is the only timestamp the hub exposes for a task, and
+    /// every time series in the dashboard is derived from it -- if it ever
+    /// stops being serialized, the sparklines silently flatline rather
+    /// than erroring, so this asserts on its presence directly.
+    #[tokio::test]
+    async fn tasks_expose_created_at_for_charting() {
+        let operator_key = PrivateKey::new_key();
+        let fake_node = FakeNode::spawn(operator_key.public_key(), 100_000_000).await;
+        let hub = spawn_hub(operator_key, fake_node.addr.clone()).await;
+
+        let created_at = Utc::now() - chrono::Duration::hours(3);
+        let task_id = {
+            let mut board = hub.state.board.write().await;
+            let mut task = board.create_task(hub.state.operator_public_key.clone(), "dated".into(), 10, Hash::hash_bytes(b"x"));
+            task.created_at = created_at;
+            let id = task.id;
+            board.restore_task(task);
+            id
+        };
+
+        let task: Value =
+            hub.client.get(format!("{}/tasks/{task_id}", hub.base_url)).send().await.unwrap().json().await.unwrap();
+        let reported: DateTime<Utc> = task["created_at"].as_str().unwrap().parse().unwrap();
+        assert_eq!(reported, created_at);
     }
 
     #[tokio::test]

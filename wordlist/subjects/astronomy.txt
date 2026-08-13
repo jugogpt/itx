@@ -1,0 +1,17 @@
+sun
+moon
+star
+planet
+comet
+meteor
+aurora
+eclipse
+rainbow
+cloud
+nova
+nebula
+galaxy
+asteroid
+pulsar
+quasar
+zenith

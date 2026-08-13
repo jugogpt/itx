@@ -1,0 +1,3386 @@
+/* Landing surface only. Everything here is scoped under .itx-landing
+ * (or the .itx-news tape it owns), so the terminal styles and the
+ * legacy pages are untouched. Palette and type are the user's spec for
+ * this surface: Helvetica Neue on near-black, red / green / blue
+ * accents -- deliberately *not* the terminal's tokens. */
+
+/* Applied to <body> only while the landing page is mounted (see
+ * LandingPage.tsx). The legacy pages keep index.css's 16px body margin;
+ * here it would draw a white frame around a full-bleed dark page. The
+ * background is repeated on the body so overscroll at either end of the
+ * page bounces against the page's own color rather than white. */
+body.itx-landing-body {
+  margin: 0;
+  background: #161418;
+}
+
+body.itx-landing-body[data-theme="light"] {
+  background: #e9f2ed;
+}
+
+.itx-landing {
+  /* These six are *roles*, not literals, which is what lets one set of
+     rules paint both themes: --ld-dark is the ground and --ld-light the
+     ink, and in light mode they hold each other's values. The three
+     hues are the ink versions -- text and hairlines -- and are deepened
+     for the light ground below. The wash on the hero's market line and
+     the quote strip is painted in JS from the brand pair (see
+     marketHue.ts) and stays the same on both themes, like the tape. */
+  --ld-red: #d8402d;
+  --ld-green: #63ba6c;
+  --ld-blue: #91c4f2;
+  --ld-dark: #161418;
+  --ld-light: #e9f2ed;
+  --ld-sub: #b3b4bf;
+
+  /* How far the quote strip rides up over the hero's market line.
+   * Declared on the landing root because both sides need it: the hero
+   * grows by it, and the board pulls the strip and its grid layer up by
+   * it. Custom properties only inherit downward, so a common ancestor
+   * is the only place both can read it.
+   *
+   * Half the strip's 72px height, so the line crosses the upper half of
+   * the box and the lower half stays clear. */
+  --bd-overlap: 24px;
+
+  /* How far the strip rides up over the *line*, on top of the overlap
+   * above.
+   *
+   * The two are separate because `--bd-overlap` cannot do this job. It
+   * is the amount the strip is pulled up **and** the amount the chart
+   * box grows by (see `.itx-hero-chart`) **and** what `MarketLine` takes
+   * off the canvas to find its baseline -- so raising it moves the
+   * canvas's bottom edge down by exactly as much as it moves the strip
+   * up, the two cancel, and the strip sits in the same place over the
+   * line it did before. That is why the chart and the strip met edge to
+   * edge however the token was tuned: the dotted rule landed above the
+   * strip's top edge, and the line, which is scaled to that rule, could
+   * never reach it.
+   *
+   * This lift is applied to the strip alone. The canvas keeps its
+   * geometry, the baseline stays where it is, and the strip simply
+   * covers more of it -- so the troughs now pass behind the strip and
+   * the peaks read above it, which is what the reference has. The hero
+   * grows by the same amount so the strip's top edge still lands on the
+   * fold rather than pulling the board up into the landing screen.
+   *
+   * At 64px the strip's top edge sits about 20px into the line's travel
+   * -- enough that troughs genuinely disappear behind it rather than
+   * grazing it. The bloom under the baseline is behind the strip at this
+   * lift and shows in the gutters either side, which is where that
+   * comment above already expected to find it. */
+  --bd-lift: 48px;
+
+  /* The band under the market line's dotted baseline, where the
+   * counter-coloured bloom lives. Read by MarketLine as well as used in
+   * the chart's height below: the canvas puts its baseline this far up
+   * from its own bottom edge, so the two have to agree, and a token is
+   * the only way for them to agree without one of them guessing.
+   *
+   * The strip's own pull-up is a fixed `--bd-overlap` off the box's
+   * bottom, independent of this band, so this is exactly how far the
+   * rule clears the strip's top edge -- and the bloom under it runs the
+   * whole way to the canvas bottom, `--bd-overlap` past that edge and
+   * behind the strip. The chart and the strip are meant to *overlap*:
+   * the reference has the strip's top third sitting on live chart, not
+   * starting where the chart has already faded out. An earlier round
+   * had the bloom stop at the strip's edge for fear a cut-off glow
+   * would read as a clipping bug; it instead read as a gap, which is
+   * the worse of the two, and the gutters either side of the strip
+   * settle it -- there the glow carries on down in plain view, so the
+   * covered stretch reads as depth.
+   *
+   * 24px, not the 56 an earlier round widened it to for the bloom's
+   * falloff: that floated the rule a whole strip-height clear of the
+   * box. The falloff stops are fractions of the band, so they follow it
+   * and the glow keeps its shape over a shorter run. */
+  --ld-chart-base: 24px;
+
+  /* Heights of the two sticky bar rows. Declared rather than measured
+   * because the hero subtracts them to work out its own height. */
+  /* Spacing scale. Every margin, padding and gap picks a step from this
+     rather than inventing a number -- the two files had 23 and 19
+     distinct spacing literals between them, including 5/7/9/11/13,
+     which differ from their neighbours by a pixel and read as identical.
+     6px is kept as a step because the dense table rows genuinely need a
+     tighter rhythm than 8px gives; everything above that is a 4px grid.
+
+     Values that are *not* rhythm keep their literals: 1px hairlines and
+     the gradient ring, fixed widths, min-heights, and anything in
+     calc()/vh. */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 20px;
+  --sp-8: 24px;
+  --sp-9: 32px;
+  --sp-10: 40px;
+  --sp-11: 48px;
+  --sp-12: 56px;
+  --sp-13: 64px;
+  --sp-14: 72px;
+
+  /* The bar's own heights come from sitebar.css, which owns the bar on
+     every surface now. Kept under these names because the hero's fold
+     arithmetic below reads them. */
+  --ld-news-h: var(--sb-news-h);
+  --ld-brand-h: var(--sb-brand-h);
+  --ld-bar-h: calc(var(--ld-news-h) + var(--ld-brand-h));
+
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  background: var(--ld-dark);
+}
+
+/* The light counterpart, from the same seven colours. Only tokens change
+   here -- every rule below this block is theme-blind, which is the whole
+   reason the roles above are named for their job rather than their
+   value.
+ *
+ * The three hues are deepened rather than reused. #63ba6c on #e9f2ed is
+ * 2.1:1 -- fine for a 2px chart stroke, unreadable as a percentage in a
+ * 13px table cell -- so text duty goes to the same hues taken down to
+ * L≈33%, which clears 4.5:1 on the ground and on a panel. Hue is held
+ * within two degrees of the dark palette's, so the surface still reads
+ * as the same green and the same red.
+ *
+ * The greys are matched by *contrast against their own ground*, not by
+ * eye: the hairline is 1.9:1 on the light ground where the dark one is
+ * 1.86:1 on the dark, so the board's outlines carry the same weight in
+ * both. Picking a pale grey that merely looked right on white was the
+ * thing that made the first light mode read as washed out. */
+.itx-landing[data-theme="light"] {
+  --ld-dark: #e9f2ed;
+  --ld-light: #161418;
+  --ld-sub: #5c6070;
+
+  --ld-red: #ab301d;
+  --ld-green: #2f7a3a;
+  --ld-blue: #2b6ba6;
+}
+
+.itx-landing[data-theme="light"] .itx-board {
+  --bd-line: #a9b0c0;
+  --bd-grid-opacity: 0.22;
+}
+
+/* The masthead follows the page it is on -- the terminal's already did
+   (see terminal.css), and a dark bar over a light board would be the one
+   thing on the site that ignored the switch.
+ *
+ * Done by restating the two roles *on the bar*, not by rules against its
+ * background and colour: sitebar.css declares the palette on itself so
+ * the bar can render outside any page root, and a nearer declaration
+ * wins. The three hues are deliberately left alone -- the tape is the
+ * same red-blue-green wherever it rides. */
+.itx-landing[data-theme="light"] .itx-sitebar {
+  --ld-dark: #e9f2ed;
+  --ld-light: #161418;
+  --ld-sub: #5c6070;
+}
+
+/* The wordmark's full stop, which is the tape's green and so is not
+   covered by the roles above. Deepened to the light theme's green (the
+   --ld-green in this theme's block): the pale one is 2.1:1 on this
+   ground, under the 3:1 that even large text needs. */
+.itx-landing[data-theme="light"] .itx-sitebar-dot {
+  color: #2f7a3a;
+}
+
+/* Ticker + hero as one viewport-tall column: the hero absorbs the
+ * tape's height when the tape is dismissed, with no JS between them. */
+.itx-landing:not(:has(.itx-news)) {
+  --ld-bar-h: var(--ld-brand-h);
+}
+
+/* The bar itself is `.itx-sitebar` now (sitebar.css): sticky against
+ * whichever page root it is in, which here is the landing root spanning
+ * the whole document, so the tape and wordmark stay pinned all the way
+ * down past the board. */
+
+.itx-landing-top {
+  display: flex;
+  flex-direction: column;
+  /* Taller than the viewport by the strip's whole pull-up. The strip is
+   * lifted by that same amount, so its top edge lands exactly on the
+   * fold: the chart still fills the first screen and no part of the
+   * board shows on the landing view.
+   *
+   * It has to be the *whole* pull-up, overlap and lift together, and
+   * that is also what fixes something the landing screen was showing
+   * that it should not have been. The dotted rule sits
+   * `--bd-overlap + --ld-chart-base` up from the canvas's bottom edge,
+   * and the canvas only reached `--bd-overlap` below the fold -- so the
+   * rule, and the top of the bloom under it, printed about 24px above
+   * the fold and were the last thing on the first screen. Carrying the
+   * lift here puts the canvas's bottom far enough down that the rule
+   * lands below the fold, and it comes into view on the first scroll,
+   * where it belongs. */
+  min-height: calc(100vh + var(--bd-overlap) + var(--bd-lift) - var(--ld-bar-h));
+  min-height: calc(100svh + var(--bd-overlap) + var(--bd-lift) - var(--ld-bar-h));
+}
+
+/* ---- news tape ------------------------------------------------- */
+
+/* Relative, not sticky: the bar above does the sticking now. It still
+ * needs to be a containing block for the fade mask and close button. */
+.itx-news {
+  position: relative;
+  flex: none;
+  height: var(--ld-news-h);
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  /* No asset needed -- the reference's diagonal bias is just an angled
+   * gradient. Color bands run perpendicular to the gradient axis, so
+   * tipping the axis 38deg past horizontal leans every transition
+   * across the bar's height (~31px of lean over 40px, which is what
+   * reads as the diagonal). Anything much steeper starts trading away
+   * the left-to-right traverse, since the bands would cross the bar's
+   * height faster than its width.
+   *
+   * Long solid runs with short blends are the other half: the first
+   * version blended across such wide spans that pure red, blue and
+   * green never actually appeared anywhere on the bar. */
+  background: linear-gradient(
+    128deg,
+    var(--ld-red) 0%,
+    var(--ld-red) 27%,
+    var(--ld-blue) 44%,
+    var(--ld-blue) 60%,
+    var(--ld-green) 77%,
+    var(--ld-green) 100%
+  );
+}
+
+.itx-news-track {
+  display: inline-flex;
+  width: max-content;
+  animation: itx-news-scroll linear infinite;
+  will-change: transform;
+}
+
+.itx-news-half {
+  display: inline-flex;
+}
+
+.itx-news-item {
+  padding: 0 var(--sp-8);
+  font-size: 16px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  color: rgba(255, 255, 255, 0.95);
+  white-space: nowrap;
+}
+
+/* Headlines dissolve into the gradient behind the close button rather
+ * than sliding under it. The mask is the tape's own left-edge color,
+ * so it reads as a fade rather than a panel. */
+.itx-news-mask {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 108px;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    var(--ld-red) 0%,
+    var(--ld-red) 42%,
+    rgba(216, 64, 45, 0) 100%
+  );
+}
+
+.itx-news-close {
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #fff;
+  cursor: pointer;
+  /* The glyph alone -- no chip behind it. Hover just grows the X a
+   * little; the translate has to be restated in the hover transform
+   * or the button would jump back to the baseline as it scales. */
+  transform: translateY(-50%) scale(1);
+  transition: transform 140ms ease;
+}
+
+.itx-news-close:hover {
+  transform: translateY(-50%) scale(1.1);
+}
+
+.itx-news-close:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+@keyframes itx-news-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* ---- hero ------------------------------------------------------ */
+
+.itx-hero {
+  position: relative;
+  /* Contains the chart's z-index. Without this the hero is position
+   * relative at z-index auto, so it creates no stacking context and
+   * .itx-hero-chart's z-index: 1 escapes into the root -- where it
+   * outranks the whole board and paints its market line *over* the
+   * quote strip that is supposed to overlap it. The z-indexes in here
+   * were only ever meant to order the chart against the hero's own
+   * copy, so keeping them local is the fix. */
+  isolation: isolate;
+  overflow: hidden;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--ld-dark);
+}
+
+/* The wordmark row that used to live here is `.itx-sitebar-brand` in
+ * sitebar.css -- same markup, now shared with every other page. */
+
+/* Proportioned off the reference mock: the globe owns the left half
+ * and the copy starts just past the midline (~50%), not at 44%. The
+ * gap is small because the mock's globe and text nearly meet. */
+.itx-hero-grid {
+  flex: 1;
+  display: grid;
+  /* fr rather than percentages: percentage columns plus a gap overflow
+   * the row, and the overflow lands as a silent horizontal shift. This
+   * splits ~52/48 of whatever is left after the gap, putting the copy's
+   * left edge just past the midline as the mock has it. */
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-5);
+  /* 56px, not 48: this padding sets the copy column's width, which sets
+     the globe column's width, which sets the globe's height (it is
+     square) -- and the hero's height feeds the fold arithmetic. Dropping
+     a step here pushed the hero 6px past its min-height and moved the
+     quote strip off the fold. */
+  padding: 0 var(--sp-12) 13vh 0;
+  position: relative;
+  z-index: 2;
+}
+
+/* The canvas is the whole orbit box, so the sphere itself renders at
+ * ~58% of this width (globe radius 1.55 against the 2.69 frustum
+ * half-height). Sizing the canvas to fill the column is what gets the
+ * *sphere* to the mock's ~30%-of-page diameter; the vh cap only stops
+ * it overflowing the hero on short, wide windows. */
+.itx-hero-globe {
+  width: min(100%, 80vh);
+  aspect-ratio: 1;
+  margin: 0 auto;
+}
+
+.itx-globe-mount {
+  width: 100%;
+  height: 100%;
+}
+
+.itx-globe-mount canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Type follows the reference mock: one dominant lowercase line, a
+ * clear gap, then a distinctly smaller body block with airy leading.
+ *
+ * Heading and paragraph share this one measure rather than carrying
+ * separate max-widths, which is what keeps their right edges lining up
+ * the way the mock has them -- a `ch`-based limit on the paragraph
+ * alone drifts out of step with the heading at every breakpoint. */
+.itx-hero-copy {
+  max-width: 560px;
+}
+
+.itx-hero-copy h1 {
+  margin: 0 0 var(--sp-9);
+  font-size: clamp(34px, 3.6vw, 56px);
+  font-weight: 700;
+  line-height: 1.06;
+  letter-spacing: -0.018em;
+  color: var(--ld-light);
+}
+
+.itx-hero-copy p {
+  margin: 0;
+  font-size: clamp(15px, 1.15vw, 19px);
+  line-height: 1.78;
+  color: var(--ld-sub);
+}
+
+.itx-hero-red {
+  color: var(--ld-red);
+}
+
+/* The chart sits under the copy in stacking order, so tall peaks can
+ * pass behind the text instead of colliding with it. */
+.itx-hero-chart {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Grows by the overlap too, so the portion above the fold stays the
+   * height it was before the strip started covering its lower edge --
+   * peaks read on the landing screen, troughs pass behind the strip.
+   *
+   * And by the base band, so the price still gets its full `min(17vh,
+   * 160px)` to move in once the baseline and the glow beneath it have
+   * taken the bottom of the canvas. Growing the box is what keeps this
+   * additive: the box is absolutely positioned against the hero's
+   * bottom, so the extra height is taken out of the copy's dead space
+   * above -- which the chart already passes behind -- rather than out
+   * of the chart. */
+  height: calc(min(17vh, 160px) + var(--bd-overlap) + var(--ld-chart-base));
+  z-index: 1;
+  pointer-events: none;
+}
+
+.itx-market-line {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---- responsive ------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .itx-hero-grid {
+    grid-template-columns: 1fr;
+    align-content: start;
+    gap: var(--sp-3);
+    padding: 0 var(--sp-8) 30vh;
+  }
+
+  .itx-hero-globe {
+    width: min(66vw, 42vh);
+  }
+
+  .itx-news-item {
+    font-size: 14px;
+    padding: 0 var(--sp-6);
+  }
+
+  .itx-news-mask {
+    width: 84px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .itx-news-track {
+    animation: none;
+  }
+}
+
+
+/* ---- board (the section below the hero) ------------------------- */
+/* Follows the user's mockup: a quote strip in a green-to-grey gradient
+ * outline, then outline-only panels whose *labels sit above them*
+ * rather than inside, all over the supplied grid at 30% opacity. */
+
+.itx-board {
+  /* Outline grey for every box on the board. Same value the quote
+     strip's gradient lands on, so the strip and the panels below it
+     read as one family rather than the strip sitting on a paler,
+     bluer-white set of outlines. */
+  --bd-line: #3f4351;
+
+  /* How hard the grid behind the board prints. The ink is one fixed
+     dark blue-grey, so on a light ground the same 30% would draw a mid
+     grey mesh -- about four times the contrast against its ground that
+     it has against the dark one. The light theme dials it to 22%, which
+     lands the lines at the same 1.24:1 they sit at in the dark. */
+  --bd-grid-opacity: 0.3;
+
+  /* The grid itself, measured off the `grid.svg` this replaced -- see
+     `.itx-board::before`. Deliberately *not* themed: the asset's stroke
+     was a hardcoded #3e4352 in both themes and the light one is right
+     as it stands, so the colour is held and only the opacity above
+     moves. Declared here so the board and the inner pages
+     (`terminal.css`) draw one grid rather than two that drift.
+
+     **The line is 1px at 41.7% rather than 0.417px at full ink**, which
+     is the same quantity of ink and the only version that survives. A
+     sub-pixel gradient stop is snapped away by the compositor -- the
+     first port used `0 0.417px` and rendered a near-empty layer with a
+     stray line every few cells, where the SVG's 0.417px *stroke* was
+     antialiased into a hairline as intended. Trading the width for
+     alpha (0.417 coverage of a pixel, or a whole pixel at 0.417 alpha,
+     come to the same 0.125 effective alpha through the layer's 30%)
+     lands on the same density and always paints. Checked against the
+     asset side by side, seam invisible. */
+  --bd-grid-ink: rgba(62, 67, 82, 0.417);
+  --bd-grid-step: 16.812px;
+  --bd-grid-w: 1px;
+
+  /* One scale for the board, so radii, type and panel padding are
+     decisions made once rather than per rule. Each type step has a job:
+     title, panel label, the leading number in a quote, body copy and
+     table cells, secondary meta, and column headers. */
+  --r-field: 10px;
+  --r-panel: 14px;
+
+  /* One row height for every list on the board, and the only place it is
+     decided: `useFitRows` reads this property off the box it measures
+     rather than carrying its own copy, so changing it here changes both
+     how tall a row draws and how many of them a panel asks for. */
+  --row-h: 34px;
+
+  --fs-title: 25px;
+  --fs-label: 16px;
+  --fs-lead: 14px;
+  --fs-body: 13px;
+  --fs-meta: 12px;
+  --fs-micro: 11px;
+
+  /* Every panel insets its content by the same amount, which is what
+     lets content in different panels line up across the row. */
+
+
+  /* Panels share one inset on all four sides, which is what makes their
+     content line up across a row. */
+  --pad-panel-y: var(--sp-6);
+  --pad-panel-x: var(--sp-6);
+
+  /* Vertical rhythm. Three relationships, each with one value:
+     between major blocks, from a heading to what it introduces, and
+     from a label to the panel it names. */
+  --gap-section: var(--sp-9);
+  --gap-heading: var(--sp-7);
+  --gap-label: var(--sp-4);
+
+  position: relative;
+  isolation: isolate;
+  padding: 0 0 var(--sp-14);
+  color: var(--ld-light);
+  background: var(--ld-dark);
+
+  /* The masthead links here, and it is sticky: without this the board's
+     top edge stops under the bar. Applies to every route to it -- the
+     click handler's `scrollIntoView`, and the browser's own handling of
+     a `/#itx-board` address, which lands after React mounts and would
+     overrule any offset computed in JS. Follows the bar's own height,
+     so it is right on narrow screens and once the tape is dismissed.
+
+     Plus the overlap, because the first thing on the board is not at
+     the board's top edge: the quote strip is pulled up by
+     `--bd-overlap` to ride over the hero's market line, so aligning the
+     box put the strip -- and its labels -- behind the bar. Plus a step
+     of air, so the strip stops clear of the bar rather than welded to
+     it. */
+  scroll-margin-top: calc(
+    var(--ld-bar-h) + var(--bd-overlap) + var(--bd-lift) + var(--sp-5)
+  );
+}
+
+/* Anything the board's own nav jumps to. Without this the target's top
+   edge stops under the sticky masthead -- and for the overview that also
+   meant landing on the carousel with its own heading scrolled away,
+   which is why the nav points at the heading's box rather than the row
+   of panels. Same offset the board itself carries, minus the strip's
+   pull-up, which only applies at the very top of the board. */
+#itx-board-overview {
+  scroll-margin-top: calc(var(--ld-bar-h) + var(--sp-7));
+}
+
+/* The three sections below the overview park their *panels* on the same
+   line as the leaderboard's, so the board looks the same however you
+   arrived at it. They used to land at three different heights, because
+   the anchor was on each section and the sections' labels are not all
+   the same height.
+ *
+ * So the anchors sit on the panels, and the offset is where the
+ * leaderboard panel's own top edge is: the pinned box's top
+ * (`--ld-bar-h` + `--sp-6`, matching `.itx-board-pin`), plus the rail's
+ * two-line label above it.
+ *
+ * That label's height is derived from the type scale rather than
+ * measured -- a line of `--fs-label` at the 1.25 leading
+ * `.itx-board-label` sets, the `--fs-micro` sub-line under it at its
+ * own 2px offset and normal leading, and the label's bottom gap. It is
+ * the one approximation here, and it is worth it: a jump that lands a
+ * pixel or two off reads as level, and the alternative is measuring a
+ * box in JS to write a number into a stylesheet.
+ *
+ * It also keeps each section's own label clear of the masthead, which
+ * is what the anchor-on-the-panel arrangement got wrong the first time:
+ * this offset is a whole label taller than the bar, so the label sits
+ * in that space rather than behind it. */
+.itx-board {
+  --rail-label-h: calc(
+    var(--fs-label) * 1.25 + var(--fs-micro) * 1.2 + 2px + var(--gap-label)
+  );
+  --anchor-top: calc(var(--ld-bar-h) + var(--sp-6) + var(--rail-label-h));
+}
+
+#itx-board-predictions,
+#itx-board-latest,
+#itx-board-sectors,
+#itx-board-newsroom {
+  scroll-margin-top: var(--anchor-top);
+}
+
+/* The grid is a separate layer rather than a background on .itx-board
+ * itself, because it needs its own opacity without fading the content
+ * on top of it.
+ *
+ * **Drawn in CSS, ported from the supplied `grid.svg`.** The asset was
+ * 140 `<line>` elements in a viewBox holding exactly 69 periods,
+ * rasterised as a 1160px tile -- so the browser cached a 1160x1160
+ * bitmap (2320x2320 at DPR 2, about 21MB of image cache) to paint a
+ * pattern whose actual repeating unit is 16.8px. It also carried its
+ * stroke colour baked in at #3e4352, which is why the light theme had
+ * to reach it through `opacity` rather than by changing the colour.
+ *
+ * The values are measured off that file, not re-chosen: 5569.94 viewBox
+ * units rendered at 1160px is a scale of 0.2083, so its 80.72u line
+ * pitch is 16.812px and its 2u stroke is 0.417px of ink. The colour
+ * stays #3e4352 in both themes, exactly as the asset was, so nothing
+ * about how this looks changes -- only what it costs to paint. How the
+ * 0.417px became 1px at 41.7% alpha is worth reading before touching
+ * it: see `--bd-grid-ink`.
+ *
+ * `repeating-linear-gradient` with no `background-size` rather than a
+ * one-cell tile: the stops are then computed once across the whole
+ * layer at full precision, where a 16.812px tile would round each
+ * repeat to the device grid and leave the pitch visibly uneven. */
+.itx-board::before {
+  content: "";
+  position: absolute;
+  /* Follows the strip up, so the grid still starts where the board
+     visually starts rather than at the strip's old edge. */
+  inset: calc(-1 * (var(--bd-overlap) + var(--bd-lift))) 0 0 0;
+  z-index: -1;
+  opacity: var(--bd-grid-opacity);
+  background-image:
+    repeating-linear-gradient(
+      to right,
+      var(--bd-grid-ink) 0 var(--bd-grid-w),
+      transparent var(--bd-grid-w) var(--bd-grid-step)
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      var(--bd-grid-ink) 0 var(--bd-grid-w),
+      transparent var(--bd-grid-w) var(--bd-grid-step)
+    );
+  pointer-events: none;
+}
+
+.itx-board-inner {
+  /* The board's fixed side columns, named here because two rows resolve
+     against them: the columns themselves, and the heading line above,
+     whose title and pager have to start and end where the market
+     carousel does. */
+  --col-nav: 172px;
+  --col-rail: 232px;
+
+  /* Establishes a block formatting context so the quote strip's
+   * negative top margin cannot collapse out through here and drag the
+   * whole board box up with it -- which pulled the grid layer 58px
+   * above the fold, where it showed as grid lines over the hero's
+   * chart. The strip still renders 58px above this box; only the box
+   * itself stays put. */
+  display: flow-root;
+  /* The board follows the window out to 2400px rather than stopping at
+     1560 and turning the rest into margin. Past that it stops: the side
+     columns are fixed, so everything beyond this goes to the market row
+     alone, and there is a width past which a row of tables is just far
+     apart. */
+  max-width: 2400px;
+  margin: 0 auto;
+  padding: 0 var(--sp-11);
+}
+
+/* The heading line: the title over the carousel's first panel, with the
+   pager beside it, on the same line so the arrows sit clear of the
+   category names below. */
+.itx-board-head {
+  display: grid;
+  grid-template-columns: var(--col-nav) minmax(0, 1fr) var(--col-rail);
+  gap: var(--sp-8);
+  align-items: center;
+  margin: var(--gap-section) 0 var(--gap-heading);
+}
+
+/* Title and pager as one unit in the middle column. Out at the column's
+   right end the arrows read as decoration on an empty stretch of rule;
+   sitting against the heading they are plainly the control for what the
+   heading names. */
+.itx-board-headline {
+  grid-row: 1;
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  /* The title's own line box, held whatever is in the row. The heading
+     line carries the section's top margin, and the back control that
+     replaces the title when a market opens is a good deal shorter --
+     without a floor the whole board below shifted up 16px on opening a
+     market and back down on closing one. */
+  min-height: calc(var(--fs-title) * 1.2);
+}
+
+.itx-board-title {
+  margin: 0;
+  font-size: var(--fs-title);
+  font-weight: 700;
+  letter-spacing: -0.012em;
+}
+
+/* Labels live outside their panels, above the outline. */
+.itx-board-labels {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  margin-bottom: var(--sp-4);
+}
+
+.itx-board-label {
+  display: block;
+  margin-bottom: var(--gap-label);
+  font-size: var(--fs-label);
+  line-height: 1.25;
+  font-weight: 700;
+  letter-spacing: -0.004em;
+  color: var(--ld-light);
+}
+
+.itx-board-labels .itx-board-label {
+  margin-bottom: 0;
+}
+
+/* The market's size, sitting under its name. Normal weight and muted so
+   the tag stays the thing you read first. */
+.itx-board-label-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-micro);
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--ld-sub);
+}
+
+.itx-board-labels-latest {
+  margin-top: var(--gap-section);
+}
+
+.itx-board-live-dot {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--ld-red);
+}
+
+/* Every box on the board is this: hairline outline, and a fill that is
+   the page colour rather than a darker slab. What sets a panel apart
+   from the background is that it is opaque and so hides the grid behind
+   it -- not a change in tone. A darker fill reads as a second surface,
+   which the mockup does not have. */
+.itx-board-panel {
+  box-sizing: border-box;
+  border: 1px solid var(--bd-line);
+  border-radius: var(--r-panel);
+  background: var(--ld-dark);
+}
+
+.itx-board a {
+  color: var(--ld-blue);
+  text-decoration: none;
+}
+
+/* Hover lifts the ink rather than underlining it -- see the same rule
+   in terminal.css for why, and for why the mix goes toward the page's
+   own ink (`--ld-light`) rather than toward white: that is what keeps
+   one rule right on both themes. */
+.itx-board a:hover {
+  color: color-mix(in srgb, var(--ld-blue) 78%, var(--ld-light));
+  text-decoration: none;
+}
+
+.itx-board .up {
+  color: var(--ld-green);
+}
+
+.itx-board .down {
+  color: var(--ld-red);
+}
+
+.itx-board .flat {
+  color: var(--ld-sub);
+}
+
+/* The ink at 12%, rather than a literal light grey: on the light theme
+   the same rule draws a faint dark dash instead of an invisible pale
+   one. */
+.itx-board .itx-spark-baseline {
+  stroke: color-mix(in srgb, var(--ld-light) 12%, transparent);
+  stroke-dasharray: 3 3;
+}
+
+.itx-board-note {
+  margin: var(--sp-1) 0;
+  color: var(--ld-sub);
+  font-size: var(--fs-body);
+  line-height: 1.5;
+}
+
+/* quote strip */
+
+/* The gradient outline is a 1px padding box: the gradient paints the
+ * wrapper, the inner element covers all but its edge. `border-image`
+ * would be the other route, but it cannot follow a border-radius. */
+/* Pulled up so the hero's market line runs behind it: peaks show above
+ * the strip, troughs disappear behind it, as in the mockup. The board
+ * paints after the hero, so a relative position is all it takes for the
+ * strip to sit on top -- no z-index race with the hero's canvas.
+ *
+ * The outline is a 1px gradient padding box (`border-image` cannot
+ * follow a border-radius). Straight down at 180deg: green along the top
+ * edge, grey by the bottom. */
+.itx-board-quotes {
+  /* Sampled across the width from the same wash the hero's market line
+     uses, written per frame by QuoteStrip. The fallbacks are the wash's
+     resting colour, so the outline is right on the first paint before
+     any script runs. */
+  --q0: var(--ld-green);
+  --q1: var(--ld-green);
+  --q2: var(--ld-green);
+  --q3: var(--ld-green);
+  --q4: var(--ld-green);
+
+  position: relative;
+  /* The whole pull-up: the overlap the chart box compensates for,
+     plus the lift that is not compensated and so is what actually
+     carries the strip up over the line. */
+  margin-top: calc(-1 * (var(--bd-overlap) + var(--bd-lift)));
+  padding: 1px;
+  /* One ring wider than the panel radius it wraps, so the outer curve
+     stays concentric with the inner one. */
+  border-radius: calc(var(--r-panel) + 1px);
+  /* Two layers, not one gradient: a grey painted *over* a horizontal
+     sweep, transparent at the top so the sweep shows through and opaque
+     by the bottom. One gradient cannot vary colour horizontally and
+     fade vertically at the same time -- the same constraint the market
+     line's own fill runs into. */
+  background-image:
+    linear-gradient(180deg, transparent 0%, var(--bd-line) 62%),
+    linear-gradient(90deg, var(--q0), var(--q1), var(--q2), var(--q3), var(--q4));
+}
+
+.itx-board-quotes-inner {
+  display: flex;
+  gap: var(--sp-5);
+  overflow-x: auto;
+  padding: var(--sp-5) var(--sp-8);
+  border-radius: var(--r-panel);
+  background: var(--ld-dark);
+  scrollbar-width: none;
+}
+
+.itx-board-quotes-inner::-webkit-scrollbar {
+  display: none;
+}
+
+.itx-board-quote {
+  flex: 1 0 auto;
+  min-width: 152px;
+  padding-right: var(--sp-5);
+}
+
+.itx-board-quote-name {
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-meta);
+  font-weight: 700;
+  color: var(--ld-light);
+}
+
+.itx-board-quote-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-5);
+  /* The cells divide the strip's whole width, so with only three kinds
+     of task on the board they are enormous -- and `space-between` spent
+     all of it pushing each figure away from its own sparkline. The cells
+     still stretch, which is what keeps the strip full; their contents
+     stop spreading here. */
+  max-width: 260px;
+}
+
+.itx-board-quote-value {
+  font-size: var(--fs-lead);
+  color: var(--ld-light);
+}
+
+.itx-board-quote-change {
+  font-size: var(--fs-micro);
+}
+
+/* markets + rail */
+
+/* The box a panel hands to `useFitRows`: it takes whatever height the
+   panel has left and reports it back, and the rows are drawn into it.
+
+   `flex-basis: 0` is what makes that safe. With `auto` the box would
+   contribute its rows to the panel's content height, so more rows would
+   make the panel taller, which would fit more rows -- the measurement
+   would chase itself. At 0 the panel's height is settled by its own
+   min-height first and the box is handed the remainder. `overflow`
+   catches the sub-row remainder that `floor` leaves behind. */
+.itx-board-fit {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.itx-board-cols {
+  display: grid;
+  grid-template-columns: var(--col-nav) minmax(0, 1fr) var(--col-rail);
+  gap: var(--sp-8);
+  /* `align-items: start` now, where it used to be deliberately absent.
+     Stretching every column to the row's height was right while the
+     three of them were the same height; the middle one is taller than
+     the viewport now (markets, then the tape), and stretching the two
+     pinned columns to *that* would leave them taller than the screen
+     with nothing to pin against. Each column is given its own height
+     below instead. */
+  align-items: start;
+}
+
+/* The two columns that stay put -- or rather, the columns that hold
+ * something that stays put.
+ *
+ * **The column itself is an ordinary grid item and the sticky box is
+ * inside it.** It used to be the other way round: the column was the
+ * sticky element. That works in this browser, but it puts the two
+ * hardest cases in CSS -- a sticky element that is also a grid item,
+ * and one whose height is a `min-height` fighting a `max-height` --
+ * into the same box, and it is where the trends panel could be seen
+ * painted over the footer. A sticky box inside a plain block is the
+ * well-defined case everywhere: it cannot travel past its parent's
+ * bottom edge, and that parent now ends exactly where the board's
+ * columns end, a section's gap above the footer.
+ *
+ * `align-self: stretch` is what gives it that parent: with the grid's
+ * `align-items: start` these columns were as tall as their contents, so
+ * there was nothing to travel *within*. Stretched, the column spans the
+ * row -- which is as tall as the middle column -- and the pinned box
+ * inside it slides down that length and stops. */
+.itx-board-nav,
+.itx-board-rail {
+  align-self: stretch;
+  /* Explicit, not just stretched. A sticky child is only bounded by a
+     parent whose height the engine treats as definite, and a height
+     that comes from `stretch` alone is where engines differ -- the
+     trends panel was reported running past the footer on a browser
+     that is not the one this was checked in. Against a grid area the
+     percentage is definite, so this says the same thing twice in the
+     way every engine agrees on. */
+  height: 100%;
+}
+
+/* What actually pins: the panels, held just under the masthead and
+ * exactly as tall as what is left of the viewport under it, so the
+ * leaderboard and trends are always fully on screen rather than
+ * scrolling half out of view. A definite height is also what the panels
+ * inside need: the trends panel takes the rail's slack with `flex: 1`,
+ * and `useFitRows` divides a real height to decide how many rows to
+ * draw -- against `height: auto` both resolve to nothing and the panels
+ * come up empty. */
+.itx-board-pin {
+  position: sticky;
+  top: calc(var(--ld-bar-h) + var(--sp-6));
+  /* **As tall as its contents, and at least as tall as the markets
+     column beside it.** Stated in that order deliberately.
+​
+     It used to be the other way round -- a definite `height` of
+     `--board-col-h` with `min-height: min-content` underneath it to
+     stop the panels being squeezed out of the box. That works here and
+     is what Safari was reported breaking on: min-content sizing of a
+     flex column is one of the places engines genuinely differ, and when
+     it resolves short the box is left shorter than its panels, which do
+     not clip -- the trends panel simply draws on past the bottom of the
+     rail and over the footer.
+
+     `height: auto` needs no such agreement: the box is as tall as what
+     is in it, in every engine, with no intrinsic-sizing keyword
+     involved. `--board-col-h` moves to the floor, which is the only job
+     it was ever doing -- stretching the rail to finish level with a
+     markets column taller than the rail's own panels. The fallback is
+     the viewport rule this carried before, for the frame before the
+     first measurement and for anything that cannot run a
+     ResizeObserver. */
+  height: auto;
+  min-height: var(--board-col-h, calc(100vh - var(--ld-bar-h) - var(--sp-9)));
+  /* Never taller than the screen: a pinned column that is has parts
+     which can never be scrolled to. `max-height` loses to `min-height`
+     in the cascade, so on a board cramped enough for the two to
+     disagree the floor still wins and the rail scrolls itself. */
+  max-height: calc(100vh - var(--ld-bar-h) - var(--sp-9));
+  display: flex;
+  flex-direction: column;
+  /* And nothing inside may paint outside this box, whatever the height
+     resolves to. This is the belt to the braces above: a scroll
+     container cannot spill its contents over the footer the way a plain
+     block does. In practice the bar never appears, because the box is
+     already the height of its contents. */
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.itx-board-pin::-webkit-scrollbar {
+  display: none;
+}
+
+/* The column that actually scrolls: the carousel at a screen's height,
+   then the tape below it. */
+.itx-board-mid {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* No height here any more. It was pinned to the viewport so the market
+   overview finished level with the rail, and that is what left the
+   panels stretched over their own content -- the thing the rows were
+   swimming in. The carousel takes its height from the tallest sector
+   now, and the rail is simply the taller of the two columns. */
+
+.itx-board-markets {
+  /* One width for a market column, read by the carousel items. The
+     label lives inside the item, so it inherits this automatically
+     instead of being laid out separately and hoping the two agree. */
+  --market-basis: calc(44% - 4px);
+  /* How many panels the clip shows whole. The one after them is the
+     peek, and this is what tells the carousel where to start fading it. */
+  --markets-shown: 2;
+
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.itx-board-market {
+  flex: 0 0 var(--market-basis);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Where the row sits, under the panels it belongs to.
+ *
+ * A real scrollbar is hidden on this row (`scrollbar-width: none`) --
+ * the peek and its dissolve are what say "there is more this way", and
+ * a native bar under a masked row reads as a second, contradicting
+ * edge. This is the same information drawn to match the board: a
+ * hairline track with a thumb as wide a fraction of it as the row is of
+ * its own scroll width.
+ *
+ * Both numbers arrive as custom properties written by `useCarousel` on
+ * the parent, on every scroll frame and off React's render path -- so
+ * this follows a finger exactly, and moves with a snapped arrow step
+ * because that is a scroll too. The fallbacks are the at-rest state, so
+ * a row that has not been measured yet shows a full track rather than
+ * an empty one.
+ *
+ * `translate` rather than `left`: it moves the thumb on the compositor,
+ * where `left` would lay the row out again on every frame of a scroll
+ * that is already doing work. */
+.itx-board-slider {
+  position: relative;
+  height: 3px;
+  margin-top: var(--sp-5);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--bd-line) 62%, transparent);
+  overflow: hidden;
+  /* So the thumb can measure the track: `100cqw` below is this box's
+     width. A percentage on the thumb resolves against the same box it
+     is sized from, which cannot express "the track's width minus my
+     own". Scoped to the track rather than the markets column so the
+     containment cannot reach anything that lays out. */
+  container-type: inline-size;
+}
+
+.itx-board-slider span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: calc(var(--rail-thumb, 1) * 100%);
+  border-radius: inherit;
+  background: var(--ld-sub);
+  /* The thumb travels the track's width less its own. */
+  translate: calc(var(--rail-progress, 0) * (100cqw - 100%)) 0;
+}
+
+
+/* Scoped to the markets row: there the labels share the width so each
+ * sits over its panel. In the "latest" row the label must stay its own
+ * width, or it grows and shoves the live dot to the far right. */
+.itx-board-markets .itx-board-labels .itx-board-label {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* Lives on the heading line now, not over the labels. Down there it had
+   to be floated out of the flow -- as a row item it would have consumed
+   width the panels do not, and the labels and panels stopped lining up --
+   and even then it crowded whichever category name was clipped beneath
+   it. Up here it is simply a flex item next to the title. */
+.itx-board-pager {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  color: var(--ld-sub);
+}
+
+.itx-board-pager button {
+  padding: var(--sp-1);
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  transition: transform 130ms ease, color 130ms ease;
+}
+
+/* 1.1, down from 1.25. The three pagers on the site share one hover
+   now, and 1.25 on a 12px triangle is a jump rather than a response --
+   it read as the arrow leaping at the cursor once the other two were
+   doing it too. */
+.itx-board-pager button:hover:not(:disabled) {
+  color: var(--ld-light);
+  transform: scale(1.1);
+}
+
+/* At an end. Dimmed rather than hidden, so the pair stays a pair and
+   the heading line does not reflow as you scroll the row. */
+.itx-board-pager button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* A real scroll container, not a clip with a transform driven from JS.
+ *
+ * That is the whole gesture story: a trackpad swipe, a finger drag,
+ * momentum, rubber-banding at the ends and shift-scroll all come from
+ * the browser, on every engine, at whatever frame rate the compositor
+ * manages -- none of which a hand-rolled version matched. What is left
+ * in JS (useCarousel) is which market is at the front and where an
+ * arrow should land.
+ *
+ * The scrollbar is hidden because the row is not a scrollbar's kind of
+ * scroll: the peek past the edge and the pager say where you are, and a
+ * gutter under the panels would cut into a box whose height is shared
+ * with the rail beside it. `overscroll-behavior-x: contain` keeps a
+ * flick that runs out of markets from reaching the browser's own
+ * back-swipe, which is what made this feel like it broke the page.
+ *
+ * The next item is deliberately half past the edge: the peek is what
+ * tells you there is more. It fades rather than ending on a hard cut --
+ * a panel sliced down the middle reads as a rendering fault, one
+ * dissolving into the page as the next thing along. */
+.itx-board-carousel {
+  /* Where the peeking panel starts: the whole panels before it, each
+     with the gap that follows it. */
+  --peek-edge: calc(var(--markets-shown) * (var(--market-basis) + var(--sp-7)));
+  /* The near edge's ramp. Unlike the far one it cannot be a constant:
+     the far edge always has a panel crossing it, while this one only
+     does between boundaries -- and the arrows leave the row *on* a
+     boundary, panel flush against the edge, nothing sliced. So the
+     width is written from useCarousel on every scroll frame, as much of
+     this ceiling as there is outgoing panel to cover, and 0 at rest.
+     The ceiling is roughly what the peek's own dissolve spans at the
+     far edge, so a row stopped mid-scroll is bounded alike at both. */
+  --leading-fade-max: 96px;
+  --leading-fade: 0px;
+  /* How far the far edge's dissolve runs: from where the peek starts to
+     the end of the row. */
+  --peek-span: calc(100% - var(--peek-edge));
+
+  display: flex;
+  flex: 1;
+  gap: var(--sp-7);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  /* Both fades are S-curves, not straight ramps, sampled at quarters.
+     A linear fade changes alpha at a constant rate but *starts* doing
+     so all at once, and that corner is visible as a seam down the panel
+     -- across a row of figures it reads as a crease in the glass. These
+     stops follow smoothstep (3t²-2t³), which leaves and arrives with
+     zero slope, so there is no instant where the dimming begins.
+     Sampled rather than eased because a gradient interpolates linearly
+     between its stops whatever curve you had in mind.
+
+     An earlier version stepped straight to 55% at --peek-edge on the
+     theory that the step fell in the gap between two panels, where
+     there is nothing painted to step. That was true only while the row
+     sat on fixed pages; now that it scrolls freely the same edge lands
+     wherever the reader stopped, which is usually mid-panel. */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    rgba(0, 0, 0, 0.16) calc(var(--leading-fade) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--leading-fade) * 0.5),
+    rgba(0, 0, 0, 0.84) calc(var(--leading-fade) * 0.75),
+    #000 var(--leading-fade),
+    #000 var(--peek-edge),
+    rgba(0, 0, 0, 0.84) calc(var(--peek-edge) + var(--peek-span) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--peek-edge) + var(--peek-span) * 0.5),
+    rgba(0, 0, 0, 0.16) calc(var(--peek-edge) + var(--peek-span) * 0.75),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    rgba(0, 0, 0, 0.16) calc(var(--leading-fade) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--leading-fade) * 0.5),
+    rgba(0, 0, 0, 0.84) calc(var(--leading-fade) * 0.75),
+    #000 var(--leading-fade),
+    #000 var(--peek-edge),
+    rgba(0, 0, 0, 0.84) calc(var(--peek-edge) + var(--peek-span) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--peek-edge) + var(--peek-span) * 0.5),
+    rgba(0, 0, 0, 0.16) calc(var(--peek-edge) + var(--peek-span) * 0.75),
+    transparent 100%
+  );
+}
+
+/* Safari's is the one that shows: hidden by hand, since
+   `scrollbar-width` is Firefox's spelling and nothing standard covers
+   WebKit yet. */
+.itx-board-carousel::-webkit-scrollbar {
+  display: none;
+}
+
+/* At the far end there is nothing behind that edge, and its fade goes
+   to nothing: the last panel finishes on the edge, and dimming it would
+   be a promise of more that isn't there. Collapsed by moving a stop
+   rather than by dropping one, so the gradient keeps its shape.
+
+   The near edge needs no rule of its own -- being at the start is just
+   the case where the row sits on a boundary, which the width written
+   from useCarousel already answers with zero. */
+.itx-board-carousel[data-at-end] {
+  --peek-edge: 100%;
+}
+
+.itx-board-panel-market {
+  /* Sized by its rows, not by the column.
+   *
+   * `flex: 1` still fills the carousel item, but the *item* is now as
+   * tall as its content rather than as tall as the viewport -- so a
+   * sector with nine markets makes a nine-row panel instead of a nine-row
+   * table adrift in six hundred pixels of empty box. Every panel in the
+   * row still finishes level, because the carousel is a flex row and its
+   * items stretch to the tallest of them.
+   *
+   * The floor is for the states with no table in them at all -- loading,
+   * an unreachable hub, a sector with nothing on the board -- where a
+   * one-line panel would make the whole row jump the moment data
+   * arrived. */
+  flex: 1;
+  min-height: calc(var(--row-h) * 5);
+  padding: var(--pad-panel-y) var(--pad-panel-x);
+  display: flex;
+  flex-direction: column;
+}
+
+/* The column is a plain block now -- what stacks its panels is the
+   pinned box inside it (`.itx-board-pin`). */
+.itx-board-rail {
+  min-width: 0;
+}
+
+.itx-board-panel-leaders {
+  min-height: 300px;
+  padding: var(--pad-panel-y) var(--pad-panel-x);
+  display: flex;
+  flex-direction: column;
+}
+
+.itx-board-panel-trends {
+  /* The last panel in the rail takes up any slack, so the rail ends
+     level with the markets column rather than leaving a ragged edge. */
+  flex: 1;
+  min-height: 244px;
+  margin-bottom: 0;
+  padding: var(--pad-panel-y) var(--pad-panel-x);
+  display: flex;
+  flex-direction: column;
+}
+
+/* left nav */
+
+.itx-board-nav {
+  min-width: 0;
+}
+
+.itx-board-panel-nav {
+  flex: 1;
+  padding: var(--pad-panel-y) var(--pad-panel-x);
+  display: flex;
+  flex-direction: column;
+}
+
+.itx-board-navlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: var(--fs-body);
+}
+
+/* Same row height as every table on the board, so the nav's entries sit
+   on the same rhythm as the rows in the panels beside it. */
+.itx-board-navlist li {
+  display: flex;
+  align-items: center;
+  height: var(--row-h);
+}
+
+.itx-board-navlist a,
+.itx-board-navlist button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ld-light);
+  font: inherit;
+  font-size: var(--fs-body);
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The market entries are a longer, changing list, so they sit back a
+   step from the four fixed section links above them. */
+.itx-board-navlist button {
+  color: var(--ld-sub);
+}
+
+/* The nav's entries are already the page's ink, so there is nothing to
+   brighten toward -- they lift by going to full strength from the step
+   back they sit at. Same idea as the links, expressed in the one
+   direction this colour can move. */
+.itx-board-navlist a:hover,
+.itx-board-navlist button:hover {
+  color: var(--ld-light);
+}
+
+/* Which market the carousel is currently showing. */
+.itx-board-navlist button.is-active {
+  color: var(--ld-light);
+  font-weight: 700;
+}
+
+/* The sectors, nested inside the overview's entry.
+ *
+ * No heading of its own any more: it had one, and an entry called
+ * "breakdown" sat directly under it pointing at the sector map, so the
+ * rail named sectors twice for two different things. Indented under the
+ * thing they belong to, the list needs no label -- its position is the
+ * label -- and the rule that used to separate it now only has to
+ * separate the off-board links at the foot.
+ *
+ * The indent is a rule rather than padding alone: a hairline down the
+ * left of the group says "these belong to the entry above" in a way
+ * whitespace on its own does not, at the width this rail has to work
+ * in. */
+/* The entry that owns the sector list.
+ *
+ * Every other nav entry is a flex row with a fixed `--row-h`, which
+ * centres its single link. This one has a *list* after the link as well,
+ * and under those rules the list became a second flex item -- it laid
+ * out to the right of "market overview", squeezed the label to
+ * "marke...", and overflowed the panel because the row is only 34px
+ * tall. So this item stacks and takes its height from its contents, and
+ * the link keeps the row rhythm on its own. */
+/* Qualified with the list, because `.itx-board-navlist li` above is a
+   class *and* an element and would otherwise out-specify a bare class
+   here -- the row would stay flex and the list beside the link. */
+.itx-board-navlist li.itx-board-navgroup {
+  display: block;
+  height: auto;
+}
+.itx-board-navgroup > a {
+  display: flex;
+  align-items: center;
+  height: var(--row-h);
+}
+
+.itx-board-navlist-sectors {
+  margin: var(--sp-2) 0 var(--sp-3);
+  padding-left: var(--sp-5);
+  border-left: 1px solid color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+
+.itx-board-navlist-sectors button {
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+}
+.itx-board-navlist-sectors button:hover,
+.itx-board-navlist-sectors button.is-active {
+  color: var(--ld-light);
+}
+
+/* Links off the board entirely, held apart from the in-page ones and
+   pinned to the foot of the rail -- there are only ever a handful of
+   markets to list, so without this the rail ends in dead space. */
+.itx-board-navlist-pages {
+  margin-top: auto;
+  padding-top: var(--sp-2);
+  border-top: 1px solid color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+
+.itx-board-navlist-pages a {
+  color: var(--ld-blue);
+}
+
+.itx-board-rail .itx-board-label:nth-of-type(2) {
+  margin-top: var(--gap-heading);
+}
+
+/* search */
+
+.itx-board-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-5);
+  padding: var(--sp-3) var(--sp-5);
+  border: 1px solid var(--bd-line);
+  border-radius: var(--r-field);
+}
+
+.itx-board-search:focus-within {
+  border-color: var(--ld-blue);
+}
+
+/* Inlined rather than an <img> so it can take currentColor -- see
+ * SearchIcon in Board.tsx for why the shipped file needed reworking. */
+.itx-board-search svg {
+  flex: none;
+  color: var(--ld-sub);
+}
+
+.itx-board-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--ld-light);
+  font: inherit;
+  font-size: var(--fs-body);
+}
+
+.itx-board-search input:focus {
+  outline: none;
+}
+
+.itx-board-search input::placeholder {
+  color: var(--ld-sub);
+}
+
+/* tables */
+
+/* index.css styles bare `table`/`th`/`td` globally for the legacy pages
+ * -- light header bands and full cell borders. Reset inside the board. */
+.itx-board-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-body);
+}
+
+.itx-board-table th,
+.itx-board-table td {
+  border: 0;
+  background: none;
+  /* The rows are a fixed height rather than one their contents set (see
+     --row-h below), so what a cell does with the slack matters. The
+     legacy `td { vertical-align: top }` in index.css was pinning every
+     agent key to the top of its 34px row -- half a pixel under the line
+     above it and eighteen clear below -- which is what made the tables
+     read as unevenly spaced rather than as rows. */
+  vertical-align: middle;
+}
+
+.itx-board-table th {
+  /* Same box model as the cells below them. Without this a declared
+     column width is the *content* width and the padding is added on
+     top, so a set of widths that fits on paper overflows its table --
+     which is what pushed the change column out of the market panels at
+     narrow widths and collapsed the market name to nothing. */
+  box-sizing: border-box;
+  padding: var(--sp-1) var(--sp-3) var(--sp-3);
+  text-align: left;
+  color: var(--ld-sub);
+  font-weight: 400;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.02em;
+}
+
+/* Fixed row height rather than one that follows its contents, so a
+   panel's capacity is arithmetic instead of a guess -- see --row-h.
+   `height` on a cell is a minimum, so the padding is dropped to the
+   sides and the row's own height governs. Border-box because a cell is
+   content-box by default, which would have put the separator *outside*
+   the 34px and left every row a pixel taller than the count assumed --
+   enough, over fifteen rows, to clip the last one. */
+.itx-board-table td {
+  box-sizing: border-box;
+  height: var(--row-h);
+  padding: 0 var(--sp-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+
+/* An inline SVG sits on the text baseline and reserves descender space
+   below it, which is enough to push a 20px sparkline past the row
+   height it was sized for. */
+.itx-board-table .itx-spark {
+  display: block;
+}
+
+/* An agent row: profile icon, then name (or key). Flex rather than
+   inline so the 22px icon centres inside the fixed 34px row instead of
+   riding the text baseline -- the same trap the sparkline note above
+   describes, solved the same way. */
+.itx-board-agent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.itx-board-avatar {
+  flex: none;
+  border-radius: 4px;
+}
+
+.itx-board-table tr:last-child td {
+  border-bottom: 0;
+}
+
+/* Outer cells sit flush with the panel's padding box. Without this the
+   cell's own side padding inset the first column a further 5px, so a
+   table and a paragraph in sibling panels -- the agent rows against the
+   "consensus winners are never exposed" note -- started on different
+   vertical lines. */
+.itx-board-table th:first-child,
+.itx-board-table td:first-child {
+  padding-left: 0;
+}
+
+.itx-board-table th:last-child,
+.itx-board-table td:last-child {
+  padding-right: 0;
+}
+
+.itx-board-table .right {
+  text-align: right;
+}
+
+.itx-board-cell-spark {
+  width: 68px;
+}
+
+/* The quoted level. Tabular figures so the column reads as a column --
+   proportional digits make 1s narrow and every row start at a slightly
+   different place, which is exactly what a price column must not do. */
+.itx-board-cell-value {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Sortable headings. The button carries the whole cell so the hit area
+   is the heading rather than the few pixels of the word, which is what
+   makes this usable in a 34px row. */
+.itx-board-sorth {
+  padding: 0;
+}
+.itx-board-sorth button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-1);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-3) var(--sp-3);
+  border: 0;
+  background: none;
+  /* Headings are set from the table's own header rule; a button resets
+     all of it, so the three that matter are restated rather than
+     inherited from a parent that no longer applies. */
+  color: var(--ld-sub);
+  font: inherit;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.itx-board-sorth:last-child button {
+  padding-right: 0;
+}
+.itx-board-sorth button:hover,
+.itx-board-sorth button:focus-visible {
+  color: var(--ld-light);
+}
+.itx-board-sorth button.is-active {
+  color: var(--ld-light);
+}
+
+/* The caret keeps its width whether or not it is drawn, so taking over
+   the sort does not shunt the two headings sideways. */
+.itx-board-caret {
+  display: inline-block;
+  min-width: 7px;
+  font-size: 7px;
+  line-height: 1;
+}
+/* A market's name, which is a capability tag and so can be long and
+   hyphenated (`relationship-advice`, `machine-learning`) where this
+   column used to hold a truncated pubkey that never wrapped.
+
+   Rows are a fixed --row-h and the panel divides its height by that to
+   decide how many it can show, so a name wrapping to a second line does
+   not just look wrong -- it makes every capacity below it an
+   overestimate. A hyphen is a break opportunity, so this is one
+   `overflow-wrap` away at any width. Clipping the link rather than the
+   cell keeps it out of the table's column sizing: `text-overflow` needs
+   a constrained box, and constraining the cell would mean
+   `table-layout: fixed` on every board table, including the two that
+   size themselves fine today. */
+/* `a, button` because the same cell is a link in the trends rail and a
+   button in the market panels -- the rail navigates, the panel opens a
+   chart in place. Both look identical and should; what differs is what
+   they do, not what they are. */
+.itx-board-cell-market a,
+.itx-board-cell-market button {
+  display: block;
+  /* 18ch, not the 22 this started at: the panel carries a fourth column
+     now (the quoted value), and at the narrowest carousel step the four
+     of them plus the sparkline are within a few pixels of the panel's
+     width. The longest tag in the taxonomy -- `relationship-advice`, 19
+     -- clips by a character here, which is why the full name is on the
+     link's `title`. */
+  max-width: 18ch;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Narrower than the rail's, for the same reason. The sparkline is the
+   most compressible thing in the row -- it carries shape, not figures,
+   and reads the same 16px shorter. */
+.itx-board-panel-market .itx-board-cell-spark {
+  width: 52px;
+}
+
+/* A percentage is the one thing in these tables that must never be
+   shortened: half a number reads as a whole one. `+290.11%` is the
+   widest it gets, and the cell is sized to hold it so the columns
+   beside it give way instead. */
+.itx-board-table .right,
+.itx-board-cell-pct {
+  white-space: nowrap;
+}
+.itx-board-cell-pct {
+  width: 1%;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The trends rail is 232px wide, against a market panel's 340 and up, so
+   its three columns need their own budget: a 44px sparkline (set on the
+   element too -- the SVG carries its own width), and a name capped
+   tighter than the panels' 18ch. Without this the longest tags wrapped
+   to a second line, which broke the fixed row height *and* pushed the
+   percentage out past the panel's edge, where it was clipped mid-digit. */
+/* Fixed layout, because auto layout will not let the name column give
+   way. A `max-width` in ch on the link is a *preferred* width as far as
+   automatic table layout is concerned, so the table sized itself to the
+   longest tag and ran 8px past the panel's edge -- the percentages were
+   still being painted outside the box, just less obviously than when
+   they wrapped. Fixed layout takes the two right-hand columns at the
+   widths declared here and hands the rest to the name, which then
+   ellipsizes into whatever it is given at any rail width. */
+.itx-board-panel-trends table {
+  table-layout: fixed;
+  width: 100%;
+}
+.itx-board-panel-trends .itx-board-cell-spark {
+  width: 44px;
+}
+.itx-board-panel-trends .itx-board-cell-pct {
+  /* Wide enough for the number *and* the gap in front of it. These
+     cells are `border-box`, so the padding added below comes out of this
+     width -- at 66px it left 48px of content for a `+300.00%` that
+     wants 56, and clipped inside its own cell while sitting well within
+     the panel. */
+  width: 80px;
+}
+/* The cap belongs to the market panels, where the column is content-
+   sized; here the column is already bounded by the table. */
+.itx-board-panel-trends .itx-board-cell-market a,
+.itx-board-panel-trends .itx-board-cell-market button {
+  max-width: none;
+}
+
+/* Both remaining tables get the fixed layout the trends rail already
+   has, and for the same reason: under automatic layout a column is only
+   as narrow as its content allows, so as a panel shrinks the *last*
+   column is the one pushed past the edge -- which is a percentage or an
+   amount, the one thing in these rows that must never be shown
+   half-rendered. Fixed layout declares the number columns and hands
+   whatever is left to the name, which ellipsizes.
+
+   With `table-layout: fixed` the widths come from the first row, so
+   these are set on the header cells where there is a header and on the
+   first body row where there is not. Positional selectors because the
+   header cells are generated (`SortHeader`) and the shape of the row is
+   right here: market, sparkline, value, change. */
+.itx-board-panel-market table {
+  table-layout: fixed;
+  width: 100%;
+}
+.itx-board-panel-market thead th:nth-child(2) {
+  width: 56px;
+}
+.itx-board-panel-market thead th:nth-child(3) {
+  width: 60px;
+}
+.itx-board-panel-market thead th:nth-child(4) {
+  width: 76px;
+}
+
+/* Below this the three columns are at their narrowest -- a market panel
+   is about 234px -- and four columns plus a chart do not fit in it. The
+   sparkline is what goes: it carries shape rather than a figure, and it
+   is the only cell in the row whose absence costs no information that
+   is not already in the two numbers beside it. Dropping it hands its
+   width back to the market's name, which is otherwise squeezed to
+   nothing. */
+@media (max-width: 1400px) {
+  .itx-board-panel-market thead th:nth-child(2),
+  .itx-board-panel-market .itx-board-cell-spark {
+    display: none;
+  }
+}
+
+/* The standings scroll. Every other panel renders what fits and stops,
+   which is right for a chart and wrong for a ranking -- the rail's
+   height comes from the carousel beside it, and there is no reason the
+   number of agents worth showing should be decided by a market panel's
+   row count. */
+.itx-board-scroll {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  /* The scrollbar sat on top of the earnings column -- an overlay
+     scrollbar takes no layout width, so it was drawn over the last
+     digit of a four-figure number. Widening the box past the content
+     and padding the content back in moves the bar into the panel's own
+     side padding, where it has nothing to cover. The rows keep their
+     width, so the separators still line up with everything above. */
+  margin-right: calc(-1 * var(--sp-5));
+  padding-right: var(--sp-5);
+  /* Firefox; the WebKit equivalent is below. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--ld-sub) color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+/* Dressed as the carousel's slider rather than as a scrollbar: same
+   track wash, same `--ld-sub` thumb, same 2px radius. They are the same
+   idea one panel apart -- how far through a row of things you are --
+   and were drawn as two different objects. 4px rather than the
+   slider's 3, because this one has to be grabbable and that one is
+   only ever read. */
+.itx-board-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.itx-board-scroll::-webkit-scrollbar-track {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+.itx-board-scroll::-webkit-scrollbar-thumb {
+  border-radius: 2px;
+  background: var(--ld-sub);
+}
+
+/* The standings' pager, under the list. Small and quiet: it is a
+   control for a rail, not for the page, and the numbers beside it are
+   what actually say where you are. */
+.itx-board-pages {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid color-mix(in srgb, var(--bd-line) 62%, transparent);
+  color: var(--ld-sub);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+/* A bare triangle, like the carousel's -- the outlined box it sat in
+   was the third pager treatment on the site and the only thing that
+   made this pair look like a different control from the pair above the
+   markets. The 22px stays as the hit area; it just has no edge now. */
+.itx-board-pages button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ld-sub);
+  font: inherit;
+  font-size: var(--fs-body);
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 130ms ease,
+    color 130ms ease;
+}
+.itx-board-pages button:hover:not(:disabled) {
+  color: var(--ld-light);
+  transform: scale(1.1);
+}
+.itx-board-pages button:disabled {
+  color: var(--ld-sub);
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Standing, ahead of the agent. Tabular and right-aligned so two- and
+   three-digit ranks stay on one axis instead of stepping in and out as
+   the list scrolls past ten and a hundred. */
+.itx-board-rank {
+  width: 22px;
+  padding-right: var(--sp-2);
+  color: var(--ld-sub);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* The leaderboard is two columns and has no header row, so the earnings
+   column is declared on the body cells. */
+.itx-board-panel-leaders table {
+  table-layout: fixed;
+  width: 100%;
+}
+.itx-board-panel-leaders td:last-child {
+  width: 66px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* The agent cell, by name rather than by position. It was
+   `td:first-child` -- correct until the rank column arrived in front of
+   it, at which point the rule quietly started clipping the *number*
+   instead and the name ran straight into the earnings beside it with
+   nothing to stop it. */
+.itx-board-cell-agent {
+  min-width: 0;
+  padding-right: var(--sp-3);
+}
+.itx-board-cell-agent .itx-board-agent {
+  min-width: 0;
+}
+.itx-board-cell-agent .itx-board-agent span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Trends had its percentage sitting against the sparkline's right edge,
+   which read as one glued-together column. The gap belongs to the
+   number rather than the chart, so it is padding on the cell that was
+   crowded. */
+.itx-board-panel-trends .itx-board-cell-pct {
+  padding-left: var(--sp-5);
+}
+
+/* Grey, not the board's link blue. Every row here is a link, so the blue
+   stopped reading as "these are links" and started reading as a colour
+   the panel happened to be painted in -- against a rail whose other
+   panel is a plain list of figures. Grey lets the sparkline and the
+   change carry the colour, which are the two things in the row that
+   actually mean something by being coloured. */
+.itx-board-panel-trends a {
+  color: var(--ld-sub);
+}
+.itx-board-panel-trends a:hover {
+  color: var(--ld-light);
+}
+
+/* The truncated-walk warning. Sits between the quote strip and the
+   board head, in the same red the tape uses for a falling market --
+   this is a correctness notice about every figure on the page, not a
+   footnote, and it should be the thing you read first if it is there
+   at all. */
+.itx-board-partial {
+  margin: var(--sp-4) 0 calc(-1 * var(--sp-2));
+  color: var(--ld-red);
+}
+
+/* latest + footer */
+
+.itx-board-panel-latest {
+  /* Less vertical padding than the other panels on purpose: the rows
+     inside carry their own, and doubling them left a visible gap.
+
+     Five rows tall, and it *scrolls* rather than being filled to fit.
+     It used to be six rows with `useFitRows` dropping in exactly as
+     many updates as the box had room for, which meant the tape was
+     only ever as deep as the panel -- and the panel's depth was a
+     layout decision, not an editorial one. Now the panel shows five and
+     holds twenty (`MAX_UPDATE_ROWS`), so what is on screen is the front
+     of a feed rather than the whole of a short one. */
+  --pad-panel-y-latest: 6px;
+  padding: var(--pad-panel-y-latest) var(--pad-panel-x);
+  height: calc(var(--row-h) * 5 + var(--pad-panel-y-latest) * 2 + 2px);
+  display: flex;
+  flex-direction: column;
+}
+
+.itx-board-updates {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.itx-board-updates li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-6);
+  height: var(--row-h);
+  font-size: var(--fs-body);
+  /* Only visible while a row is glowing -- it gives the wash a shape
+     instead of a full-bleed band with square corners. */
+  border-radius: var(--r-field);
+  /* Padding out, margin back: the row's contents stay on the same
+     lines they were on, and the glow gets somewhere to go. Without it
+     the wash started exactly at the bullet, so its rounded corner cut
+     across the dot instead of enclosing it. */
+  padding: 0 var(--sp-5);
+  margin: 0 calc(-1 * var(--sp-5));
+}
+
+/* The box that measures the tape now *clips* it, where before it
+   overflowed freely -- so what hangs outside a row has to be accounted
+   for. Two things do: the row's own 12px padding-out/margin-back (see
+   `li` above), which is what gives the arrival wash its rounded corners
+   somewhere to sit, and that wash's 22px halo on top of it.
+
+   The bleed is the panel's full padding, in both axes, which is as far
+   as it can go while staying inside the outline. That clears the row's
+   12px overhang with room to spare, so the corners -- the thing these
+   negative margins have always been for -- are never sheared; only the
+   last few pixels of a 20%-alpha shadow tail fall outside. Taking the
+   vertical padding in too means the scrollport is exactly five rows,
+   and the scrollbar lands at the panel's inner edge, clear of the row
+   content. */
+.itx-board-panel-latest .itx-board-fit {
+  margin: calc(-1 * var(--pad-panel-y-latest)) calc(-1 * var(--pad-panel-x));
+  padding: var(--pad-panel-y-latest) var(--pad-panel-x);
+  /* The tape is taller than its panel now. `flex: 1` with `min-height:
+     0` is what actually lets it scroll: without the zero minimum a flex
+     item refuses to shrink below its content, so the box grows past the
+     panel instead of overflowing inside it. */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ld-sub) color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+
+.itx-board-panel-latest .itx-board-fit::-webkit-scrollbar {
+  width: 4px;
+}
+
+.itx-board-panel-latest .itx-board-fit::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--bd-line) 62%, transparent);
+  border-radius: 2px;
+}
+
+.itx-board-panel-latest .itx-board-fit::-webkit-scrollbar-thumb {
+  background: var(--ld-sub);
+  border-radius: 2px;
+}
+
+/* A row that landed on the last poll: it rises the length of the tape
+   into the top slot, resolving as it climbs, and glows red as it
+   settles.
+
+   The wash and the halo are painted on the row rather than on the
+   panel. What is new is one headline, and lighting the whole panel for
+   it would say the section changed rather than that a task arrived.
+
+   **The length of the travel is what makes it calm.** This went the
+   wrong way for three rounds: the movement read as aggressive, so it
+   was made smaller -- 52px, then 30, then 10 -- and each cut made it
+   worse, because a short hop is a jolt however small it is. The
+   trouble was never the distance, it was that the row appeared halfway
+   up a list it had no history in. It travels the whole tape now, from
+   under the bottom edge to the top slot: far enough to be a glide, so
+   the eye picks it up at the bottom, follows it, and it arrives
+   somewhere it was already going.
+
+   **Straight up, and nothing else.** Several versions gave it a
+   sideways component too -- a diagonal, then three legs, then a bow --
+   on the theory that a card is drawn out of a deck before it is placed
+   on top. Every one of them read as a thing being manoeuvred. A row
+   joining a list is not a card trick, and the horizontal was the part
+   the eye kept catching on. One axis needs no sampled path either: a
+   single bezier is exactly smooth where eleven interpolated points
+   were only nearly so.
+
+   **Weight is three things, all in the ending.** The curve is eased
+   *out*, so the row is quickest as it leaves the bottom and spends the
+   second half of the climb slowing down. It rebounds three pixels past
+   the slot and settles back, which is what something with mass does
+   when it stops. And the red builds from 8% to its fullest exactly as
+   it lands, so the colour settles with the row rather than announcing
+   it from the bottom of the panel -- then fades.
+
+   **The contents fade in over the climb**, on their own animation on
+   the row's children so the wash and the text can be on different
+   clocks. A line that is legible from the first frame has already
+   arrived and is merely being carried; one that resolves as it rises
+   is arriving.
+
+   While it travels it is opaque and lifted above its siblings, because
+   a row crossing the rows below has to hide them. A translucent wash
+   over live text underneath reads as a rendering fault. It ends on the
+   panel's own colour, which is indistinguishable from the transparent
+   it started life with. */
+.itx-board-updates li.is-new {
+  /* How far it travels. One number, because most rounds of this
+     animation have been amplitude changes. A shade more than the five
+     row-heights between the top and bottom slots, so the row starts
+     under the clip and rises into view rather than blinking on at the
+     bottom row. */
+  --arrive-rise: 180px;
+
+  /* Lifted out of the flow for the duration. Rows are static, so later
+     siblings paint over earlier ones -- without this the row would
+     pass *under* the rows it is supposed to be moving over. */
+  position: relative;
+  z-index: 1;
+  /* Promoted for the duration: the row is opaque and crosses every
+     other row in the list, so without this each frame repaints all of
+     them, which is the kind of cost that never shows in a still and
+     reads as "not smooth" in motion. */
+  will-change: transform;
+  /* Lands at 590ms, settles at 660, glow gone by 1.4s. */
+  animation: itx-arrive 1400ms linear both;
+}
+
+@keyframes itx-arrive {
+  /* Below the last row, under the clip: moving fastest, barely tinted,
+     its contents not yet faded in. The curve here governs the whole
+     climb -- the colour stops below break the *background* into
+     intervals, but transform is only given at the ends, so it keeps
+     this one easing all the way up. */
+  0% {
+    transform: translateY(var(--arrive-rise));
+    background: color-mix(in srgb, var(--ld-red) 8%, var(--ld-dark));
+    box-shadow: 0 0 18px color-mix(in srgb, var(--ld-red) 6%, transparent);
+    animation-timing-function: cubic-bezier(0.28, 0.7, 0.45, 1);
+  }
+
+  16% {
+    background: color-mix(in srgb, var(--ld-red) 14%, var(--ld-dark));
+  }
+
+  30% {
+    background: color-mix(in srgb, var(--ld-red) 20%, var(--ld-dark));
+  }
+
+  /* Three pixels past the slot. */
+  42% {
+    transform: translateY(-3px);
+    background: color-mix(in srgb, var(--ld-red) 27%, var(--ld-dark));
+    animation-timing-function: cubic-bezier(0.4, 0, 0.25, 1);
+  }
+
+  /* Settled, and at its reddest -- the glow arrives with the row
+     rather than in advance of it. */
+  47% {
+    transform: translateY(0);
+    background: color-mix(in srgb, var(--ld-red) 30%, var(--ld-dark));
+    box-shadow: 0 0 22px color-mix(in srgb, var(--ld-red) 20%, transparent);
+    /* Holds the colour for a beat before it goes, and lands on zero
+       gently -- the eye follows a fade far better than it follows a
+       drop-off. */
+    animation-timing-function: cubic-bezier(0.55, 0, 0.45, 1);
+  }
+
+  100% {
+    transform: translateY(0);
+    background: var(--ld-dark);
+    box-shadow: 0 0 0 transparent;
+  }
+}
+
+/* Fully in just before it lands, so the row is readable at the moment
+   it stops. */
+.itx-board-updates li.is-new > * {
+  animation: itx-arrive-contents 1400ms linear both;
+}
+
+@keyframes itx-arrive-contents {
+  0% {
+    opacity: 0;
+  }
+
+  42% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 1;
+  }
+}
+
+/* Same news, no movement: the glow still marks which row is new, it
+   just doesn't travel to say so. */
+@media (prefers-reduced-motion: reduce) {
+  .itx-board-updates li.is-new {
+    animation: itx-arrive-still 900ms ease-out both;
+  }
+
+  /* Held, then faded, on the same clock as the moving version -- a
+     quick flash is the thing that was hard to read. */
+  @keyframes itx-arrive-still {
+    0%,
+    45% {
+      background: color-mix(in srgb, var(--ld-red) 28%, transparent);
+    }
+
+    100% {
+      background: transparent;
+    }
+  }
+}
+
+.itx-board-dot {
+  flex: none;
+  align-self: center;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ld-red);
+}
+
+.itx-board-when {
+  flex: none;
+  width: 76px;
+  color: var(--ld-sub);
+  font-size: var(--fs-meta);
+}
+
+/* The task's own name is the only cell that flexes; every other column
+   is a fixed width so the columns line up down the panel.
+ *
+ * Fixed widths rather than a grid on the <ul> with `display: contents`
+ * rows, because the row has to stay a box: the arrival animation moves
+ * it, paints a glow behind it and rounds its corners, none of which a
+ * contents-display element can do. */
+/* Grey, not the link blue -- and the selector needs the element to say
+   so, since `.itx-board a` is a class *and* an element and out-specifies
+   a lone class. The tape has two links per row and they were both blue,
+   which made the row read as two equal offers when only one of them is
+   the thing you click to go somewhere new. The task is the row's
+   subject and sits in body ink; the agent keeps the blue. */
+a.itx-board-what {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ld-sub);
+}
+
+a.itx-board-what:hover {
+  color: var(--ld-light);
+}
+
+/* Green, and immediately after the task it belongs to -- money is the
+   point of the row, and it was previously stranded at the far right
+   where it read as a footnote to whatever column it had drifted past.
+   Tabular figures and a fixed width so the amounts stack into a column
+   rather than ragging against the text beside them. */
+.itx-board-amt {
+  flex: none;
+  width: 96px;
+  color: var(--ld-green);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Which market the work belongs to. Muted: it is context for the task,
+   not the headline, and at full strength three coloured columns in one
+   row compete with each other. */
+.itx-board-cat {
+  flex: none;
+  width: 148px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--fs-meta);
+}
+.itx-board-cat a {
+  color: var(--ld-sub);
+}
+.itx-board-cat a:hover {
+  color: var(--ld-light);
+}
+.itx-board-untagged {
+  color: color-mix(in srgb, var(--ld-sub) 55%, transparent);
+}
+
+/* Who posted it. The icon is composed from the pubkey, so it is there
+   for every agent whether the hub has named them or not.
+ *
+ * Scoped to the tape, and it has to be: `.itx-board-agent` is also the
+ * leaderboard's row link, and an unscoped `width: 164px` here put a
+ * 164px link inside a 232px rail -- which left the earnings column no
+ * room and clipped it mid-number. That is what made the leaderboard read
+ * as unsorted, with a "16" sitting between 172 and 152. */
+.itx-board-updates .itx-board-agent {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  width: 164px;
+  min-width: 0;
+  /* The link colour, where this used to be grey. The row now reads
+     task-in-body-ink, agent-in-blue, which is the way round that
+     matches what each one is: the description is the row's subject,
+     the agent is a name you follow. */
+  color: var(--ld-blue);
+  font-size: var(--fs-meta);
+}
+.itx-board-updates .itx-board-agent span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.itx-board-updates .itx-board-agent:hover {
+  color: var(--ld-light);
+}
+.itx-board-updates .itx-board-agent .itx-avatar {
+  flex: none;
+}
+
+.itx-board-footer {
+  min-height: 96px;
+  margin-top: var(--gap-section);
+}
+
+/* responsive */
+
+/* Wide screens show more of the market rather than a wider two of it.
+ *
+ * The panel count is stepped rather than computed because the peek's
+ * mask has to know it: `--markets-shown` is what tells the carousel
+ * where the dissolve starts, and CSS cannot divide a width by a width to
+ * work it out for itself.
+ *
+ * The steps are placed to keep a panel between about 340 and 500 pixels
+ * across -- wide enough for a key, a sparkline and a percentage without
+ * the three drifting apart, narrow enough that the next one is worth
+ * showing. At the moment each new panel arrives the row goes from its
+ * widest to its narrowest (502 to 337 at the first step, 470 to 356 at
+ * the second), which is the trade for not letting a two-panel row
+ * stretch to 600px each on a monitor this size. */
+@media (min-width: 1700px) {
+  .itx-board-markets {
+    --market-basis: calc(29.6% - 4px);
+    --markets-shown: 3;
+  }
+}
+
+@media (min-width: 2150px) {
+  .itx-board-markets {
+    --market-basis: calc(22.5% - 4px);
+    --markets-shown: 4;
+  }
+}
+
+@media (max-width: 1080px) {
+  .itx-board-inner {
+    padding: 0 var(--sp-8);
+  }
+
+  .itx-board-cols {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-7);
+  }
+
+  /* Nothing to pin against once the columns stack: three sections one
+     under another, each a viewport tall and two of them sticky, would
+     mean scrolling a screen's worth of nav before reaching a market.
+     They go back to being ordinary blocks, sized by their contents. */
+  .itx-board-pin {
+    position: static;
+    height: auto;
+    max-height: none;
+  }
+
+  /* Stacked, there is no nav column to clear, so the heading goes back
+     to the page's left edge. */
+  .itx-board-head {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .itx-board-headline {
+    grid-column: 1;
+  }
+
+  /* Nothing left to line up with once the columns stack. */
+  .itx-board-label-spacer {
+    display: none;
+  }
+
+  /* Stacked, the nav is no longer sized by a row it shares with the
+     panels, so it needs a height of its own -- without one its fit box
+     resolves to nothing and the market list empties. Sized for the
+     fixed entries plus about six markets. */
+  .itx-board-panel-nav {
+    min-height: 480px;
+  }
+
+  .itx-board-markets {
+    --market-basis: calc(78% - 4px);
+    --markets-shown: 1;
+  }
+
+  .itx-board-panel-market {
+    min-height: calc(var(--row-h) * 4);
+  }
+}
+
+@media (max-width: 640px) {
+  .itx-board-markets {
+    --market-basis: 92%;
+    --markets-shown: 1;
+  }
+
+  .itx-board-when {
+    width: 62px;
+  }
+
+  .itx-board-title {
+    font-size: 21px; /* one step down from --fs-title on narrow screens */
+  }
+}
+
+/* ------------------------------------------------------------ sectors
+ *
+ * The visual breakdown under the tape: a table of sectors by weight, and
+ * a treemap where a sector's area is its share of the value on offer and
+ * its colour is which way it is moving. Size and colour deliberately
+ * carry different facts -- see SectorBreakdown.tsx.
+ */
+
+.itx-sectors {
+  margin-top: var(--gap-section);
+}
+
+.itx-sectors-panel {
+  display: grid;
+  /* The table needs a readable minimum before the map gets the rest;
+     below that the two stack rather than both being cramped. */
+  grid-template-columns: minmax(260px, 5fr) minmax(0, 7fr);
+  gap: var(--sp-8);
+  padding: var(--pad-panel-y) var(--pad-panel-x);
+}
+
+.itx-sectors-head {
+  margin: 0 0 var(--sp-5);
+  color: var(--ld-sub);
+  font-size: var(--fs-meta);
+}
+
+.itx-sectors-table table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+/* The name column is a button, not a link -- it selects rather than
+   navigates -- so it needs the anchor styling restated rather than
+   inherited. */
+.itx-sectors-table td button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ld-light);
+  font: inherit;
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: pointer;
+}
+
+.itx-sectors-table tr.is-selected td button {
+  color: var(--ld-blue);
+}
+
+.itx-sectors-weight {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+}
+
+.itx-sectors-bar {
+  flex: 1;
+  min-width: 0;
+  height: 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--bd-line) 62%, transparent);
+  overflow: hidden;
+}
+
+.itx-sectors-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ld-blue);
+}
+
+.itx-sectors-pct {
+  flex: none;
+  color: var(--ld-sub);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+.itx-sectors-side {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.itx-sectors-map {
+  /* So the tiles can size their type against the map's rendered width
+     (`cqw` below). Without a container the labels were sized in layout
+     units and stayed put as the map shrank, which is what crowded and
+     clipped them at narrow windows. */
+  container-type: inline-size;
+  position: relative;
+  /* Held to the ratio the layout was computed in (MAP_W x MAP_H), which
+     is what lets the tiles be positioned in percentages without anything
+     measuring the box. */
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  border-radius: var(--r-field);
+  overflow: hidden;
+}
+
+.itx-sectors-tile {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 2px;
+  box-sizing: border-box;
+  /* Hairline gutters between tiles, drawn as a border rather than a gap
+     so the boxes still tile the map exactly -- a gap would need the
+     layout to know about it, and the layout is pure geometry. */
+  border: 1px solid var(--ld-dark);
+  overflow: hidden;
+  /* The tint mixes the direction's hue into the panel ground, so a flat
+     sector reads as the panel and a strong mover as the hue. */
+  background: color-mix(in srgb, var(--tile-hue) calc(var(--tile-tint, 0) * 62%), var(--ld-dark));
+  color: var(--ld-light);
+  text-align: center;
+  transition: opacity 120ms ease-out;
+}
+
+.itx-sectors-tile[data-dir="up"],
+.itx-sectors-legend i[data-dir="up"] {
+  --tile-hue: var(--ld-green);
+}
+.itx-sectors-tile[data-dir="down"],
+.itx-sectors-legend i[data-dir="down"] {
+  --tile-hue: var(--ld-red);
+}
+.itx-sectors-tile[data-dir="flat"],
+.itx-sectors-legend i[data-dir="flat"] {
+  --tile-hue: var(--ld-sub);
+}
+
+/* Selecting one sector dims the others rather than hiding them: the map
+   is a comparison, and a tile that vanishes takes its own context with
+   it. */
+.itx-sectors-tile[data-dim] {
+  opacity: 0.35;
+}
+.itx-sectors-tile[data-on] {
+  outline: 1px solid var(--ld-light);
+  outline-offset: -2px;
+}
+
+/* Type as a fraction of the tile's own short side, which `--tile-scale`
+   expresses as a fraction of the map's width -- so `cqw` turns it into
+   pixels that follow the box at every size. Clamped at both ends: a
+   sliver's label still has to be readable, and the biggest tile's must
+   not turn into a headline. */
+.itx-sectors-tile-name {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: clamp(9px, calc(var(--tile-scale, 0.2) * 14cqw), 21px);
+  line-height: 1.15;
+}
+
+.itx-sectors-tile-pct {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: clamp(8px, calc(var(--tile-scale, 0.2) * 10cqw), 15px);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+}
+
+.itx-sectors-legend {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-5);
+  color: var(--ld-sub);
+  font-size: var(--fs-micro);
+}
+
+.itx-sectors-legend i {
+  width: 26px;
+  height: 10px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--tile-hue) calc(var(--tile-tint, 0) * 62%), var(--ld-dark));
+  border: 1px solid color-mix(in srgb, var(--bd-line) 62%, transparent);
+}
+
+@media (max-width: 1080px) {
+  .itx-sectors-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ------------------------------------------------------------- market chart
+ *
+ * One market's history, opened in the middle column in place of the
+ * carousel. Not a route and not a modal: the board's nav and rail stay
+ * where they are, so this is sized and coloured as another panel on the
+ * board rather than as a surface of its own.
+ */
+
+/* The market cell's button has to be a button and look like the link
+   beside it in the rail -- the browser's own control chrome is the one
+   thing that would give it away. */
+.itx-board-cell-market button {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--ld-blue);
+  text-align: left;
+  cursor: pointer;
+}
+
+.itx-board-cell-market button:hover {
+  color: color-mix(in srgb, var(--ld-blue) 78%, var(--ld-light));
+}
+
+/* Carries `.itx-board-panel` as well, so the outline, radius and fill
+   come from the one place every other panel gets them. Only what is
+   particular to a chart is here. */
+/* An `<h3>`, so the market's name is a heading rather than a styled
+   span -- which means clearing the UA's top margin that a `span` never
+   had. Left in place it pushed the whole middle column 16px below the
+   rail beside it. */
+.itx-chart-label {
+  margin-top: 0;
+}
+
+.itx-chart-panel {
+  box-sizing: border-box;
+  padding: var(--sp-6) var(--pad-panel-x);
+  /* Matches the height of a sector panel, so the tape below does not
+     jump up the page when a market is opened and back down when it is
+     closed -- and so the rail, which sizes itself from this column,
+     does not resize either. */
+  min-height: 394px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Sits in the heading line, exactly where the carousel's pager was, and
+   says where it goes rather than just pointing -- "back" alone would
+   leave the reader to remember what they came from. */
+.itx-chart-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-4);
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+  cursor: pointer;
+  transition:
+    transform 130ms ease,
+    color 130ms ease;
+}
+
+.itx-chart-back:hover {
+  color: var(--ld-light);
+}
+
+/* The arrow scales, not the words: the whole control growing would shove
+   the header sideways. Same 1.1 the site's other arrows use. */
+.itx-chart-back svg {
+  font-size: 9px;
+  transition: transform 130ms ease;
+}
+
+.itx-chart-back:hover svg {
+  transform: scale(1.1);
+}
+
+/* The market's name moved out to a label above the panel, where every
+   other panel on the board keeps its name -- so the panel opens on its
+   figure, and the figure sits where a quote belongs: top right. */
+.itx-chart-figure {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0 var(--sp-4);
+  margin-bottom: var(--sp-5);
+}
+
+.itx-chart-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+}
+
+.itx-chart-value {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ld-light);
+}
+
+.itx-chart-change {
+  font-size: var(--fs-body);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Range tabs. Quiet at rest and filled when active, like the pill nav
+   the terminal pages dropped -- a row of eight outlined buttons would
+   out-shout the chart they belong to. */
+.itx-chart-ranges {
+  display: flex;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-5);
+}
+
+.itx-chart-ranges button {
+  background: none;
+  border: 0;
+  border-radius: var(--r-field);
+  padding: var(--sp-2) var(--sp-5);
+  font: inherit;
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+  cursor: pointer;
+}
+
+.itx-chart-ranges button:hover {
+  color: var(--ld-light);
+}
+
+.itx-chart-ranges button.is-active {
+  background: color-mix(in srgb, var(--bd-line) 40%, transparent);
+  color: var(--ld-light);
+}
+
+.itx-chart-plot {
+  flex: 1;
+  min-height: 0;
+}
+
+.itx-chart-empty {
+  padding: var(--sp-11) 0;
+  text-align: center;
+  color: var(--ld-sub);
+  font-size: var(--fs-meta);
+}
+
+/* --- the chart itself --- */
+
+.itx-chart {
+  display: block;
+  overflow: visible;
+}
+
+.itx-chart-grid {
+  stroke: color-mix(in srgb, var(--bd-line) 45%, transparent);
+  stroke-width: 1;
+}
+
+.itx-chart-line {
+  fill: none;
+  stroke: var(--ld-sub);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* Direction colours the line and its wash, and only those: the axes and
+   labels stay neutral, or a market that happened to be down would print
+   its whole chart in red. */
+.itx-chart-up .itx-chart-line {
+  stroke: var(--ld-green);
+}
+
+.itx-chart-down .itx-chart-line {
+  stroke: var(--ld-red);
+}
+
+.itx-chart-fill-top {
+  stop-color: currentColor;
+  stop-opacity: 0.22;
+}
+
+.itx-chart-fill-bottom {
+  stop-color: currentColor;
+  stop-opacity: 0;
+}
+
+.itx-chart-up {
+  color: var(--ld-green);
+}
+
+.itx-chart-down {
+  color: var(--ld-red);
+}
+
+.itx-chart-flat {
+  color: var(--ld-sub);
+}
+
+.itx-chart-ylabel,
+.itx-chart-xlabel {
+  fill: var(--ld-sub);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.itx-chart-ylabel {
+  text-anchor: start;
+}
+
+.itx-chart-bar {
+  fill: color-mix(in srgb, var(--bd-line) 70%, transparent);
+}
+
+.itx-chart-bar.is-active {
+  fill: var(--ld-sub);
+}
+
+.itx-chart-crosshair {
+  stroke: color-mix(in srgb, var(--ld-sub) 55%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.itx-chart-dot {
+  fill: currentColor;
+  stroke: var(--ld-dark);
+  stroke-width: 2;
+}
+
+/* The readout sits at the top-left of the plot and never moves. A
+   tooltip that follows the cursor covers the part of the line being
+   inspected, which at this size is the whole reason for hovering. */
+.itx-chart-readout {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.itx-chart-readout-value {
+  fill: var(--ld-light);
+}
+
+.itx-chart-readout-meta {
+  fill: var(--ld-sub);
+}
+
+/* ---- prediction market (the board's sample card) ----------------- */
+/* One market in the Kalshi format: the odds table and its news on the
+   left, both outcomes' history on the right, and a row of them that
+   scrolls. All of it authored data for now -- see PredictionMarket.tsx
+   -- so nothing here polls. */
+
+.itx-pm {
+  margin-top: var(--gap-section);
+}
+
+/* The row and its slider, which is why this box exists: the slider is a
+   sibling of the scroll container, and `useCarousel` writes the thumb's
+   size and position onto the container's *parent* -- custom properties
+   inherit down, not sideways. */
+.itx-pm-row {
+  position: relative;
+}
+
+/* The same scroll container the market overview uses, with the same
+   reasoning behind it (see `.itx-board-carousel`): the browser owns the
+   finger, the momentum and the rubber-banding, and the arrows are left
+   as the deliberate one-card step. Only two things differ -- an item
+   here is nearly the whole width, so the peek is a sliver of the next
+   card rather than half a panel, and each card snaps, because a market
+   left straddling the edge is a card you cannot read either of. */
+.itx-pm-track {
+  /* One card, with the next just breaking the edge. */
+  --pm-basis: calc(94% - var(--sp-7));
+  --peek-edge: calc(var(--pm-basis) + var(--sp-7));
+  --leading-fade-max: 96px;
+  --leading-fade: 0px;
+  --peek-span: calc(100% - var(--peek-edge));
+
+  display: flex;
+  gap: var(--sp-7);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+  /* Both edges dissolve on the same sampled smoothstep the market
+     carousel uses -- a linear ramp starts all at once and that corner
+     reads as a crease down the card. */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    rgba(0, 0, 0, 0.16) calc(var(--leading-fade) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--leading-fade) * 0.5),
+    rgba(0, 0, 0, 0.84) calc(var(--leading-fade) * 0.75),
+    #000 var(--leading-fade),
+    #000 var(--peek-edge),
+    rgba(0, 0, 0, 0.84) calc(var(--peek-edge) + var(--peek-span) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--peek-edge) + var(--peek-span) * 0.5),
+    rgba(0, 0, 0, 0.16) calc(var(--peek-edge) + var(--peek-span) * 0.75),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    rgba(0, 0, 0, 0.16) calc(var(--leading-fade) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--leading-fade) * 0.5),
+    rgba(0, 0, 0, 0.84) calc(var(--leading-fade) * 0.75),
+    #000 var(--leading-fade),
+    #000 var(--peek-edge),
+    rgba(0, 0, 0, 0.84) calc(var(--peek-edge) + var(--peek-span) * 0.25),
+    rgba(0, 0, 0, 0.5) calc(var(--peek-edge) + var(--peek-span) * 0.5),
+    rgba(0, 0, 0, 0.16) calc(var(--peek-edge) + var(--peek-span) * 0.75),
+    transparent 100%
+  );
+}
+
+.itx-pm-track::-webkit-scrollbar {
+  display: none;
+}
+
+/* At the far end nothing is behind that edge and the fade goes to
+   nothing: the last card finishes on the edge, and dimming it would
+   promise more that isn't there. */
+.itx-pm-track[data-at-end] {
+  --peek-edge: 100%;
+}
+
+/* Its own margin, since this slider sits under a row of cards rather
+   than under the market panels -- otherwise it takes the board's
+   default and crowds the tape below. */
+.itx-pm-slider {
+  margin-top: var(--sp-6);
+}
+
+/* A section's door: its name and an arrow, as one link -- see
+   `SectionLink`. Both sample sections wear it.
+
+   The name keeps the label's own weight and ink, so the row still reads
+   as a heading; only the arrow takes the link colour, which is what
+   says the heading goes somewhere. The selector is qualified with
+   `.itx-board` for the anchor rules the board sets on every link
+   inside it. */
+.itx-board a.itx-section-link,
+.itx-board a.itx-section-link:hover {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-4);
+  color: var(--ld-light);
+  text-decoration: none;
+}
+
+/* The label inside the link keeps its own type but gives up its bottom
+   margin -- the row it sits in owns the spacing now. */
+.itx-section-link .itx-board-label {
+  margin-bottom: 0;
+}
+
+.itx-section-arrow {
+  flex: none;
+  color: var(--ld-blue);
+  transition: transform 130ms ease;
+}
+
+/* Hover moves the arrow the way it points rather than scaling the pair.
+   Growing the whole control shifted the words beside it, which on a row
+   that also holds a pager read as the layout twitching. */
+.itx-board a.itx-section-link:hover .itx-section-arrow {
+  transform: translateX(3px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .itx-section-arrow {
+    transition: none;
+  }
+}
+
+.itx-pm-card {
+  /* Sized by the row, and it does not shrink: a flex item's default
+     `min-width: auto` would let a long title squeeze the card narrower
+     than its basis, and the cards would stop landing on the snap. */
+  flex: 0 0 var(--pm-basis);
+  min-width: 0;
+  scroll-snap-align: start;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: var(--sp-6) var(--sp-10);
+  padding: var(--sp-8);
+}
+
+/* One column under 1100px: the cards sit in the board's middle column,
+   which at that point is too narrow to give the chart half. */
+@media (max-width: 1100px) {
+  .itx-pm-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* On the label row, beside the section's name and its door -- where the
+   market carousel keeps its pager too, rather than out at the row's
+   right end where nothing ties it to what it moves. Pushed to the far
+   end of the row so the label and the arrow stay together. */
+.itx-pm-pager {
+  /* Position only. The look -- bare triangles, no ring, hover lift,
+     dimmed at the ends -- comes from `.itx-board-pager`, which this row
+     also carries: the market overview's pager and this one are the same
+     control, so they are the same rule. Pushed to the far end of the
+     label row, where the owner wants it, rather than beside the name. */
+  margin-left: auto;
+}
+
+/* Just the word now that the drawn tile is gone -- so a block with a
+   margin rather than a flex row with a gap for something to sit in. */
+.itx-pm-cat {
+  display: block;
+  margin-bottom: var(--sp-5);
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  /* Lower case, like every word on this site. It was set in caps, and
+     the tracking goes with them: 0.09em is what caps need to stay
+     legible and what lower case at 11px does not want. 0.02em is where
+     the board's own micro labels sit. */
+  letter-spacing: 0.02em;
+  color: var(--ld-sub);
+}
+
+/* The event, and the biggest thing on the card -- but not the biggest
+   thing on the board.
+ *
+ * It was `--fs-title`, the 25px the board's own section headings use,
+ * which made a sample market's question larger than "market overview"
+ * and larger than every real figure on the page. A card is one item
+ * inside a section; it cannot outrank the section. `--fs-label` is the
+ * board's heading step down from that, and it still leads the card
+ * because nothing else in it is bold at that size. */
+.itx-pm-title {
+  margin: 0 0 var(--sp-5);
+  font-size: var(--fs-label);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.008em;
+  color: var(--ld-light);
+}
+
+/* Airier rows than the board's 34px: this table has two rows and a
+   pill button's worth of height in each, and the reference gives them
+   room. Overrides the shared `--row-h` locally rather than restyling
+   the cells, so everything else `.itx-board-table` decides still
+   holds. */
+.itx-pm-outcomes {
+  --row-h: 48px;
+}
+
+/* The outcome's name wears its line's colour as an underline -- the
+   reference's way of tying the table to the chart without a swatch
+   column. */
+.itx-pm-outcome {
+  display: inline-block;
+  padding-bottom: var(--sp-2);
+  border-bottom: 2px solid var(--bd-line);
+  font-size: var(--fs-body);
+  color: var(--ld-light);
+}
+
+.itx-pm-outcome.is-yes {
+  border-bottom-color: var(--ld-green);
+}
+
+.itx-pm-outcome.is-no {
+  border-bottom-color: var(--ld-blue);
+}
+
+.itx-pm-pays {
+  font-variant-numeric: tabular-nums;
+  color: var(--ld-sub);
+}
+
+/* The odds, as the reference's outlined pill. A span dressed as the
+   trade button this will one day be -- deliberately not a <button>
+   while there is nothing to press (see the markup's comment). */
+.itx-pm-pill {
+  display: inline-block;
+  min-width: 44px;
+  padding: var(--sp-3) var(--sp-6);
+  /* The board's field radius, not a 999px lozenge. Fields on this site
+     are 10px and panels 14px; a full pill was a third rounding, and the
+     one place it appeared was a card that sits inside both. */
+  border: 1px solid var(--bd-line);
+  border-radius: var(--r-field);
+  font-size: var(--fs-body);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--ld-light);
+}
+
+/* Which way the market leans, on the outline only -- the figure itself
+   stays the page's ink, because the number is a price rather than a
+   verdict. Green and red are already the board's pair for this, so a
+   reader who has been down the market tables arrives knowing what they
+   mean. `.up`/`.down`/`.flat` are the board's own class names, set by
+   `leaning()` from the odds themselves. */
+.itx-pm-pill.up {
+  border-color: var(--ld-green);
+}
+
+.itx-pm-pill.down {
+  border-color: var(--ld-red);
+}
+
+.itx-pm-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  margin-top: var(--sp-5);
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+}
+
+/* Set off by the reference's dotted rule. */
+.itx-pm-news {
+  margin: var(--sp-6) 0 0;
+  padding-top: var(--sp-6);
+  /* The same hairline the tables above it draw between rows -- a
+     dotted rule was a separator style this site does not otherwise
+     have, one line below a table full of solid ones. */
+  border-top: 1px solid color-mix(in srgb, var(--bd-line) 62%, transparent);
+  font-size: var(--fs-body);
+  line-height: 1.6;
+  color: var(--ld-sub);
+}
+
+.itx-pm-news strong {
+  color: var(--ld-light);
+}
+
+.itx-pm-chartcol {
+  display: flex;
+  flex-direction: column;
+  /* Centred in the card's height, not pinned to its top. The left
+     column is the taller of the two -- title, table, meta and the news
+     line -- so a chart that started at the top finished well short of
+     the card's bottom and left the panel looking bottom-heavy. The
+     legend rides with it, since the pair is one object. */
+  justify-content: center;
+  min-width: 0;
+}
+
+.itx-pm-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-4) var(--sp-7);
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-body);
+  color: var(--ld-sub);
+}
+
+.itx-pm-key {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.itx-pm-key strong {
+  color: var(--ld-light);
+}
+
+.itx-pm-key-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.itx-pm-key.is-yes .itx-pm-key-dot {
+  background: var(--ld-green);
+}
+
+.itx-pm-key.is-no .itx-pm-key-dot {
+  background: var(--ld-blue);
+}
+
+/* No `flex: 1` any more: stretching the plot to fill the column is
+   what pinned the chart's box to the top of the card and made
+   centring it a no-op. The SVG is a fixed height, so the box is simply
+   as tall as the chart and the column centres it. */
+.itx-pm-plot {
+  min-width: 0;
+}
+
+.itx-pm-svg {
+  display: block;
+  overflow: visible;
+  /* The whole plot reads a price, so the whole plot is the target. */
+  cursor: crosshair;
+  /* A finger dragging across the chart should read prices, not scroll
+     the page out from under itself. `pan-y` keeps the vertical scroll,
+     which is the one gesture that has somewhere else to go. */
+  touch-action: pan-y;
+}
+
+/* The hovered moment: a rule down the plot, the time above it, and each
+   outcome's odds beside its own dot. */
+.itx-pm-crosshair {
+  stroke: color-mix(in srgb, var(--ld-light) 45%, transparent);
+  stroke-width: 1.5;
+}
+
+.itx-pm-when {
+  fill: var(--ld-sub);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* A plate under each readout so the words read against whatever the
+   chart has behind them -- gridlines, or the other outcome's line --
+   without hiding it. The page's own ground at low alpha rather than a
+   panel colour: it should look like the chart dimming under the label,
+   not like a tooltip landing on it. */
+.itx-pm-plate {
+  fill: var(--ld-dark);
+  opacity: 0.62;
+  pointer-events: none;
+}
+
+/* Sits on the line's own colour, like the reference -- which is what
+   lets the two readouts go unlabelled by anything but their words.
+   The thin ground stroke is painted *behind* the glyphs
+   (`paint-order`), and does the job the plate cannot: at 62% the plate
+   still passes a line through, and a stroke this close to the letters
+   keeps their edges clean where it does. */
+.itx-pm-readout {
+  fill: currentColor;
+  font-size: 13px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: var(--ld-dark);
+  stroke-width: 2.5;
+  stroke-opacity: 0.62;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+/* Says on the card what the comments say in the source: these odds are
+   authored. Quiet, but not hidden -- a quote and a volume look live
+   whether or not they are. */
+.itx-pm-sample {
+  margin: calc(-1 * var(--sp-3)) 0 var(--sp-6);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.04em;
+  color: var(--ld-sub);
+}
+
+/* Dotted, unlike the market chart's solid rules: the reference's
+   gridlines are dotted, and two chart grammars one section apart is
+   fine when each is faithful to its own reference. */
+.itx-pm-gridline {
+  stroke: color-mix(in srgb, var(--ld-light) 14%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+}
+
+.itx-pm-ylabel,
+.itx-pm-xlabel {
+  fill: var(--ld-sub);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.itx-pm-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.itx-pm-line.is-yes {
+  stroke: var(--ld-green);
+}
+
+.itx-pm-line.is-no {
+  stroke: var(--ld-blue);
+}
+
+.itx-pm-end.is-yes {
+  color: var(--ld-green);
+}
+
+.itx-pm-end.is-no {
+  color: var(--ld-blue);
+}
+
+/* The last price, haloed like the reference: a soft ring with the hard
+   dot inside it. */
+.itx-pm-halo {
+  fill: currentColor;
+  opacity: 0.22;
+}
+
+.itx-pm-dot {
+  fill: currentColor;
+}
+
+/* ---- inner pages (prediction market, newsroom) ------------------- */
+/* An inner page's main area carries `.itx-board` for the grid, the
+   ground and the tokens, plus this class for what differs: it has no
+   hero above it, so it owes the viewport its full height under the
+   masthead, and its grid has no quote strip to reach up behind. */
+
+.itx-subpage {
+  box-sizing: border-box;
+  min-height: calc(100vh - var(--ld-bar-h));
+  min-height: calc(100svh - var(--ld-bar-h));
+  padding: var(--sp-9) var(--sp-11) var(--sp-14);
+}
+
+/* The board's grid layer starts `--bd-overlap + --bd-lift` above its
+   box to ride under the pulled-up quote strip. Here that stretch would
+   sit behind the opaque masthead doing nothing -- start it at the
+   page's own edge. */
+.itx-subpage::before {
+  inset: 0;
+}
+
+/* ---- newsroom (the board's sample stories) ----------------------- */
+/* Five authored stories under the prediction market, ranked by how
+   many agents have read them -- see Newsroom.tsx and
+   lib/newsroomSample.ts. One panel, one table: this section is a feed,
+   not a card, so it takes the tape's grammar rather than the market
+   card's. */
+
+.itx-nr {
+  margin-top: var(--gap-section);
+}
+
+.itx-nr-panel {
+  padding: var(--pad-panel-y) var(--pad-panel-x);
+}
+
+/* The headline takes whatever width the row has left and clips.
+   `max-width: 0` is the table-layout trick that makes that true: a
+   table cell's natural minimum is its content, so without it a long
+   headline would push the views and the timestamp out of the panel
+   instead of losing its own tail. */
+.itx-nr-headline {
+  width: 100%;
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ld-light);
+}
+
+.itx-nr-cat {
+  white-space: nowrap;
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+}
+
+/* The count and its eye. Tabular figures so the column reads as a
+   column, and the glyph a step back from the number it qualifies. */
+.itx-nr-views {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--ld-light);
+}
+
+.itx-nr-eye {
+  margin-right: var(--sp-2);
+  vertical-align: -2px;
+  color: var(--ld-sub);
+}
+
+.itx-nr-when {
+  white-space: nowrap;
+  font-size: var(--fs-meta);
+  color: var(--ld-sub);
+}

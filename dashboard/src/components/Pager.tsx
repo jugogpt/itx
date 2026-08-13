@@ -1,0 +1,102 @@
+import Triangle from "./Triangle";
+import { formatCount } from "../lib/format";
+
+interface Props {
+  page: number;
+  pageSize: number;
+  total: number;
+  onPageChange: (page: number) => void;
+}
+
+/** Prev/next pager with an explicit "showing X–Y of Z" range.
+ *
+ * The component is agnostic about where the page comes from: it is given
+ * a page number, a size and a total, and reports a range. `/leaderboard`
+ * hands it a **server-side** page -- the hub ranks the whole field and
+ * serves fifty of it, so `total` there is `X-Total-Count` and changing
+ * page issues a request.
+ *
+ * On the task list, paging happens **client-side**, over the
+ * already-fetched and filtered set, rather than through the hub's
+ * `?offset=&limit=`. That's not
+ * laziness: kind filtering has no server-side equivalent (the hub has no
+ * `?kind=`), so a server-side page of 50 would arrive, get filtered down
+ * to whatever matched, and render a page of unpredictable size --
+ * sometimes empty, while later pages still held matches. Filtering first
+ * and paging second is the only ordering that yields correct page sizes.
+ *
+ * The hub's `X-Total-Count` still does real work upstream: `listAllTasks`
+ * uses it to know when it has walked the whole board.
+ *
+ * Renders nothing for a single page -- a pager that can't page is noise.
+ */
+export default function Pager({ page, pageSize, total, onPageChange }: Props) {
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  if (pageCount <= 1) return null;
+
+  const first = page * pageSize + 1;
+  const last = Math.min(total, (page + 1) * pageSize);
+  /** Whether the jump-to-the-end controls are worth their space. See
+   * the comment on them below. */
+  const ends = pageCount > 2;
+
+  return (
+    <div className="itx-pager">
+      <span className="num">
+        {formatCount(first)}–{formatCount(last)} of {formatCount(total)}
+      </span>
+      <span className="itx-pager-spacer" />
+      {/* Round icon buttons carrying the site's one triangle, the same
+          pair the board's rail and its carousel use. They were "← Prev"
+          and "Next →" -- a third arrow style on a page that already had
+          two, and words that the page number beside them makes
+          redundant. The label survives on `aria-label`.
+
+          The barred pair outside them jump to the ends. They appear
+          only past two pages, which is the point at which stepping
+          stops being the same thing as arriving: with two pages "next"
+          already *is* "last", and a second control that does what the
+          one beside it does is furniture. On a 49-page board they are
+          the difference between one click and forty-eight. */}
+      {ends && (
+        <button
+          type="button"
+          aria-label="First page"
+          onClick={() => onPageChange(0)}
+          disabled={page === 0}
+        >
+          <Triangle direction="left" toEnd />
+        </button>
+      )}
+      <button
+        type="button"
+        aria-label="Previous page"
+        onClick={() => onPageChange(page - 1)}
+        disabled={page === 0}
+      >
+        <Triangle direction="left" />
+      </button>
+      <span className="num">
+        {page + 1} / {pageCount}
+      </span>
+      <button
+        type="button"
+        aria-label="Next page"
+        onClick={() => onPageChange(page + 1)}
+        disabled={page >= pageCount - 1}
+      >
+        <Triangle direction="right" />
+      </button>
+      {ends && (
+        <button
+          type="button"
+          aria-label="Last page"
+          onClick={() => onPageChange(pageCount - 1)}
+          disabled={page >= pageCount - 1}
+        >
+          <Triangle direction="right" toEnd />
+        </button>
+      )}
+    </div>
+  );
+}
